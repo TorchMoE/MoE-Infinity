@@ -1,8 +1,20 @@
 # MoE-Infinity
 
-MoE-Infinity is a cost-efficient mixture-of-expert (MoE) serving system that realizes activation-aware expert offloading. MoE-Infinity features sequence-level expert activation tracing, a new approach adept at identifying sparse activations and capturing the temporal locality of MoE inference. By analyzing these traces, MoE-Infinity performs novel activation-aware expert prefetching and caching, substantially reducing the latency overheads usually associated with offloading experts for improved cost performance. Extensive experiments in a cluster show that MoE-Infinity outperforms numerous existing systems and approaches, reducing latency by 4 - 20X and decreasing deployment costs by over 8X for various MoEs.
+MoE-Infinity is a cost-effective, fast, and easy-to-use library for Mixture-of-Experts (MoE) inference and serving.
 
-For more details, please refer to our paper: [MoE-Infinity: Activation-Aware Expert Offloading for Efficient MoE Serving](https://arxiv.org/abs/2401.14361).
+MoE-Infinity is cost-effective yet fast:
+
+- Offloading MoE's experts to host memory, allowing memory-constrained GPUs to serve MoE models.
+- Minimizing the expert offloading overheads through several novel techniques: expert activation tracing, activation-aware expert prefetching, and activation-aware expert caching.
+- Supporting LLM acceleration techniques (such as FlashAttention).
+- Achieving SOTA latency and throughput performance when serving MoEs in a resource-constrained GPU environment (in comparison with HuggingFace Accelerate, DeepSpeed, Mixtral Offloading, and Ollama/LLama.cpp).
+
+MoE-Infinity is easy-to-use:
+
+- HuggingFace model compatible, and HuggingFace programmer friendly.
+- Supporting all available MoE checkpoints (including Google Switch Transformers, Meta NLLB-MoE, and Mixtral).
+
+Note that: The open-sourced MoE-Infinity has been redesigned for making it HuggingFace-users friendly. This version is different from the version reported in the paper, which takes high performance as the top priority and uses NVIDIA Triton library as the inference engine. As a result, distributed inference is currently not supported in this open-sourced version.
 
 ## Contents
 - [Performance](#performance)
@@ -17,7 +29,7 @@ For more details, please refer to our paper: [MoE-Infinity: Activation-Aware Exp
 
 ## Performance
 
-Single GPU A5000, per-token-latency (seconds) for generation on a mixture of [FLAN](https://huggingface.co/datasets/Muennighoff/flan), [BIG-Bench](https://huggingface.co/datasets/bigbench) and [MMLU](https://huggingface.co/datasets/lukaemon/mmlu) datasets.
+Single GPU A5000 (24GB Memory), per-token-latency (seconds) for generation with a mixed dataset that includes [FLAN](https://huggingface.co/datasets/Muennighoff/flan), [BIG-Bench](https://huggingface.co/datasets/bigbench) and [MMLU](https://huggingface.co/datasets/lukaemon/mmlu) datasets.
 
 |  | switch-large-128 | NLLB-MoE-54B | Mixtral-7x8b |
 | :---: | :---: | :---: | :---: |
@@ -69,7 +81,7 @@ pip install -e .
 
 ## Usage and Examples
 
-We provide a intuitive and consistent API for diverse setups, including single GPU, multiple GPUs, and multiple nodes. The following examples show how to use MoE-Infinity to run generation on a Huggingface LLM model.
+We provide a simple API for diverse setups, including single GPU, multiple GPUs, and multiple nodes. The following examples show how to use MoE-Infinity to run generation on a Huggingface LLM model.
 
 ### Sample Code of Huggingface LLM Inference
 
@@ -113,10 +125,21 @@ We provide a simple example to run inference on a Huggingface LLM model. The scr
 CUDA_VISIBLE_DEVICES=0 python example/interface_example.py --model_name_or_path "mistralai/Mixtral-8x7B-Instruct-v0.1" --offload_dir <your local path on SSD> 
 ```
 
-## Roadmap
+## Release Plan
 
-- [ ] Open LLM Leaderboard
-- [ ] User-defined device-map for expert parallelism
-- [ ] Multinode expert offloading
-- [ ] Automatic memory size management
-- [ ] vLLM KV cache offloading
+We plan to release two functions in the following months:
+
+* We currently support PyTorch as the default inference engine, and we are in the process of supporting vLLM as another inference runtime, which includes the support of KV cache offloading. 
+* Supporting expert parallelism for distributed MoE inference.
+
+## Citation
+
+If you use MoE-Inifity for your research, please cite our [paper](https://arxiv.org/abs/2401.14361):
+```bibtex
+@inproceedings{moe-infinity2024,
+  title={MoE-Infinity: Activation-Aware Expert Offloading for Efficient MoE Serving},
+  author={Leyang Xue, Yao Fu, Zhan Lu, Luo Mai, Mahesh Marina},
+  booktitle={https://arxiv.org/abs/2401.14361},
+  year={2024}
+}
+```
