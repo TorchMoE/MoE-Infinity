@@ -6,15 +6,16 @@ MoE-Infinity is cost-effective yet fast:
 
 - Offloading MoE's experts to host memory, allowing memory-constrained GPUs to serve MoE models.
 - Minimizing the expert offloading overheads through several novel techniques: expert activation tracing, activation-aware expert prefetching, and activation-aware expert caching.
-- Supporting LLM acceleration techniques (such as FlashAttention).
-- Achieving SOTA latency and throughput performance when serving MoEs in a resource-constrained GPU environment (in comparison with HuggingFace Accelerate, DeepSpeed, Mixtral Offloading, and Ollama/LLama.cpp).
+- Supporting LLM acceleration techniques (such as [FlashAttention](https://github.com/Dao-AILab/flash-attention)).
+- Supporting multi-GPU environments with numeorous OS-level performance optimizations. 
+- Achieving SOTA latency and throughput performance when serving MoEs in a resource-constrained GPU environment (in comparison with HuggingFace [Accelerate](https://github.com/huggingface/accelerate), [DeepSpeed](https://github.com/microsoft/DeepSpeed), [Mixtral-Offloading](https://github.com/dvmazur/mixtral-offloading), and [Ollama/LLama.cpp](https://github.com/ollama/ollama)).
 
 MoE-Infinity is easy-to-use:
 
 - HuggingFace model compatible, and HuggingFace programmer friendly.
-- Supporting all available MoE checkpoints (including Google Switch Transformers, Meta NLLB-MoE, and Mixtral).
+- Supporting all available MoE checkpoints (including [Google Switch Transformers](https://huggingface.co/google/switch-large-128), [Meta NLLB-MoE](https://huggingface.co/facebook/nllb-moe-54b), and [Mixtral](mistralai/Mixtral-8x7B-Instruct-v0.1)).
 
-Note that: The open-sourced MoE-Infinity has been redesigned for making it HuggingFace-users friendly. This version is different from the version reported in the paper, which takes high performance as the top priority and uses NVIDIA Triton library as the inference engine. As a result, distributed inference is currently not supported in this open-sourced version.
+Note that: The open-sourced MoE-Infinity has been redesigned for making it HuggingFace-users friendly. This version is different from the version reported in the paper, which takes extreme performance as the top priority. As a result, distributed inference is currently not supported in this open-sourced version.
 
 ## Contents
 - [Performance](#performance)
@@ -131,6 +132,7 @@ We plan to release two functions in the following months:
 
 * We currently support PyTorch as the default inference engine, and we are in the process of supporting vLLM as another inference runtime, which includes the support of KV cache offloading. 
 * Supporting expert parallelism for distributed MoE inference.
+* More (We welcome contributors to join us!)
 
 ## Citation
 
