@@ -69,12 +69,18 @@ MoE-Infinity is currently only supported on Linux, Ensure the following dependen
 sudo apt install build-essential curl libaio-dev libspdlog-dev
 ```
 
-Pytorch (>=2.0), libstdcxx-ng (>=12.0) and Python (>=3.8) required for MoE-Infinity, please refer to [Pytorch](https://pytorch.org/get-started/locally/) for installation instructions.
+### Install from conda environment
+
+```bash
+conda env create --file environment.yml
+conda activate moe-infinity
+```
 
 ### Install from PyPI
 
 ```bash
 pip install moe-infinity
+conda install -c conda-forge libstdcxx-ng=12 # assume using conda, otherwise install libstdcxx-ng=12 using your package manager or gcc=12
 ```
 
 ### Install from Source
@@ -83,6 +89,7 @@ pip install moe-infinity
 git clone https://github.com/TorchMoE/MoE-Infinity.git
 cd MoE-Infinity
 pip install -e .
+conda install -c conda-forge libstdcxx-ng=12 # assume using conda, otherwise install libstdcxx-ng=12 using your package manager or gcc=12
 ```
 
 ## Usage and Examples
