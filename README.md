@@ -20,13 +20,16 @@ Note that: The open-sourced MoE-Infinity has been redesigned for making it Huggi
 ## Contents
 - [Performance](#performance)
 - [Installation](#installation)
-     - [Prerequisites](#prerequisites)
-     - [Install from PyPI](#install-from-pypi)
-     - [Install from Source](#install-from-source)
+    - [Prerequisites](#prerequisites)
+    - [Install from conda environment](#install-from-conda-environment)
+    - [Install from PyPI](#install-from-pypi)
+    - [Install from Source](#install-from-source)
+    - [Enable FlashAttention (Optional)](#enable-flashattention-optional)
 - [Usage and Examples](#usage-and-examples)
-     - [Sample Code of Huggingface LLM Inference](#sample-code-of-huggingface-llm-inference)
+    - [Sample Code of Huggingface LLM Inference](#sample-code-of-huggingface-llm-inference)
     - [Running Inference](#running-inference)
-- [Roadmap](#roadmap)
+- [Release Plan](#release-plan)
+- [Citation](#citation)
 
 ## Performance
 
@@ -91,6 +94,15 @@ cd MoE-Infinity
 pip install -e .
 conda install -c conda-forge libstdcxx-ng=12 # assume using conda, otherwise install libstdcxx-ng=12 using your package manager or gcc=12
 ```
+
+### Enable FlashAttention (Optional)
+
+Install FlashAttention for faster inference with the following command.
+```bash
+pip install packaing
+FLASH_ATTENTION_FORCE_BUILD=TRUE pip install flash-attn
+```
+Post-installation, MoE-Infinity will automatically integrate with FlashAttention to enhance performance.
 
 ## Usage and Examples
 
