@@ -110,7 +110,7 @@ std::int64_t ArcherPrioAioHandle::Write(const std::string& filename,
 }
 
 ArcherPrioAioContext::ArcherPrioAioContext(const int block_size)
-    : iocb_pool_(), block_size_(block_size)
+    : block_size_(block_size)
 {
     thread_pool_ = std::make_unique<ArcherAioThreadPool>(1);  // only one SSD device
     thread_pool_->Start();
@@ -181,7 +181,6 @@ std::vector<AioCallback> ArcherPrioAioContext::PrepIocbs(const bool read_op,
     const auto n_blocks = total_size / static_cast<std::int64_t>(block_size);
     const auto last_block_size = total_size % static_cast<std::int64_t>(block_size);
     const auto n_iocbs = n_blocks + (last_block_size > 0 ? 1 : 0);
-    auto iocbs = iocb_pool_.getDefaultMany(n_iocbs);
 
     std::vector<AioCallback> callbacks;
 
@@ -191,17 +190,13 @@ std::vector<AioCallback> ArcherPrioAioContext::PrepIocbs(const bool read_op,
         const auto xfer_offset = offset + shift;
         auto byte_count = static_cast<std::int64_t>(block_size);
         if ((shift + block_size) > total_size) { byte_count = total_size - shift; }
-        auto iocb = std::move(iocbs[i]);
         if (read_op) {
-            io_prep_pread(iocb.get(), fd, xfer_buffer, byte_count, xfer_offset);
             auto cb = std::bind(ArcherReadFile, fd, xfer_buffer, byte_count, xfer_offset);
             callbacks.push_back(std::move(cb));
         } else {
-            io_prep_pwrite(iocb.get(), fd, xfer_buffer, byte_count, xfer_offset);
             auto cb = std::bind(ArcherWriteFile, fd, xfer_buffer, byte_count, xfer_offset);
             callbacks.push_back(std::move(cb));
         }
-        iocbs[i] = std::move(iocb);
     }
 
     return callbacks;

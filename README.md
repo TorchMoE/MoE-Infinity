@@ -69,7 +69,7 @@ MoE-Infinity is currently only supported on Linux, Ensure the following dependen
 
 ```bash
 # example of installing dependencies on ubuntu
-sudo apt install build-essential curl libaio-dev libspdlog-dev
+sudo apt install build-essential curl libspdlog-dev
 ```
 
 ### Install from conda environment

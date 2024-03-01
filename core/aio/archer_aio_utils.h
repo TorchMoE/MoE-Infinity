@@ -6,7 +6,6 @@
 #pragma once
 
 #include <fcntl.h>
-#include <libaio.h>
 #include <unistd.h>
 #include <functional>
 

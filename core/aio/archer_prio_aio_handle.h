@@ -72,7 +72,6 @@ public:
                                        const std::int64_t total_size);
 
 private:
-    SimpleObjectPool<struct iocb> iocb_pool_;
     std::int64_t block_size_;
 
     std::mutex io_queue_high_mutex_;
