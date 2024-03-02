@@ -84,7 +84,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
                     experts_[i][j]->module = new MixtralMoEDenseActDense(dtype);
                     break;
                 default:
-                    ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type {}",
+                    ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type ",
                                      expert_type);
             }
             experts_[i][j]->module->eval();
@@ -121,15 +121,12 @@ void ExpertDispatcher::Enqueue(const CallArgs& args)
     auto& a = input_queue_.back();
     if (expert_node->node->device.is_cuda()) { a.gpu_id = expert_node->node->device.index(); }
     ARCHER_LOG_DEBUG(
-        "ExpertDispatcher::Enqueue: num_enqueued_ {} input_queue_ {} gpu_id {} layer_idx {} "
-        "expert_idx "
-        "{} remote {}",
-        num_enqueued_,
-        input_queue_.size(),
-        a.gpu_id,
-        a.layer_idx,
-        a.expert_idx,
-        a.remote);
+        "ExpertDispatcher::Enqueue: num_enqueued_ ", num_enqueued_.load(),
+        "input_queue_ ", input_queue_.size(), \
+        "gpu_id ", a.gpu_id,
+        "layer_idx ", a.layer_idx,
+        "expert_idx ", a.expert_idx,
+        "remote ", a.remote);
 }
 
 void ExpertDispatcher::RegisterExpert(int layer_idx,
@@ -143,7 +140,7 @@ void ExpertDispatcher::RegisterExpert(int layer_idx,
             cached_node = node;
             experts_[expert_idx][layer_idx]->node = node;
         } else if (cached_node != node) {
-            ARCHER_LOG_FATAL("RegisterExpert: tensor_id {} has multiple nodes", tensor_id);
+            ARCHER_LOG_FATAL("RegisterExpert: tensor_id has multiple nodes", tensor_id);
         }
     }
 }
@@ -251,7 +248,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
                 wait_count++;
                 if (wait_count % 100000 == 0) {
-                    ARCHER_LOG_WARN("ExpertDispatcher::EnqueueTask: wait_count {} {}",
+                    ARCHER_LOG_WARN("ExpertDispatcher::EnqueueTask: wait_count ",
                                     wait_count,
                                     expert_node->node->str());
                 }
@@ -262,7 +259,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
             //     {} node {}", gpu_id, layer_idx, expert_idx, expert_node->node->device.str());
         }
         expert_node->SetTensorsFromBlob(device);
-        auto& meta = kTensorIndex->find(expert_node->node->tensor_ids[0])->second;
+        // auto& meta = kTensorIndex->find(expert_node->node->tensor_ids[0])->second;
 
         int expert_type = expert_type_;
         torch::Tensor input;
@@ -276,18 +273,16 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
                 input = hidden_states_.index({token_indices}).to(expert_node->node->device);
                 break;
             default:
-                ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type {}",
+                ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type ",
                                  expert_type);
         }
 
         ARCHER_LOG_DEBUG(
-            "ExpertDispatcher::GPUFetchFunc gpu_id {} layer_idx {} expert_idx {} input {} node {}",
-            gpu_id,
-            layer_idx,
-            expert_idx,
-            input.device().str(),
-            expert_node->node->device.str());
-
+            "ExpertDispatcher::GPUFetchFunc gpu_id ",  gpu_id,
+            "layer_idx ", layer_idx,
+            "expert_idx ", expert_idx,
+            "input ", input.device().str(),
+            "node ", expert_node->node->device.str());
         {
             ExecArgs exec_args;
             exec_args.hidden_states = std::move(input);
@@ -363,7 +358,7 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
                         break;
                     default:
                         ARCHER_LOG_FATAL(
-                            "ExpertDispatcher::ExpertDispatcher: unknown expert type {}",
+                            "ExpertDispatcher::ExpertDispatcher: unknown expert type",
                             expert_type);
                 }
 
@@ -372,10 +367,7 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
                 ss << "DenseActDense tensor_ids: [";
                 for (auto& id : args.expert_node->node->tensor_ids) { ss << id << " "; }
                 ss << "]";
-                ARCHER_LOG_FATAL("ExpertDispatcher::GPUExecFunc: expert_type {} {} exception {}",
-                                 ss.str(),
-                                 expert_type,
-                                 e.what());
+                ARCHER_LOG_FATAL("ExpertDispatcher::GPUExecFunc", ss.str(), "expert_type", expert_type, e.what());
             }
         }
 
@@ -413,14 +405,14 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
                                    args.expert_node->expert_idx,
                                    args.hit);
         ARCHER_LOG_DEBUG(
-            "ExpertDispatcher::OutputFunc: output_queue_ {} output {}, evict  {}, ({},{},{},{})",
-            output_queue_.size(),
-            std::get<0>(output_queue_.back()).device().str(),
-            args.evict,
+            "ExpertDispatcher::OutputFunc: output_queue_", output_queue_.size(),
+            "output", std::get<0>(output_queue_.back()).device().str(),
+            "evict", args.evict,
+            "(", 
             args.expert_node->layer_idx,
             args.expert_node->expert_idx,
             gpu_id,
-            args.hit);
+            args.hit, ")");
     }
     pending_.fetch_sub(1);
 }

@@ -40,9 +40,9 @@ public:
     torch::TensorOptions GetTensorOptions(const std::uint32_t tensor_id) const;
 
 private:
-    bool ValidateTensorMove(const std::uint32_t tensor_id,
-                            const torch::Device& src_device,
-                            const torch::Device& dst_device);
+    // bool ValidateTensorMove(const std::uint32_t tensor_id,
+    //                         const torch::Device& src_device,
+    //                         const torch::Device& dst_device);
     std::string GetIndexFileName(const std::uint32_t file_id) const;
 
 private:

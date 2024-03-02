@@ -29,46 +29,46 @@ ArcherTensorHandle::ArcherTensorHandle(const std::string& prefix)
 
     struct stat st;
     if (stat(prefix_.c_str(), &st) != -1 && !S_ISDIR(st.st_mode)) {
-        ARCHER_LOG_FATAL("Invalid prefix: {} is not a directory", prefix_);
+        ARCHER_LOG_FATAL("Invalid prefix: ", prefix_, " is not a directory");
     }
     if (stat(prefix_.c_str(), &st) == -1) {
-        ARCHER_LOG_WARN("Invalid prefix: {} does not exist, creating", prefix_);
+        ARCHER_LOG_WARN("Invalid prefix: ", prefix_," does not exist, creating");
         mkdir(prefix_.c_str(), 0777);
     }
 
-    ARCHER_LOG_DEBUG("Aio alignment size {}", st.st_blksize);
+    ARCHER_LOG_DEBUG("Aio alignment size ", st.st_blksize);
 
     auto ckpt_index_path = prefix_ + std::string(ARCHER_IHDEX_NAME);
     if (access(ckpt_index_path.c_str(), F_OK) != -1) {
-        ARCHER_LOG_INFO("Loading index file from {}", ckpt_index_path);
+        ARCHER_LOG_INFO("Loading index file from ", ckpt_index_path);
         kTensorIndex->Deserialize(ckpt_index_path.c_str());
         is_serialized_ = true;
     } else {
-        ARCHER_LOG_INFO("Index file {} does not exist, creating", ckpt_index_path);
+        ARCHER_LOG_INFO("Index file", ckpt_index_path," does not exist, creating");
     }
-    ARCHER_LOG_INFO("Index file size {}", kTensorIndex->size());
+    ARCHER_LOG_INFO("Index file size ", kTensorIndex->size());
 }
 
-bool ArcherTensorHandle::ValidateTensorMove(const std::uint32_t tensor_id,
-                                            const torch::Device& src_device,
-                                            const torch::Device& dst_device)
-{
-    auto it = kTensorIndex->find(tensor_id);
-    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor {} does not exist", tensor_id); }
+// bool ArcherTensorHandle::ValidateTensorMove(const std::uint32_t tensor_id,
+//                                             const torch::Device& src_device,
+//                                             const torch::Device& dst_device)
+// {
+//     auto it = kTensorIndex->find(tensor_id);
+//     if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor ", tensor_id, " does not exist"); }
 
-    auto tensor_device = it->second.device;
+//     auto tensor_device = it->second.device;
 
-    if (src_device == dst_device) {
-        ARCHER_LOG_ERROR("Tensor {} [{} -> {}] is on device {}",
-                         tensor_id,
-                         src_device.str(),
-                         dst_device.str(),
-                         tensor_device.str());
-        return false;
-    }
+//     if (src_device == dst_device) {
+//         ARCHER_LOG_ERROR("Tensor {} [{} -> {}] is on device {}",
+//                          tensor_id,
+//                          src_device.str(),
+//                          dst_device.str(),
+//                          tensor_device.str());
+//         return false;
+//     }
 
-    return true;
-}
+//     return true;
+// }
 
 void ArcherTensorHandle::StoreTensor(const std::uint32_t tensor_id, torch::Tensor& buffer)
 {
@@ -106,7 +106,7 @@ void ArcherTensorHandle::StoreTensor(const std::uint32_t tensor_id, torch::Tenso
 int64_t ArcherTensorHandle::GetTensorSizeAligned(const std::uint32_t tensor_id) const
 {
     auto it = kTensorIndex->find(tensor_id);
-    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor {} not found", tensor_id); }
+    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor not found", tensor_id); }
     auto num_bytes = it->second.size;
     std::int64_t num_bytes_aligned = (num_bytes + kAioAlignment - 1) & ~(kAioAlignment - 1);
     return num_bytes_aligned;
@@ -115,7 +115,7 @@ int64_t ArcherTensorHandle::GetTensorSizeAligned(const std::uint32_t tensor_id) 
 torch::TensorOptions ArcherTensorHandle::GetTensorOptions(const std::uint32_t tensor_id) const
 {
     auto it = kTensorIndex->find(tensor_id);
-    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor {} not found", tensor_id); }
+    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor not found", tensor_id); }
     return it->second.options;
 }
 
@@ -124,7 +124,7 @@ void ArcherTensorHandle::SetTensor(std::uint32_t tensor_id,
                                    const torch::Device& device)
 {
     auto it = kTensorIndex->find(tensor_id);
-    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor {} not found", tensor_id); }
+    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor not found", tensor_id); }
     // FIXME: this is may creates extra copy of data, need to be confirmed optimized
     // CANNOT use shallow copy here, e.g., buffer = it->second.tensor.to(DEFAULT_CUDA_DEVICE);
 
@@ -134,22 +134,22 @@ void ArcherTensorHandle::SetTensor(std::uint32_t tensor_id,
 void ArcherTensorHandle::SetTensor(std::uint32_t tensor_id, torch::Tensor& buffer)
 {
     auto it = kTensorIndex->find(tensor_id);
-    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor {} not found", tensor_id); }
+    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor not found", tensor_id); }
     if (buffer.dtype() != it->second.tensor.dtype()) {
         std::ostringstream oss;
         oss << buffer.dtype() << " -> " << it->second.tensor.dtype();
-        ARCHER_LOG_DEBUG("Tensor {} dtype mismatch {}", tensor_id, oss.str());
+        ARCHER_LOG_DEBUG("Tensor dtype mismatch", tensor_id, oss.str());
         buffer.set_data(it->second.tensor.to(buffer.dtype()));
     } else {
         buffer.set_data(it->second.tensor);
     }
-    ARCHER_LOG_DEBUG("Set tensor {} to device {}", tensor_id, buffer.device().str());
+    ARCHER_LOG_DEBUG("Set tensor to device", tensor_id, buffer.device().str());
 }
 
 void ArcherTensorHandle::RegisterTensor(const std::uint32_t tensor_id, torch::Tensor& buffer)
 {
     auto it = kTensorIndex->find(tensor_id);
-    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor {} not found", tensor_id); }
+    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor not found", tensor_id); }
 
     tensor_to_id_.insert(std::make_pair((void*)buffer.data_ptr(), tensor_id));
 
@@ -165,7 +165,7 @@ std::uint32_t ArcherTensorHandle::GetTensorId(void* tensor) const
 {
     auto it = tensor_to_id_.find(tensor);
     if (it == tensor_to_id_.end()) {
-        ARCHER_LOG_CRITICAL("Tensor {} not found", (void*)tensor);
+        ARCHER_LOG_FATAL("Tensor not found", (void*)tensor);
         return UINT32_MAX;
     }
     return it->second;
@@ -175,7 +175,7 @@ void ArcherTensorHandle::UpdateTensorMap(void* old_data_ptr, void* new_data_ptr)
 {
     auto it = tensor_to_id_.find(old_data_ptr);
     if (it == tensor_to_id_.end()) {
-        ARCHER_LOG_FATAL("Tensor {} not found in tensor_to_id_", (void*)old_data_ptr);
+        ARCHER_LOG_FATAL("Tensor ", (void*)old_data_ptr, " not found in tensor_to_id_");
         return;
     }
     auto tensor_id = it->second;
@@ -183,20 +183,20 @@ void ArcherTensorHandle::UpdateTensorMap(void* old_data_ptr, void* new_data_ptr)
 
     auto it2 = kTensorIndex->find(tensor_id);
     if (it2 == kTensorIndex->end()) {
-        ARCHER_LOG_FATAL("Tensor {} not found in tensor_index_", tensor_id);
+        ARCHER_LOG_FATAL("Tensor not found in tensor_index_", tensor_id);
         return;
     }
     tensor_to_id_.insert(std::make_pair(new_data_ptr, tensor_id));
-    ARCHER_LOG_DEBUG("Update tensor {} with address {} to {}",
-                     tensor_id,
-                     (void*)old_data_ptr,
-                     (void*)new_data_ptr);
+    // ARCHER_LOG_DEBUG("Update tensor {} with address {} to {}",
+    //                  tensor_id,
+    //                  (void*)old_data_ptr,
+    //                  (void*)new_data_ptr);
 }
 
 void ArcherTensorHandle::ReadTensor(const uint32_t tensor_id, void* memory_ptr, bool on_demand)
 {
     auto it = kTensorIndex->find(tensor_id);
-    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor {} not found", tensor_id); }
+    if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor not found", tensor_id); }
 
     auto tensor_meta = it->second;
     auto filename = GetIndexFileName(tensor_meta.file_id);

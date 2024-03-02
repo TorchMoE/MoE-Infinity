@@ -492,8 +492,8 @@ void ArcherTopologyHandle::InitializeTopology(
                      dense_nodes.size());
 
     int target_device_id = 0;
-    int dense_gpu_idx = 0;
-    int sparse_gpu_idx = 0;
+    // int dense_gpu_idx = 0;
+    // int sparse_gpu_idx = 0;
 
     // Split evently dense nodes only
     int num_dense_nodes_per_device = std::ceil(dense_nodes.size() / num_gpu / 2);

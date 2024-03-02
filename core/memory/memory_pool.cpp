@@ -34,7 +34,7 @@ void* HostMemoryPool::AllocateMemory(const std::size_t key,
     assert(device.is_cpu());
     std::unique_lock<std::mutex> lock(mutex_);
     if (allocated_id_.find(key) != allocated_id_.end()) {
-        ARCHER_LOG_ERROR("PreAllocateMemory failed, {:x} already allocated", key);
+        ARCHER_LOG_ERROR("PreAllocateMemory failed, already allocated ", key);
         return allocated_id_[key];
     }
     auto allocator = c10::HostCachingAllocator::get();
@@ -51,7 +51,7 @@ int HostMemoryPool::FreeMemory(const std::size_t key,
     assert(device.is_cpu());
     std::unique_lock<std::mutex> lock(mutex_);
     if (allocated_id_.find(key) == allocated_id_.end()) {
-        ARCHER_LOG_ERROR("FreeMemory failed, {:x} not found", key);
+        ARCHER_LOG_ERROR("FreeMemory failed, not found ", key);
         return -1;
     }
     allocated_id_.erase(key);
@@ -95,7 +95,7 @@ void* DeviceMemoryPool::AllocateMemory(const std::size_t key,
     int device_id = device.index();
     std::unique_lock<std::mutex> lock(mutex_);
     if (allocated_id_[device_id].find(key) != allocated_id_[device_id].end()) {
-        ARCHER_LOG_ERROR("PreAllocateMemory failed, {:x} already allocated", key);
+        ARCHER_LOG_ERROR("PreAllocateMemory failed, already allocated ", key);
         return allocated_id_[device_id][key];
     }
     cudaSetDevice(device_id);
@@ -114,7 +114,7 @@ int DeviceMemoryPool::FreeMemory(const std::size_t key,
     int device_id = device.index();
     std::unique_lock<std::mutex> lock(mutex_);
     if (allocated_id_[device_id].find(key) == allocated_id_[device_id].end()) {
-        ARCHER_LOG_ERROR("FreeMemory failed, {:x} not found", key);
+        ARCHER_LOG_ERROR("FreeMemory failed, not found ", key);
         return -1;
     }
     allocated_id_[device_id].erase(key);

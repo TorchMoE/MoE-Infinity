@@ -64,14 +64,6 @@ Higher throughput is preferable.
 
 We recommend installing MoE-Infinity in a virtual environment. To install MoE-Infinity, you can either install it from PyPI or build it from source.
 
-### Prerequisites
-MoE-Infinity is currently only supported on Linux, Ensure the following dependencies are installed on your system:
-
-```bash
-# example of installing dependencies on ubuntu
-sudo apt install build-essential curl libspdlog-dev
-```
-
 ### Install from conda environment
 
 ```bash

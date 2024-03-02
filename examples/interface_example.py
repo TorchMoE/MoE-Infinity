@@ -12,7 +12,6 @@ import multiprocessing as mp
 from transformers import AutoTokenizer, TextStreamer
 from moe_infinity import MoE
 
-cache_dir = "/mnt/raid0sata1/huggingface/hub"
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name_or_path", type=str, required=True)
 parser.add_argument("--offload_dir", type=str, required=True)

@@ -60,7 +60,7 @@ void Node::SetDevice(const torch::Device& target_device,
                      bool on_demand,
                      cudaStream_t stream) noexcept
 {
-    ARCHER_LOG_DEBUG("SetDevice: " + str() + " to " + target_device.str());
+    ARCHER_LOG_DEBUG("SetDevice: ", str(), " to ", target_device.str());
     if (device == target_device) {
         ARCHER_LOG_DEBUG("SetDevice: " + str() + " to " + target_device.str() +
                          " but device is the same");
@@ -76,7 +76,7 @@ void Node::SetDevice(const torch::Device& target_device,
     if (kCudaStreamH2D == NULL) {
         auto cudaError = cudaStreamCreateWithFlags(&kCudaStreamH2D, cudaStreamNonBlocking);
         if (cudaError != cudaSuccess) {
-            ARCHER_LOG_ERROR("cudaStreamCreate failed: {}", cudaGetErrorString(cudaError));
+            ARCHER_LOG_ERROR("cudaStreamCreate failed: ", cudaGetErrorString(cudaError));
             exit(-1);
         }
     }
@@ -102,7 +102,7 @@ void Node::SetDevice(const torch::Device& target_device,
             auto start_time = MCIROSECONDS_SINCE_EPOCH;
             SetModuleMemoryFromDisk(tensor_ids, host_memory_ptr, on_demand);
             auto end_time = MCIROSECONDS_SINCE_EPOCH;
-            ARCHER_LOG_DEBUG("SetModuleMemoryFromDisk time: {} us", end_time - start_time);
+            ARCHER_LOG_DEBUG("SetModuleMemoryFromDisk time:", end_time - start_time, " us");
         }
 
         if (target_device.is_cuda()) {
@@ -686,7 +686,7 @@ void SetModuleMemoryFromCuda(std::vector<TensorID>& tensor_ids, void* host_ptr)
         // void* old_ptr = kTensorIndex->find(tensor_id)->second.tensor.data_ptr();
 
         auto it = kTensorIndex->find(tensor_id);
-        ARCHER_LOG_DEBUG("SetModuleMemoryFromCuda tensor {}", it->second.DebugString());
+        ARCHER_LOG_DEBUG("SetModuleMemoryFromCuda tensor ", it->second.DebugString());
         it->second.tensor.set_data(torch::from_blob((char*)host_ptr + param_size,
                                                     it->second.shape,
                                                     DoNothingDeleter<void>{},

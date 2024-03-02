@@ -23,7 +23,7 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
     kTopologyHandle = std::make_unique<ArcherTopologyHandle>();
     kTaskPool = std::make_unique<ArcherTaskPool>();
     kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
-    ARCHER_LOG_DEBUG("Free Device Memory {}", kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
+    ARCHER_LOG_DEBUG("Free Device Memory ", kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
 
     if (prefix_.back() != '/') { prefix_ += '/'; }
 
@@ -31,7 +31,7 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
     int device_count = 0;
     cudaGetDeviceCount(&device_count);
 
-    ARCHER_LOG_INFO("Device count {}", device_count);
+    ARCHER_LOG_INFO("Device count ", device_count);
 
     for (int i = 0; i < device_count; i++) {
         cudaSetDevice(i);
@@ -54,7 +54,7 @@ void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tenso
 {
     auto tensor_id = kArcherTensorHandle->GetTensorId((void*)buffer.data_ptr());
     void* old_ptr = (void*)buffer.data_ptr();
-    ARCHER_LOG_DEBUG("Acquire tensor {} old_ptr {}", tensor_id, old_ptr);
+    ARCHER_LOG_DEBUG("Acquire tensor ", tensor_id, old_ptr);
 
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
     node->state = 1;
@@ -91,13 +91,13 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id, torch::Tenso
 {
     auto tensor_id = kArcherTensorHandle->GetTensorId((void*)buffer.data_ptr());
     void* old_ptr = (void*)buffer.data_ptr();
-    ARCHER_LOG_DEBUG("Release tensor {} old_ptr {}", tensor_id, old_ptr);
+    ARCHER_LOG_DEBUG("Release tensor ", tensor_id, old_ptr);
 
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
     // node->state = 1;
 
     if (node_id_to_tensor_ids_.find(node->id) == node_id_to_tensor_ids_.end()) {
-        ARCHER_LOG_ERROR("Node {} not found in node_id_to_tensor_ids_", node->str());
+        ARCHER_LOG_ERROR("Node not found in node_id_to_tensor_ids_", node->str());
         return;
     }
 
@@ -131,7 +131,7 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id, torch::Tenso
     }
 
     if (kTopologyHandle->IsLastNode(node)) {
-        ARCHER_LOG_DEBUG("Node {} is last, clean up", node->str());
+        ARCHER_LOG_DEBUG("Node is last, clean up", node->str());
         request_id_to_nodes_.erase(request_id);
     }
 
@@ -219,7 +219,7 @@ void ArcherPrefetchHandle::RegisterModule(torch::nn::Module& module)
 
 void ArcherPrefetchHandle::RegisterTensor(torch::Tensor* tensor)
 {
-    ARCHER_LOG_DEBUG("Register tensor: {}, is view {}", (void*)tensor, tensor->is_view());
+    ARCHER_LOG_DEBUG("Register tensor: is view ", (void*)tensor, tensor->is_view());
 }
 
 torch::Tensor ArcherPrefetchHandle::GetTrace()
@@ -281,7 +281,7 @@ void ArcherPrefetchHandle::TraceRequest(const std::uint64_t request_id, const Te
 
     auto node_it = request_id_to_nodes_[request_id].find(node);
     if (node_it != request_id_to_nodes_[request_id].end()) {
-        ARCHER_LOG_DEBUG("Node {} already traced for request {}", node->str(), request_id);
+        ARCHER_LOG_DEBUG("Node already traced for request ", request_id, node->str());
         return;
     }
 
@@ -309,7 +309,7 @@ void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor, torch::Device 
     void* device_ptr = nullptr;
     auto byte_size = tensor.element_size() * tensor.numel();
 
-    ARCHER_LOG_DEBUG("Set tensor {} to device {}", (void*)tensor.data_ptr(), device.str());
+    ARCHER_LOG_DEBUG("Set tensor to device ", (void*)tensor.data_ptr(), device.str());
 
     // then copy to target device
     cudaSetDevice(device.index());

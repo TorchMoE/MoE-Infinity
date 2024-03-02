@@ -84,12 +84,12 @@ void NllbMoeDenseActDense::SetTensorsFromBlob(void *ptr,
 
 torch::Tensor NllbMoeDenseActDense::forward(torch::Tensor hidden_states)
 {
-    ARCHER_LOG_DEBUG("NllbMoeDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states {}",
-                     fc1.device().str(),
-                     fc1_bias.device().str(),
-                     fc2.device().str(),
-                     fc2_bias.device().str(),
-                     hidden_states.device().str());
+    // ARCHER_LOG_DEBUG("NllbMoeDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states {}",
+    //                  fc1.device().str(),
+    //                  fc1_bias.device().str(),
+    //                  fc2.device().str(),
+    //                  fc2_bias.device().str(),
+    //                  hidden_states.device().str());
     return torch::matmul(torch::relu(torch::matmul(hidden_states, fc1.transpose(0, 1)) + fc1_bias),
                          fc2.transpose(0, 1)) +
            fc2_bias;
@@ -117,12 +117,12 @@ void FSGPTMoEDenseActDense::SetTensorsFromBlob(void *ptr,
 
 torch::Tensor FSGPTMoEDenseActDense::forward(torch::Tensor hidden_states)
 {
-    ARCHER_LOG_DEBUG("FSGPTMoEDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states {}",
-                     fc1.device().str(),
-                     fc1_bias.device().str(),
-                     fc2.device().str(),
-                     fc2_bias.device().str(),
-                     hidden_states.device().str());
+    // ARCHER_LOG_DEBUG("FSGPTMoEDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states {}",
+    //                  fc1.device().str(),
+    //                  fc1_bias.device().str(),
+    //                  fc2.device().str(),
+    //                  fc2_bias.device().str(),
+    //                  hidden_states.device().str());
     if (hidden_states.dtype() != fc1.dtype())
         hidden_states = hidden_states.to(fc1.dtype());
     return torch::matmul(torch::relu(torch::matmul(hidden_states, fc1.transpose(0, 1)) + fc1_bias),

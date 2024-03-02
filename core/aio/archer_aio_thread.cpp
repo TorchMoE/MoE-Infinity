@@ -9,7 +9,7 @@
 
 ArcherAioThread::ArcherAioThread(int thread_id) : thread_id_(thread_id), is_running_(false)
 {
-    ARCHER_LOG_INFO("Create ArcherAioThread for thread: {}", thread_id_);
+    ARCHER_LOG_INFO("Create ArcherAioThread for thread: ", thread_id_);
 }
 
 ArcherAioThread::~ArcherAioThread() { Stop(); }
