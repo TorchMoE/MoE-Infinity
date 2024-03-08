@@ -70,7 +70,6 @@ class PrefetchBuilder(OpBuilder):
             SIMD_WIDTH,
             '-I/usr/local/cuda/include',
             '-L/usr/local/cuda/lib64',
-            '-lspdlog',
             '-lcuda',
             '-lcudart',
             '-lcublas',

@@ -79,7 +79,8 @@ setup(
     version='0.0.1',
     packages=find_packages(exclude=['op_builder', 'op_builder.*', 'moe_infinity.ops.core.*']),
     package_data={
-        'moe_infinity.ops.prefetch': ['ops/core/**', '**/*.so']
+        'moe_infinity.ops.prefetch': ['**/*.so'],
+        'moe_infinity': ['ops/core/**']
     },
     include_package_data=True,
     install_requires=install_requires,
@@ -92,6 +93,7 @@ setup(
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
         "License :: OSI Approved :: Apache Software License",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],

@@ -5,7 +5,6 @@
 
 #pragma once
 
-// #include <spdlog/spdlog.h>
 #include <iostream>
 #include <mutex>
 
@@ -37,31 +36,7 @@ std::string level2str(int level);
 std::string formatstr();
 
 enum ArcherLogLevel { kFatal, kDebug, kInfo, kWarn, kError };
-// class ArcherLogger : public noncopyable {
-// public:
-//     DELETE_COPY_AND_ASSIGN(ArcherLogger);
-//     STATIC_GET_INSTANCE(ArcherLogger);
 
-//     void info(const char* fmt, ...);
-//     void error(const char* fmt, ...);
-//     void warn(const char* fmt, ...);
-//     void debug(const char* fmt, ...);
-//     void fatal(const char* fmt, ...);
-
-// private:
-
-//     std::string formatstr();
-//     std::string level2str(int level);
-
-// private:
-//     static std::shared_ptr<spdlog::logger> kLogger;
-//     static std::once_flag kLoggerFlag;
-//     std::mutex log_mutex_;
-//     int log_level_ = -1;
-//     std::string format_str_;
-// };
-
-// extern std::shared_ptr<spdlog::logger> kLogger;
 extern std::once_flag kLoggerFlag;
 extern int kLogLevel;
 extern std::mutex kLogMutex;
