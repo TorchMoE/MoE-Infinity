@@ -80,26 +80,6 @@ class SyncNllbMoeSparseMLP(nn.Module):
             if token_indices.any():
                 expert_output = expert(hidden_states[token_indices]).to(weights.device)
                 next_states[token_indices] += torch.einsum("b,be->be", weights[token_indices], expert_output)
-        
-        # print("router_mask", router_mask.shape, batch_size, sequence_length)
-        # results = self.expert_executor.dispatch(hidden_states, router_mask,
-        #                                         self.layer_id)
-
-        # # num_experts = torch.sum(torch.sum(router_mask,
-        # #                                   dim=(0, 1)).bool()).item()
-        # num_hits = 0
-        # for output, _, idx, hit in results:
-        #     token_indices = router_mask[..., idx].bool()
-        #     weights = combining_weights[..., idx]
-        #     expert_output = output * (1 - self.moe_token_dropout)
-        #     next_states[token_indices] += torch.einsum(
-        #         "b,be->be", weights[token_indices],
-        #         expert_output.to(weights.device))
-
-        #     num_hits += hit
-
-        # print(
-        #     f"Layer {self.layer_id} - {num_experts} experts - {num_hits} hits")
 
         next_states[next_states == 0] = hidden_states[next_states == 0]
         hidden_states = next_states

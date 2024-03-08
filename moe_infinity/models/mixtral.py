@@ -86,19 +86,6 @@ class SyncMixtralSparseMoeBlock(nn.Module):
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        # results = self.expert_executor.dispatch(hidden_states.to(torch.bfloat16), router_mask, self.layer_id)
-        # num_hits = 0
-        # for output, _, idx, hit in results:
-        #     token_indices = router_mask[..., idx].bool()
-        #     weights = routing_weights_mask[token_indices, idx][:, None]
-
-        #     assert torch.isnan(output).sum() == 0, "output: {} {} {}".format(self.layer_id, idx, output)
-        #     current_hidden_states = output * weights
-        #     # assert torch.sum(current_hidden_states) != 0, "{}, {}, {}".format(routing_weights_mask, idx, token_indices)
-        #     final_hidden_states[token_indices, :] += current_hidden_states
-
-        #     num_hits += hit
-
         for expert_idx in range(self.num_experts):
             # expert_layer = self.experts[expert_idx]
             token_indices = router_mask[:, expert_idx]

@@ -22,6 +22,4 @@ class ExpertCacheEntry:
     timestamp: int = 0
 
     def __hash__(self):
-        # print(self.layer_idx, self.expert_idx, hash((self.layer_idx, self.expert_idx)))
-        # return (self.layer_idx << 16) + self.expert_idx
         return hash((self.layer_idx, self.expert_idx))

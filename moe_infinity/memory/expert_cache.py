@@ -63,14 +63,6 @@ class ExpertCache:
     def set_cache_policy(self, policy: str):
         self.cache_policy = policy
 
-    # def set_score_func(self, type:str):
-    #     if type == "lfu":
-    #         self.score_func = lfu_score
-    #     elif type == "priority":
-    #         self.score_func = priority_score
-    #     else:
-    #         assert False, "Should not reach here"
-
     def get_gpu_sorted_candidates(self):
         if type == "lfu":
             expert_freq = {
@@ -85,9 +77,6 @@ class ExpertCache:
 
     def add_tracer(self, tracer):
         self.tracer = tracer
-
-    # def add_predictor(self, predictor):
-    #     self.predictor = predictor
 
     def unprotect_expert(self, expert_idx: int, layer_idx: int):
         try:
@@ -137,10 +126,6 @@ class ExpertCache:
             )
         else:
             assert False, "Should not reach here"
-        # cache_candidates = lru_score_with_layers(cache_entries, layer_idx)
-        # cache_candidates = lru_score(cache_entries)
-        # cache_candidates = lfu_score(expert_visit_freq)
-        # cache_candidates = oracle_score(expert_freq, decoder_entry)
 
         cache_candidates.sort(key=lambda x: x.r)  # sort by r acending
         cache_candidates_in_gpu = [
@@ -177,11 +162,6 @@ class ExpertCache:
                     self.logger.debug(f"Force evicting expert {candidate_key}")
                     return True
 
-        # self.logger.debug("cache_candidates", cache_candidates)
-        # self.logger.debug("gpu_expert_caches", self.gpu_expert_cache.keys())
-        # self.logger.debug("experts_protected_ondemand", self.experts_protected_ondemand.keys())
-        # self.logger.debug("experts_protected_prefetch", self.experts_protected_prefetch.keys())
-        # self.logger.warning("Cannot evict expert", cache_candidates_in_gpu[0], "from GPU")
         return False
 
     def cpu_evict(self, seq_id, layer_idx):

@@ -39,51 +39,6 @@ class DistributedExpertPrefetcher(object):
     def set_archer_prefetch(self, archer_prefetch):
         self.archer_prefetch = archer_prefetch
 
-    # def prefetch_tensors(
-    #     self,
-    #     layer_id: int,
-    #     router_mask: torch.Tensor,
-    #     expert_tensor_ids,
-    #     n_tokens: int = None,
-    # ):
-    #     if dist.get_rank() != 0:
-    #         return
-
-    #     expert_counts = torch.sum(router_mask, dim=(0, 1)).cpu().numpy()
-    #     index = np.argsort(expert_counts)[::-1]
-
-    #     expert_list = index[expert_counts[index] > 0].tolist()
-    #     tensor_ids = [expert_tensor_ids[e] for e in expert_list]
-
-    #     expert_counts = expert_counts[expert_list]
-    #     expert_input_ratio = (expert_counts / n_tokens).tolist()
-
-    #     start_time = time.perf_counter()
-
-    #     self.archer_prefetch.add_trace(layer_id, expert_list, expert_input_ratio)
-    #     candidates = self.archer_prefetch.get_candidates(layer_id)
-    #     if candidates is None:
-    #         tensor_ids = []
-    #         return
-    #     tensor_ids, tensor_counts = candidates
-    #     device_list = self.device_map_manager.get_target_device(tensor_ids)
-
-    #     end_time = time.perf_counter()
-
-    #     if tensor_ids is not None and len(tensor_ids) > 0:
-    #         self._replace_cache_candidates(tensor_ids)
-
-    #         for meta in device_list:
-    #             rank, gpu_id, tensor_id = meta
-    #             if rank == dist.get_rank():
-    #                 self.archer_engine.enqueue_prefetch(tensor_id, gpu_id)
-    #             else:
-    #                 rpc.rpc_async(
-    #                     f"worker_{rank}",
-    #                     _call_expert_prefetcher,
-    #                     args=("enqueue_prefetch", tensor_id, gpu_id),
-    #                 )
-
     def prefetch_experts(self, layer_id, expert_matrix):
         expert_list = []
         # print("expert_tensor_map", self.expert_tensor_map)
@@ -123,6 +78,3 @@ class DistributedExpertPrefetcher(object):
                     args=("replace_cache_candidates", tensor_ids),
                 )
                 futures.append(future)
-
-        # for future in futures:
-        #     future.wait()

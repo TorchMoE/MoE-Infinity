@@ -30,34 +30,11 @@ class DistributedExpertExecutor:
         self.device_map_manager = device_map_manager
 
     def dispatch(self, hidden_states, router_mask, layer_id):
-
-        # if len(router_mask.shape) >= 3:
-        #     router_mask = router_mask.squeeze(0)
-        
-        # print("router_mask", router_mask.shape, "rank", dist.get_rank())
-        # print("hidden_states", hidden_states.shape, "rank", dist.get_rank())
-
         num_expert = router_mask.shape[-1]
         expert_count = torch.sum(router_mask.view((-1, num_expert)), dim=0).cpu().numpy().flatten()
 
         expert_list = np.arange(num_expert).astype(int)[
             expert_count > 0].tolist()
-        
-        # print("expert_list", expert_list, "rank", dist.get_rank())
-        
-        
-        # n_tokens = hidden_states.shape[1] * hidden_states.shape[0]
-        # n_experts = router_mask.shape[-1]
-
-        # expert_counts = torch.sum(router_mask,
-        #                           dim=(0, 1)).cpu().numpy().flatten()
-        # expert_counts = expert_counts / n_tokens
-
-        # # original_device = hidden_states.device
-
-        # expert_list = np.arange(n_experts).astype(int)[
-        #     expert_counts > 0].tolist()
-        # expert_counts = expert_counts[expert_counts > 0].tolist()
 
         device_list = self.device_map_manager.get_target_device(expert_list)
         visited_ranks = set()

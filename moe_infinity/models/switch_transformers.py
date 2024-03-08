@@ -97,20 +97,6 @@ class SyncSwitchTransformersSparseMLP(nn.Module):
             if token_indices.any():
                 next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.device)
 
-        # results = self.expert_executor.dispatch(hidden_states, router_mask,
-        #                                         self.layer_id)
-
-        # # num_experts = torch.sum(torch.sum(router_mask,
-        # #                                   dim=(0, 1)).bool()).item()
-        # num_hits = 0
-        # for output, _, idx, hit in results:
-        #     token_indices = router_mask[:, :, idx].bool()
-        #     next_states[token_indices] = output.to(next_states.device)
-
-        #     num_hits += hit
-
-        # print(
-        #     f"Layer {self.layer_id} - {num_experts} experts - {num_hits} hits")
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits.to("cuda:0", non_blocking=True),
                                expert_index.to("cuda:0", non_blocking=True))

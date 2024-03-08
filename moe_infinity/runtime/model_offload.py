@@ -25,11 +25,6 @@ from moe_infinity.models import (
 from moe_infinity.utils import ArcherConfig
 from moe_infinity.utils.arguments import copy_args_to_device, copy_kwargs_to_device
 
-# from moe_infinity.distributed import (
-#     DistributedExpertExecutor,
-#     DeviceMapManager,
-#     ExpertPrefetcher,
-# )
 from moe_infinity.memory import ExpertPrefetcher
 import moe_infinity
 from moe_infinity.utils import (
@@ -118,10 +113,7 @@ class OffloadEngine(object):
 
         self.checkpoint = _archer_config.offload_path
 
-        # self.archer_prefetch = ArcherPrefetchTrace(self.checkpoint)
-        # self.archer_prefetch.archer_config = _archer_config
 
-        # mkdir -p _archer_config.checkpoint
         os.makedirs(self.checkpoint, exist_ok=True)
 
         # print("Waiting for distributed init ...")
