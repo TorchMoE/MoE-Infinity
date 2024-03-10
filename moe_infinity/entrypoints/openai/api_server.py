@@ -24,25 +24,34 @@ import time
 from typing import Tuple
 from queue import Queue
 
-from transformers import AutoTokenizer, TextStreamer
-# from moe_infinity import MoE
-from transformers import OPTForCausalLM
+from transformers import TextStreamer
+from moe_infinity import MoE
 import torch
+from transformers import AutoTokenizer, SwitchTransformersForConditionalGeneration
 
 import fastapi
 import uvicorn
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
-from moe_infinity.entrypoints.openai.protocol import (
-    ChatCompletionRequest, ChatCompletionResponse,
-    ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse, ChatMessage, DeltaMessage, ErrorResponse,
+# from moe_infinity.entrypoints.openai.protocol import (
+#     ChatCompletionRequest, ChatCompletionResponse,
+#     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
+#     ChatCompletionStreamResponse, ChatMessage, DeltaMessage, ErrorResponse,
+#     CompletionRequest, CompletionResponse,
+#     CompletionResponseChoice,
+#     ModelPermission, ModelCard, ModelList,
+#     UsageInfo)
+# from moe_infinity.entrypoints.openai.protocol import random_uuid
+
+from protocol import (
+    ChatCompletionRequest, ChatCompletionResponse, 
+    ChatCompletionResponseChoice, ChatMessage, DeltaMessage, ErrorResponse,
     CompletionRequest, CompletionResponse,
     CompletionResponseChoice,
     ModelPermission, ModelCard, ModelList,
     UsageInfo)
-from moe_infinity.entrypoints.openai.protocol import random_uuid
+from protocol import random_uuid
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 # logger = init_logger(__name__)
@@ -141,11 +150,11 @@ async def chat_completion(request: ChatCompletionRequest,
     prompt = tokenizer.apply_chat_template(
         conversation=request.messages,
         tokenize=False,
-        add_generation_prompt=request.add_generation_prompt
     )
     print(f"prompt: {prompt}")
 
     token_ids = tokenizer.encode(prompt, return_tensors="pt")
+    token_ids = token_ids.to("cuda:0")
     print(f"token_ids: {token_ids}")
     num_prompt_tokens = token_ids.size(1)
 
@@ -176,18 +185,6 @@ async def chat_completion(request: ChatCompletionRequest,
         finish_reason="stop",
     )
     choices.append(choice_data)
-
-    if request.echo:
-        last_msg_content = ""
-        if request.messages and isinstance(
-                request.messages, list) and request.messages[-1].get(
-                    "content") and request.messages[-1].get(
-                        "role") == role:
-            last_msg_content = request.messages[-1]["content"]
-
-        for choice in choices:
-            full_message = last_msg_content + choice.message.content
-            choice.message.content = full_message
 
     usage = UsageInfo(
         prompt_tokens=num_prompt_tokens,
@@ -222,6 +219,7 @@ async def completion(request: CompletionRequest, raw_request: Request):
         else:
             input_ids = tokenizer.encode(prompt, return_tensors="pt")
 
+        input_ids = input_ids.to("cuda:0")
         streamer = TokenStreamer(tokenizer)
 
         token = model_queue.get()
@@ -269,14 +267,15 @@ if __name__ == "__main__":
     print(f"args: {args}")
 
     model_name = args.model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-16")
 
     config = {
         "offload_path": os.path.join(args.offload_dir, model_name),
         "device_memory_ratio": args.device_memory_ratio,
     }
-    # model = MoE(args.model_name_or_path, config)
-    model = OPTForCausalLM.from_pretrained(model_name)
+    model = MoE("google/switch-base-16", config)
+    # model = SwitchTransformersForConditionalGeneration.from_pretrained("google/switch-base-16", torch_dtype=torch.float16)
+    # model = OPTForCausalLM.from_pretrained(model_name)
     model_queue = Queue()
     model_queue.put("token")
 
