@@ -9,7 +9,6 @@
 
 #include "archer_prio_aio_handle.h"
 #include "archer_tensor_index.h"
-// #include "deepspeed_aio_types.h"
 #include "utils/noncopyable.h"
 
 extern const char* ARCHER_PARAM_NAME;

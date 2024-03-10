@@ -17,11 +17,6 @@
 static const std::size_t kAioAlignment = 4096;
 using IocbPtr = typename SimpleObjectPool<struct iocb>::Pointer;
 
-// struct thread_sync_t {
-//     std::mutex _mutex;
-//     std::condition_variable _cond_var;
-// };
-
 struct AioRequest {
     // std::vector<IocbPtr> iocbs;
     std::vector<AioCallback> callbacks;
@@ -30,37 +25,11 @@ struct AioRequest {
     std::atomic<int> pending_callbacks;
 };
 
-// struct aio_prio_context {
-//     io_context_t _io_ctx;
-//     std::deque<std::shared_ptr<io_request_t>> _io_queue_high_priority;
-//     std::deque<std::shared_ptr<io_request_t>> _io_queue_low_priority;
-
-//     std::vector<struct io_event> _io_events;
-//     std::vector<struct iocb*> _iocbs;
-//     std::mutex _io_mutex_high;
-//     std::mutex _io_mutex_low;
-//     int _block_size;
-//     int _queue_depth;
-
-//     aio_prio_context(const int block_size);
-//     ~aio_prio_context();
-
-//     void schedule();
-//     void submit_io(IocbPtr& iocb_to_submit);
-//     void wait(int n_completes);
-//     void submit_io_batch(std::vector<IocbPtr>& iocbs_to_submit);
-//     // void submit_io_overlap(std::vector<IocbPtr>& iocbs_to_submit);
-//     void accept_request(std::shared_ptr<struct io_request_t> io_request, bool high_prio);
-// };
-
 class ArcherPrioAioContext {
 public:
     explicit ArcherPrioAioContext(const int block_size);
     ~ArcherPrioAioContext();
 
-    // void SubmitIo(IocbPtr& iocb_to_submit);
-    // void Wait(int n_completes);
-    // void SubmitIoBatch(std::vector<IocbPtr>& iocbs_to_submit);
     void AcceptRequest(std::shared_ptr<AioRequest>& io_request, bool high_prio);
 
     void Schedule();

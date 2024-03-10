@@ -364,7 +364,7 @@ class OffloadEngine(object):
                     ):
                         state_dict = {}
                         if "safetensors" in ckpt:
-                            with safe_open(ckpt, "pt") as f:
+                            with safe_open(ckpt, framework="pt", device='cpu') as f:
                                 for k in f.keys():
                                     state_dict[k] = f.get_tensor(k)
                         else:
@@ -372,7 +372,7 @@ class OffloadEngine(object):
 
                         # convert all tensors in state_dict to self.dtype
                         for k, v in state_dict.items():
-                            state_dict[k] = v.to(self.dtype)
+                            state_dict[k] = v.to(self.dtype).to("cpu")
 
                         self._offload_state_dict(state_dict, empty_state_dict)
 

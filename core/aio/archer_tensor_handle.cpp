@@ -49,27 +49,6 @@ ArcherTensorHandle::ArcherTensorHandle(const std::string& prefix)
     ARCHER_LOG_INFO("Index file size ", kTensorIndex->size());
 }
 
-// bool ArcherTensorHandle::ValidateTensorMove(const std::uint32_t tensor_id,
-//                                             const torch::Device& src_device,
-//                                             const torch::Device& dst_device)
-// {
-//     auto it = kTensorIndex->find(tensor_id);
-//     if (it == kTensorIndex->end()) { ARCHER_LOG_FATAL("Tensor ", tensor_id, " does not exist"); }
-
-//     auto tensor_device = it->second.device;
-
-//     if (src_device == dst_device) {
-//         ARCHER_LOG_ERROR("Tensor {} [{} -> {}] is on device {}",
-//                          tensor_id,
-//                          src_device.str(),
-//                          dst_device.str(),
-//                          tensor_device.str());
-//         return false;
-//     }
-
-//     return true;
-// }
-
 void ArcherTensorHandle::StoreTensor(const std::uint32_t tensor_id, torch::Tensor& buffer)
 {
     auto it = kTensorIndex->find(tensor_id);
