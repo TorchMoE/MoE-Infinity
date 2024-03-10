@@ -84,14 +84,13 @@ conda install -c conda-forge libstdcxx-ng=12 # assume using conda, otherwise ins
 git clone https://github.com/TorchMoE/MoE-Infinity.git
 cd MoE-Infinity
 pip install -e .
-conda install -c conda-forge libstdcxx-ng=12 # assume using conda, otherwise install libstdcxx-ng=12 using your package manager or gcc=12
 ```
 
 ### Enable FlashAttention (Optional)
 
-Install FlashAttention for faster inference with the following command.
+Install FlashAttention (>=2.5.2) for faster inference with the following command.
 ```bash
-pip install packaing
+pip install packaging 
 FLASH_ATTENTION_FORCE_BUILD=TRUE pip install flash-attn
 ```
 Post-installation, MoE-Infinity will automatically integrate with FlashAttention to enhance performance.
