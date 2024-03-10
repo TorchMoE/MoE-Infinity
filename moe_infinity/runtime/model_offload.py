@@ -113,7 +113,6 @@ class OffloadEngine(object):
 
         self.checkpoint = _archer_config.offload_path
 
-
         os.makedirs(self.checkpoint, exist_ok=True)
 
         # print("Waiting for distributed init ...")
@@ -364,7 +363,7 @@ class OffloadEngine(object):
                     ):
                         state_dict = {}
                         if "safetensors" in ckpt:
-                            with safe_open(ckpt, framework="pt", device='cpu') as f:
+                            with safe_open(ckpt, framework="pt", device="cpu") as f:
                                 for k in f.keys():
                                     state_dict[k] = f.get_tensor(k)
                         else:
@@ -402,7 +401,13 @@ class OffloadEngine(object):
                 is_flash_attn_available = kwargs.get("is_flash_attn_available", False)
                 # self.archer_prefetch.n_layer, self.archer_prefetch.n_expert, n_encoder_layers = parse_moe_param(self.config)
                 if self.dtype_cls is torch.bfloat16 or self.dtype_cls is torch.float16:
-                    model = cls._from_config(self.config, torch_dtype=self.dtype_cls, attn_implementation="flash_attention_2" if is_flash_attn_available else "eager")
+                    model = cls._from_config(
+                        self.config,
+                        torch_dtype=self.dtype_cls,
+                        attn_implementation=(
+                            "flash_attention_2" if is_flash_attn_available else "eager"
+                        ),
+                    )
                 else:
                     model = cls._from_config(self.config)
 
@@ -413,14 +418,16 @@ class OffloadEngine(object):
                 # for name, param in model.named_parameters(recurse=False):
                 #     print(name, param.dtype, flush=True)
 
-                # print(model, flush=True)
+                # print(self.config, flush=True)
 
                 if hasattr(self.config, "quantization_config"):
                     self.quant_method = self.config.quantization_config["quant_method"]
-
+                    self.config.quantization_config["use_exllama"] = False
+                    self.config.quantization_config["disable_exllama"] = True
+                    # print("Quantizing model ...", self.quant_method, flush=True)
                     if self.quant_method == "gptq":
                         from optimum.gptq import GPTQQuantizer
-
+                        # print("Quantizing model with GPTQ ...", self.config.quantization_config, flush=True)
                         optimum_quantizer = GPTQQuantizer.from_dict(
                             self.config.quantization_config
                         )
@@ -709,9 +716,8 @@ class OffloadEngine(object):
     def setup_archer_hooks(self, model):
 
         for name, param in model.named_parameters(recurse=True):
-            if (
-                name not in self.name_id_map
-            ):  # or "embed" in name or "shared" in name or "lm_head" in name:
+            if name not in self.name_id_map:
+                # print("param not in self.name_id_map", name)
                 continue
             self.archer_engine.register(param.data, self.name_id_map[name])
             self.offload_set.add(param.data.data_ptr())
@@ -720,7 +726,8 @@ class OffloadEngine(object):
                 self.offload_exemption.add(param.data.data_ptr())
 
         for name, buffer in model.named_buffers(recurse=True):
-            if name not in self.name_id_map:  # or "embed" in name:
+            if name not in self.name_id_map:
+                # print("buffer not in self.name_id_map", name)
                 continue
             self.archer_engine.register(buffer.data, self.name_id_map[name])
             self.offload_set.add(buffer.data.data_ptr())
@@ -870,14 +877,17 @@ class OffloadEngine(object):
 
             for name, param in module.named_parameters(recurse=False):
 
-                # if not param.data.data_ptr() in self.offload_set:
-                #     if param.data.shape == torch.Size([1]):
-                #         param.data = torch.rand(module.param_real_shape[name])
-                #         param.data = torch.nn.init.kaiming_uniform_(
-                #             param.data, a=math.sqrt(5))
-                #     num_devices = torch.cuda.device_count()
-                #     param.data = param.data.to(f"cuda:{num_devices-1}")
-                #     continue
+                if not param.data.data_ptr() in self.offload_set:
+                    # if param.data.shape == torch.Size([1]):
+                    #     param.data = torch.rand(module.param_real_shape[name])
+                    #     param.data = torch.nn.init.kaiming_uniform_(
+                    #         param.data, a=math.sqrt(5))
+                    # print(
+                    #     "offload param", name, param.data.data_ptr(), param.data.shape
+                    # )
+                    num_devices = torch.cuda.device_count()
+                    param.data = param.data.to(f"cuda:{num_devices-1}")
+                    continue
 
                 self.offload_set.remove(param.data.data_ptr())
                 self.archer_engine.begin(self.request_id, param)
@@ -889,9 +899,9 @@ class OffloadEngine(object):
             for name, buf in module.named_buffers(recurse=False):
 
                 if not buf.data.data_ptr() in self.offload_set:
-                    if buf.data.shape == torch.Size([1]):
-                        buf.data = torch.rand(module.param_real_shape[name])
-
+                    # if buf.data.shape == torch.Size([1]):
+                    #     buf.data = torch.rand(module.param_real_shape[name])
+                    # print("offload buffer", name, buf.data.data_ptr(), buf.data.shape)
                     buf.data = buf.data.to("cuda:0")
                     continue
 

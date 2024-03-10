@@ -90,7 +90,6 @@ pip install -e .
 
 Install FlashAttention (>=2.5.2) for faster inference with the following command.
 ```bash
-pip install packaging 
 FLASH_ATTENTION_FORCE_BUILD=TRUE pip install flash-attn
 ```
 Post-installation, MoE-Infinity will automatically integrate with FlashAttention to enhance performance.

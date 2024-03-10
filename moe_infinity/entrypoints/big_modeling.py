@@ -111,6 +111,9 @@ class MoE:
             import flash_attn
 
             is_flash_attn_available = True
+
+            if arch == "switch":
+                is_flash_attn_available = False
         except ImportError:
             print(
                 "[WARNING] FlashAttention is not available in the current environment. Using default attention."
