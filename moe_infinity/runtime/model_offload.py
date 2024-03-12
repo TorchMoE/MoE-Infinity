@@ -249,7 +249,6 @@ class OffloadEngine(object):
                 orig_param_init(cls, *args, **kwargs)
 
                 cls.param_real_shape = {}
-
                 for name, param in cls.named_parameters(recurse=False):
                     cls.param_real_shape[name] = param.shape
                     param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
@@ -261,6 +260,19 @@ class OffloadEngine(object):
                     self.model_create_counter.update(1)
 
             return archer_param_init
+        
+        def cast_classifier_decorator(orig_cast_classifier: Callable) -> Callable:
+
+            @functools.wraps(orig_cast_classifier)
+            def archer_cast_classifier(cls, *args, **kwargs):
+                orig_data_ptr = cls.classifier.weight.data.data_ptr()
+                self.offload_set.remove(cls.classifier.weight.data.data_ptr())
+                orig_cast_classifier(cls, *args, **kwargs)
+                new_data_ptr = cls.classifier.weight.data.data_ptr()
+                self.offload_set.add(cls.classifier.weight.data.data_ptr())
+                self.archer_engine.update_tensor_map(orig_data_ptr, new_data_ptr)
+
+            return archer_cast_classifier
 
         self.cls._old_init = self.cls.__init__
         self.cls.__init__ = init_decorator(self.cls._old_init)
@@ -313,6 +325,8 @@ class OffloadEngine(object):
             if hasattr(module, "reset_parameters"):
                 module._old_reset_parameters = module.reset_parameters
                 module.reset_parameters = do_nothing_decorator(module.reset_parameters)
+                
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier =  cast_classifier_decorator(transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier)  
 
         transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp = (
             transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP
@@ -714,10 +728,8 @@ class OffloadEngine(object):
         return topology
 
     def setup_archer_hooks(self, model):
-
         for name, param in model.named_parameters(recurse=True):
             if name not in self.name_id_map:
-                # print("param not in self.name_id_map", name)
                 continue
             self.archer_engine.register(param.data, self.name_id_map[name])
             self.offload_set.add(param.data.data_ptr())
@@ -727,7 +739,6 @@ class OffloadEngine(object):
 
         for name, buffer in model.named_buffers(recurse=True):
             if name not in self.name_id_map:
-                # print("buffer not in self.name_id_map", name)
                 continue
             self.archer_engine.register(buffer.data, self.name_id_map[name])
             self.offload_set.add(buffer.data.data_ptr())
@@ -876,22 +887,13 @@ class OffloadEngine(object):
             device_list = []
 
             for name, param in module.named_parameters(recurse=False):
-
                 if not param.data.data_ptr() in self.offload_set:
-                    # if param.data.shape == torch.Size([1]):
-                    #     param.data = torch.rand(module.param_real_shape[name])
-                    #     param.data = torch.nn.init.kaiming_uniform_(
-                    #         param.data, a=math.sqrt(5))
-                    # print(
-                    #     "offload param", name, param.data.data_ptr(), param.data.shape
-                    # )
                     num_devices = torch.cuda.device_count()
                     param.data = param.data.to(f"cuda:{num_devices-1}")
                     continue
 
                 self.offload_set.remove(param.data.data_ptr())
                 self.archer_engine.begin(self.request_id, param)
-                # param.data = param.data.to(self.dtype)
                 self.offload_set.add(param.data.data_ptr())
 
                 device_list.append(param.data.device)
@@ -899,9 +901,6 @@ class OffloadEngine(object):
             for name, buf in module.named_buffers(recurse=False):
 
                 if not buf.data.data_ptr() in self.offload_set:
-                    # if buf.data.shape == torch.Size([1]):
-                    #     buf.data = torch.rand(module.param_real_shape[name])
-                    # print("offload buffer", name, buf.data.data_ptr(), buf.data.shape)
                     buf.data = buf.data.to("cuda:0")
                     continue
 

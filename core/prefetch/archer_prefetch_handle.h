@@ -40,7 +40,7 @@ public:
     void TraceRequest(const std::uint64_t request_id, const TensorID tensor_id);
     void SetTopology(
         const std::vector<std::tuple<std::string, std::vector<std::vector<TensorID>>>>& topology);
-
+    void UpdateTensorMap(std::uint64_t old_ptr, std::uint64_t new_ptr);
     bool IsTensorIndexInitialized() const;
     bool IsTensorOnDevice(const torch::Tensor& tensor) const;
     bool IsTensorOnDevice(const TensorID tensor_id) const;

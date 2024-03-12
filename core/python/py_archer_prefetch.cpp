@@ -16,9 +16,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("register",
              (void(ArcherPrefetchHandle::*)(torch::Tensor&, const std::uint32_t)) &
                  ArcherPrefetchHandle::RegisterTensor)
-     //    .def("register",
-     //         (void(ArcherPrefetchHandle::*)(torch::nn::Module&)) &
-     //             ArcherPrefetchHandle::RegisterModule)
+        //    .def("register",
+        //         (void(ArcherPrefetchHandle::*)(torch::nn::Module&)) &
+        //             ArcherPrefetchHandle::RegisterModule)
         .def("register",
              (void(ArcherPrefetchHandle::*)(torch::Tensor*)) & ArcherPrefetchHandle::RegisterTensor)
         .def("set_tensor_device",
@@ -39,19 +39,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         // .def("end",
         //      (void (ArcherPrefetchHandle::*)(torch::Tensor&, const std::uint32_t)) &
         //          ArcherPrefetchHandle::ReleaseTensor)
-     //    .def("get_trace",
-          //    (torch::Tensor(ArcherPrefetchHandle::*)()) & ArcherPrefetchHandle::GetTrace)
+        //    .def("get_trace",
+        //    (torch::Tensor(ArcherPrefetchHandle::*)()) & ArcherPrefetchHandle::GetTrace)
         .def("get_hit_rate",
              (torch::Tensor(ArcherPrefetchHandle::*)()) & ArcherPrefetchHandle::GetHitRate)
         .def("set_trace",
              (void(ArcherPrefetchHandle::*)(const torch::Tensor&)) & ArcherPrefetchHandle::SetTrace)
-     //    .def("trace_request",
-     //         (void(ArcherPrefetchHandle::*)(const std::uint64_t, const std::uint32_t)) &
-     //             ArcherPrefetchHandle::TraceRequest)
+        //    .def("trace_request",
+        //         (void(ArcherPrefetchHandle::*)(const std::uint64_t, const std::uint32_t)) &
+        //             ArcherPrefetchHandle::TraceRequest)
         .def("set_topology",
              (void(ArcherPrefetchHandle::*)(
                  const std::vector<std::tuple<std::string, std::vector<std::vector<TensorID>>>>&)) &
                  ArcherPrefetchHandle::SetTopology)
+        .def("update_tensor_map",
+             (void(ArcherPrefetchHandle::*)(std::uint64_t, std::uint64_t)) &
+                 ArcherPrefetchHandle::UpdateTensorMap)
         .def("is_tensor_offloaded", &ArcherPrefetchHandle::IsTensorOffloaded)
         .def("is_tensor_index_initialized", &ArcherPrefetchHandle::IsTensorIndexInitialized)
         .def("is_tensor_on_device",

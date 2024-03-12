@@ -337,6 +337,11 @@ bool ArcherPrefetchHandle::IsTensorOnDevice(const torch::Tensor& tensor) const
     return node->device.is_cuda();
 }
 
+void ArcherPrefetchHandle::UpdateTensorMap(std::uint64_t old_data_ptr, std::uint64_t new_data_ptr)
+{
+    kArcherTensorHandle->UpdateTensorMap((void*)old_data_ptr, (void*)new_data_ptr);
+}
+
 bool ArcherPrefetchHandle::IsTensorOnDevice(const TensorID tensor_id) const
 {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
