@@ -163,26 +163,28 @@ class MoE:
             # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             return self.model.generate(input_ids, **kwargs)
 
-    def forward(self, **kwargs) -> Any:
+    def forward(self, *args, **kwargs) -> Any:
         """
         Forwards the input through the model.
 
         Args:
-            **kwargs: Additional arguments for the model's forward method.
+            *args: Additional positional arguments for the model's forward method.
+            **kwargs: Additional keyword arguments for the model's forward method.
 
         Returns:
             Any: The output of the model.
         """
-        return self.model(**kwargs)
+        return self.model(*args, **kwargs)
     
-    def __call__(self, **kwargs) -> Any:
+    def __call__(self, *args, **kwargs) -> Any:
         """
         Forwards the input through the model.
 
         Args:
-            **kwargs: Additional arguments for the model's forward method.
+            *args: Additional positional arguments for the model's forward method.
+            **kwargs: Additional keyword arguments for the model's forward method.
 
         Returns:
             Any: The output of the model.
         """
-        return self.forward(**kwargs)
+        return self.forward(*args, **kwargs)
