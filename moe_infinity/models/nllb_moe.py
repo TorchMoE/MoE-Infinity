@@ -68,9 +68,6 @@ class SyncNllbMoeSparseMLP(nn.Module):
             expert_matrix = self.expert_predictor.predict(seq_id, expert_index[i], self.layer_id)
             self.expert_prefetcher.prefetch_experts(self.layer_id, expert_matrix)
         
-        # self.expert_prefetcher.prefetch_tensors(self.layer_id, router_mask,
-        #                                         self.expert_tensor_ids,
-        #                                         n_tokens)
             
         for expert_id, expert in self.experts.items():
             idx = int(expert_id.split("_")[-1])

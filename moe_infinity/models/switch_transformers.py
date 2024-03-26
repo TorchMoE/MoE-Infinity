@@ -87,15 +87,18 @@ class SyncSwitchTransformersSparseMLP(nn.Module):
             expert_matrix = self.expert_predictor.predict(seq_id, expert_index[i], self.layer_id)
             self.expert_prefetcher.prefetch_experts(self.layer_id, expert_matrix)
 
-        # self.expert_prefetcher.prefetch_tensors(self.layer_id, router_mask,
-        #                                         self.expert_tensor_ids,
-        #                                         n_tokens)
-            
-        for expert_id, expert in self.experts.items():
-            idx = int(expert_id.split("_")[-1])
+
+        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
+
+        for output, _, idx, _ in results:
             token_indices = router_mask[:, :, idx].bool()
-            if token_indices.any():
-                next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.device)
+            next_states[token_indices] = output.to(next_states.device)
+            
+        # for expert_id, expert in self.experts.items():
+        #     idx = int(expert_id.split("_")[-1])
+        #     token_indices = router_mask[:, :, idx].bool()
+        #     if token_indices.any():
+        #         next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.device)
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits.to("cuda:0", non_blocking=True),
