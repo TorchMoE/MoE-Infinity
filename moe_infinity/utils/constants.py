@@ -5,11 +5,14 @@ from transformers import (
     OPTForCausalLM,
 )
 
+from ..modeling_grok.modeling_grok1 import Grok1ModelForCausalLM # TODO: Replace this with huggingface transformers
+
 MODEL_MAPPING_NAMES = {
     "switch": SwitchTransformersForConditionalGeneration,
     "nllb": NllbMoeForConditionalGeneration,
     "mixtral": MixtralForCausalLM,
-    "opt": OPTForCausalLM
+    "opt": OPTForCausalLM,
+    "grok": Grok1ModelForCausalLM,
 }
 
 
@@ -23,4 +26,5 @@ MODEL_MAPPING_TYPES = {
     "switch": 0,
     "nllb": 2,
     "mixtral": 4,
+    "grok": 4,
 }

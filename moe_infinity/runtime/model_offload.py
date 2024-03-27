@@ -21,6 +21,7 @@ from moe_infinity.models import (
     SyncSwitchTransformersSparseMLP,
     SyncNllbMoeSparseMLP,
     SyncMixtralSparseMoeBlock,
+    SyncGrokMoeBlock,
 )
 from moe_infinity.utils import ArcherConfig
 from moe_infinity.utils.arguments import copy_args_to_device, copy_kwargs_to_device
@@ -347,6 +348,10 @@ class OffloadEngine(object):
         transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock = (
             SyncMixtralSparseMoeBlock
         )
+        moe_infinity.modeling_grok.modeling_grok1._old_sparse_mlp = moe_infinity.modeling_grok.modeling_grok1.MoeBlock
+        moe_infinity.modeling_grok.modeling_grok1.MoeBlock = SyncGrokMoeBlock
+        
+        
 
         def from_pretrained_decorator(orig_from_pretrained: Callable) -> Callable:
 
@@ -531,6 +536,7 @@ class OffloadEngine(object):
                         or isinstance(module, SyncSwitchTransformersSparseMLP)
                         or isinstance(module, SyncNllbMoeSparseMLP)
                         or isinstance(module, SyncMixtralSparseMoeBlock)
+                        or isinstance(module, SyncGrokMoeBlock)
                     ):
                         # module.archer_prefetch = self.archer_prefetch
                         # module.archer_tracer = self.archer_tracer
@@ -768,8 +774,6 @@ class OffloadEngine(object):
             keys = key.split(".")
             # print(keys)
             m = model
-            # parameter_names = list(m.state_dict().keys())
-            # print(parameter_names)
             for k in keys:
                 if k.isdigit():
                     m = m[int(k)]
@@ -803,7 +807,7 @@ class OffloadEngine(object):
                 for expert_idx, expert_tensors in enumerate(tensors):
                     expert_key = (
                         f"{key}.expert_{expert_idx}"
-                        if self.config.model_type != "mixtral"
+                        if self.config.model_type != "mixtral" and self.config.model_type != "grok-1"
                         else f"{key}.{expert_idx}"
                     )
                     input_device_index = self.archer_engine.get_node_default_device(
