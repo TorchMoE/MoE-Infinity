@@ -36,7 +36,7 @@ Note that: The open-sourced MoE-Infinity has been redesigned for making it Huggi
 Single GPU A5000 (24GB Memory), per-token-latency (seconds) for generation with a mixed dataset that includes [FLAN](https://huggingface.co/datasets/Muennighoff/flan), [BIG-Bench](https://huggingface.co/datasets/bigbench) and [MMLU](https://huggingface.co/datasets/lukaemon/mmlu) datasets.
 Lower per-token-latency is preferable.
 
-|  | switch-large-128 | NLLB-MoE-54B | Mixtral-7x8b |
+|  | switch-large-128 | NLLB-MoE-54B | Mixtral-8x7b |
 | :---: | :---: | :---: | :---: |
 | <ins>MoE-Infinity</ins> | <ins>*0.230*</ins>	| <ins>*0.239*</ins> | <ins>*0.895*</ins> |
 | Accelerate | 1.043 | 3.071 | 6.633 |
@@ -48,7 +48,7 @@ Lower per-token-latency is preferable.
 Single GPU A5000, throughput (token/s) for generation with batch size 32.
 Higher throughput is preferable.
 
-|  | switch-large-128 | NLLB-MoE-54B | Mixtral-7x8b |
+|  | switch-large-128 | NLLB-MoE-54B | Mixtral-8x7b |
 | :---: | :---: | :---: | :---: |
 | <ins>MoE-Infinity</ins> | <ins>*69.105*</ins>	| <ins>*30.300*</ins> | <ins>*12.579*</ins> |
 | Accelerate | 5.788 | 4.344 | 1.245 |
