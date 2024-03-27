@@ -20,31 +20,37 @@ Note that: The open-sourced MoE-Infinity has been redesigned for making it Huggi
 ## Contents
 - [Performance](#performance)
 - [Installation](#installation)
-     - [Prerequisites](#prerequisites)
-     - [Install from PyPI](#install-from-pypi)
-     - [Install from Source](#install-from-source)
+    - [Prerequisites](#prerequisites)
+    - [Install from conda environment](#install-from-conda-environment)
+    - [Install from PyPI](#install-from-pypi)
+    - [Install from Source](#install-from-source)
+    - [Enable FlashAttention (Optional)](#enable-flashattention-optional)
 - [Usage and Examples](#usage-and-examples)
-     - [Sample Code of Huggingface LLM Inference](#sample-code-of-huggingface-llm-inference)
+    - [Sample Code of Huggingface LLM Inference](#sample-code-of-huggingface-llm-inference)
     - [Running Inference](#running-inference)
-- [Roadmap](#roadmap)
+- [Release Plan](#release-plan)
+- [Citation](#citation)
 
 ## Performance
 
 Single GPU A5000 (24GB Memory), per-token-latency (seconds) for generation with a mixed dataset that includes [FLAN](https://huggingface.co/datasets/Muennighoff/flan), [BIG-Bench](https://huggingface.co/datasets/bigbench) and [MMLU](https://huggingface.co/datasets/lukaemon/mmlu) datasets.
+Lower per-token-latency is preferable.
 
 |  | switch-large-128 | NLLB-MoE-54B | Mixtral-7x8b |
 | :---: | :---: | :---: | :---: |
-| *MoE-Infinity* | *0.230*	| *0.239* | *0.895* |
+| <ins>MoE-Infinity</ins> | <ins>*0.230*</ins>	| <ins>*0.239*</ins> | <ins>*0.895*</ins> |
 | Accelerate | 1.043 | 3.071 | 6.633 |
 |DeepSpeed | 4.578 | 8.381 | 2.486 |
 |Mixtral Offloading| X | X | 1.752 | 
 |Ollama | X | X | 0.903 |
 
-Single GPU A5000, throughput (token/s) for generation at batch size 32.
+
+Single GPU A5000, throughput (token/s) for generation with batch size 32.
+Higher throughput is preferable.
 
 |  | switch-large-128 | NLLB-MoE-54B | Mixtral-7x8b |
 | :---: | :---: | :---: | :---: |
-| *MoE-Infinity* | *69.105*	| *30.300* | *12.579* |
+| <ins>MoE-Infinity</ins> | <ins>*69.105*</ins>	| <ins>*30.300*</ins> | <ins>*12.579*</ins> |
 | Accelerate | 5.788 | 4.344 | 1.245 |
 |DeepSpeed | 7.416 | 4.334 | 7.727 |
 |Mixtral Offloading| X | X | 7.684 | 
@@ -52,24 +58,24 @@ Single GPU A5000, throughput (token/s) for generation at batch size 32.
 
 > The Mixtral Offloading experiment was carried out with a batch size of 16, as utilizing a batch size of 32 would result in Out of Memory errors on the GPU.
 
+> Ollama does not support batching for generation, so the throughput is calculated with a batch size of 1.
+
 ## Installation
 
 We recommend installing MoE-Infinity in a virtual environment. To install MoE-Infinity, you can either install it from PyPI or build it from source.
 
-### Prerequisites
-MoE-Infinity is currently only supported on Linux, Ensure the following dependencies are installed on your system:
+### Install from conda environment
 
 ```bash
-# example of installing dependencies on ubuntu
-sudo apt install build-essential curl libaio-dev libspdlog-dev
+conda env create --file environment.yml
+conda activate moe-infinity
 ```
-
-Pytorch (>=2.0), libstdcxx-ng (>=12.0) and Python (>=3.8) required for MoE-Infinity, please refer to [Pytorch](https://pytorch.org/get-started/locally/) for installation instructions.
 
 ### Install from PyPI
 
 ```bash
 pip install moe-infinity
+conda install -c conda-forge libstdcxx-ng=12 # assume using conda, otherwise install libstdcxx-ng=12 using your package manager or gcc=12
 ```
 
 ### Install from Source
@@ -79,6 +85,14 @@ git clone https://github.com/TorchMoE/MoE-Infinity.git
 cd MoE-Infinity
 pip install -e .
 ```
+
+### Enable FlashAttention (Optional)
+
+Install FlashAttention (>=2.5.2) for faster inference with the following command.
+```bash
+FLASH_ATTENTION_FORCE_BUILD=TRUE pip install flash-attn
+```
+Post-installation, MoE-Infinity will automatically integrate with FlashAttention to enhance performance.
 
 ## Usage and Examples
 
