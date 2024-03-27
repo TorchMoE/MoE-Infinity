@@ -137,7 +137,7 @@ CUDA_VISIBLE_DEVICES=0,1 python script.py
 We provide a simple example to run inference on a Huggingface LLM model. The script will download the model checkpoint and run inference on the specified input text. The output will be printed to the console.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python example/interface_example.py --model_name_or_path "mistralai/Mixtral-8x7B-Instruct-v0.1" --offload_dir <your local path on SSD> 
+CUDA_VISIBLE_DEVICES=0 python examples/interface_example.py --model_name_or_path "mistralai/Mixtral-8x7B-Instruct-v0.1" --offload_dir <your local path on SSD> 
 ```
 
 ## Release Plan
