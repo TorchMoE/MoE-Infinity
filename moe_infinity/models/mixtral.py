@@ -86,17 +86,22 @@ class SyncMixtralSparseMoeBlock(nn.Module):
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        for expert_idx in range(self.num_experts):
-            # expert_layer = self.experts[expert_idx]
-            token_indices = router_mask[:, expert_idx]
-            current_state = hidden_states[token_indices, :]
+        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
+        for output, _, idx, _ in results:
+            token_indices = router_mask[:, idx].bool()
+            final_hidden_states[token_indices, :] += output.to(routing_weights_mask.device) * routing_weights_mask[token_indices, idx][:, None]
 
-            if token_indices.any():
-                current_hidden_states = (
-                    self.experts[expert_idx](current_state).to(routing_weights_mask.device)
-                    * routing_weights_mask[token_indices, expert_idx][:, None]
-                )
-                final_hidden_states[token_indices, :] += current_hidden_states
+        # for expert_idx in range(self.num_experts):
+        #     # expert_layer = self.experts[expert_idx]
+        #     token_indices = router_mask[:, expert_idx]
+        #     current_state = hidden_states[token_indices, :]
+
+        #     if token_indices.any():
+        #         current_hidden_states = (
+        #             self.experts[expert_idx](current_state).to(routing_weights_mask.device)
+        #             * routing_weights_mask[token_indices, expert_idx][:, None]
+        #         )
+        #         final_hidden_states[token_indices, :] += current_hidden_states
 
         
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)

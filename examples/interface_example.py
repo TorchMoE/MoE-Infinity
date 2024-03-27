@@ -9,7 +9,7 @@ import torch
 import argparse
 import datasets
 import multiprocessing as mp
-from transformers import AutoTokenizer, TextStreamer
+from transformers import AutoTokenizer, TextStreamer, LlamaTokenizerFast
 from moe_infinity import MoE
 
 parser = argparse.ArgumentParser()
@@ -20,7 +20,10 @@ args = parser.parse_args()
 
 model_name = args.model_name_or_path.split("/")[-1]
 
-tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+if "grok" in model_name:
+    tokenizer = LlamaTokenizerFast.from_pretrained("Xenova/grok-1-tokenizer", trust_remote_code=True)
+else:
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 streamer = TextStreamer(tokenizer)
 
 dataset_name = "tasksource/bigbench"
@@ -51,6 +54,8 @@ elif "nllb" in args.model_name_or_path.lower():
     custom_kwargs = {"forced_bos_token_id": 256057} # translate to French
 elif "mixtral" in args.model_name_or_path.lower():
     custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
+elif "grok" in args.model_name_or_path.lower():
+    custom_kwargs = {}
 else:
     raise ValueError(f"Model {args.model_name_or_path} not supported")
 
