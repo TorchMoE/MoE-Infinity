@@ -12,6 +12,7 @@ from moe_infinity.utils.constants import MODEL_MAPPING_NAMES
 from moe_infinity.runtime import OffloadEngine
 from moe_infinity.utils import get_checkpoint_paths, ArcherConfig
 from moe_infinity.models import apply_rotary_pos_emb
+import moe_infinity
 
 
 class MoE:
@@ -147,6 +148,11 @@ class MoE:
 
         if self.arch == "mixtral":
             transformers.models.mixtral.modeling_mixtral.apply_rotary_pos_emb = (
+                apply_rotary_pos_emb
+            )
+            
+        if self.arch == "grok":
+            moe_infinity.modeling_grok.modeling_grok1.apply_rotary_pos_emb = (
                 apply_rotary_pos_emb
             )
 
