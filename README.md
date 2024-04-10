@@ -74,8 +74,11 @@ conda activate moe-infinity
 ### Install from PyPI
 
 ```bash
+# install stable release
 pip install moe-infinity
-conda install -c conda-forge libstdcxx-ng=12 # assume using conda, otherwise install libstdcxx-ng=12 using your package manager or gcc=12
+
+# install nightly release
+pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ moe-infinity
 ```
 
 ### Install from Source
@@ -97,6 +100,11 @@ Post-installation, MoE-Infinity will automatically integrate with FlashAttention
 ## Usage and Examples
 
 We provide a simple API for diverse setups, including single GPU, multiple GPUs, and multiple nodes. The following examples show how to use MoE-Infinity to run generation on a Huggingface LLM model.
+
+### Important Note
+
+- The `offload_path` must be unique for each MoE model. Reusing the same `offload_path` for different MoE models will result in unexpected behavior.
+
 
 ### Sample Code of Huggingface LLM Inference
 
