@@ -28,7 +28,7 @@ This document outlines the steps for releasing packages within the MoE-Infinity 
 2. **Build Package**: Execute the command below to build the wheel and source files in the `dist/` directory.
 
     ```bash
-    docker run --gpus all --rm -v $(pwd):/root/workspace -w /root/workspace nvidia/cuda:12.1.0-devel-ubuntu20.04 /bin/bash -c "/root/workspace/matrix_build.sh"
+    docker run --gpus all --rm -v $(pwd):/root/workspace -w /root/workspace nvidia/cuda:12.1.0-devel-ubuntu20.04 /bin/bash /root/workspace/scripts/matrix_build.sh
     ```
 
     > **Note**: Building the wheel file might take some time due to the necessity to build across 4 different Python versions.
