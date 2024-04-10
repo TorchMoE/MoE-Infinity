@@ -38,6 +38,7 @@ This document outlines the steps for releasing packages within the MoE-Infinity 
     ```bash
     cd dist
     rename 's/linux/manylinux1/' *.whl
+    cd ..
     ```
 
 4. **Upload Package**: Finally, upload the package to either TestPyPI or PyPI as needed.
