@@ -43,13 +43,15 @@ jobs:
     name: Build Wheel
     runs-on: ${{ matrix.os }}
     needs: release
+    permissions:
+      id-token: write
 
     strategy:
       fail-fast: false
       matrix:
           os: ['ubuntu-20.04']
           python-version: ['3.8', '3.9', '3.10', '3.11']
-          cuda-version: ['11.7', '12.1']
+          cuda-version: ['11.7']
 
     steps:
       - name: Checkout
@@ -97,10 +99,9 @@ jobs:
           asset_name: ${{ env.asset_name }}
           asset_content_type: application/*
 
-      # (Danielkinz): This last step will publish the .whl to pypi. Warning: untested
-      # - name: Publish package
-      #   uses: pypa/gh-action-pypi-publish@release/v1.8
-      #   with:
-      #     repository-url: https://test.pypi.org/legacy/
-      #     password: ${{ secrets.PYPI_API_TOKEN }}
-      #     skip-existing: true
+    #   (Danielkinz): This last step will publish the .whl to pypi. Warning: untested
+      - name: Publish package
+        uses: pypa/gh-action-pypi-publish@release/v1.8
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
