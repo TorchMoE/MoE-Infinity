@@ -85,6 +85,7 @@ jobs:
           BUILD_OPS=1 python -m build
           wheel_name=$(ls dist/*whl | xargs -n 1 basename)
           asset_name=${wheel_name//"linux"/"manylinux1"}
+          cd dist && rename 's/linux/manylinux1/' *.whl && cd ..
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
           echo "asset_name=${asset_name}" >> $GITHUB_ENV
 
