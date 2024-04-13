@@ -43,8 +43,7 @@ jobs:
     name: Build Wheel
     runs-on: ${{ matrix.os }}
     needs: release
-    permissions:
-      id-token: write
+    permissions: write-all
 
     strategy:
       fail-fast: false
