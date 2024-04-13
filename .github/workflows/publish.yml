@@ -36,7 +36,7 @@ jobs:
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
           script: |
-            const script = require('.github/workflows/scripts/create_release.js')
+            const script = require('.github/workflows/scripts/create-release.js')
             await script(github, context, core)
 
   wheel:
@@ -49,17 +49,22 @@ jobs:
       matrix:
           os: ['ubuntu-20.04']
           python-version: ['3.8', '3.9', '3.10', '3.11']
-          pytorch-version: ['2.2.1']  # Must be the most recent version that meets requirements-cuda.txt.
-          cuda-version: ['11.8', '12.1']
+          cuda-version: ['11.7', '12.1']
 
     steps:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Set up Linux Env
-        if: ${{ runner.os == 'Linux' }}
+    #   - name: Set up Linux Env
+    #     if: ${{ runner.os == 'Linux' }}
+    #     run: |
+    #       bash -x .github/workflows/scripts/env.sh
+
+      - name: Free disk space
         run: |
-          bash -x .github/workflows/scripts/env.sh
+          sudo rm -rf /usr/local/cuda-* /opt/cuda
+          sudo rm -rf /usr/local/cuda
+          bash -x .github/workflows/scripts/free-disk-space.sh
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -70,14 +75,13 @@ jobs:
         run: |
           bash -x .github/workflows/scripts/cuda-install.sh ${{ matrix.cuda-version }} ${{ matrix.os }}
 
-      - name: Install PyTorch ${{ matrix.pytorch-version }} with CUDA ${{ matrix.cuda-version }}
-        run: |
-          bash -x .github/workflows/scripts/pytorch-install.sh ${{ matrix.python-version }} ${{ matrix.pytorch-version }} ${{ matrix.cuda-version }}
-
       - name: Build wheel
         shell: bash
         run: |
-          bash -x .github/workflows/scripts/build.sh ${{ matrix.python-version }} ${{ matrix.cuda-version }}
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install build
+          python -m build
           wheel_name=$(ls dist/*whl | xargs -n 1 basename)
           asset_name=${wheel_name//"linux"/"manylinux1"}
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
