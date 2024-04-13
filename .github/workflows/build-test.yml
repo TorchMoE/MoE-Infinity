@@ -26,6 +26,20 @@ jobs:
         with:
           python-version: 3.8
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/cuda-* /opt/cuda
+          sudo rm -rf /usr/local/cuda
+          bash -x .github/workflows/scripts/free-disk-space.sh
+
+      - name: Cache Python packages
+        uses: actions/cache@v2
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install CUDA 11.7
         run: |
           bash -x .github/workflows/scripts/cuda-install.sh 11.7 ubuntu-20.04
