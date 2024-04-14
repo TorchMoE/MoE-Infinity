@@ -75,8 +75,8 @@ print(f"find_packages: {find_packages()}")
 
 # install all files in the package, rather than just the egg    
 setup(
-    name='moe_infinity',
-    version='0.0.1.dev13',
+    name='test_proj_8e00a834c8',
+    version='0.0.1',
     packages=find_packages(exclude=['op_builder', 'op_builder.*', 'moe_infinity.ops.core.*']),
     package_data={
         'moe_infinity.ops.prefetch': ['**/*.so'],
