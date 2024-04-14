@@ -83,11 +83,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install build
-          BUILD_OPS=1 python -m build
+          BUILD_OPS=1 python -m build --wheel
           wheel_name=$(ls dist/*whl | xargs -n 1 basename)
           asset_name=${wheel_name//"linux"/"manylinux1"}
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
           echo "asset_name=${asset_name}" >> $GITHUB_ENV
+      
+
+      # only build source when the python version is 3.8
+      - name: Build Source
+        if: ${{ matrix.python-version == '3.8' }}
+        run: |
+          python -m build --sdist
 
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
