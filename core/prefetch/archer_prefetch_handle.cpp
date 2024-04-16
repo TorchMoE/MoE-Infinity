@@ -35,8 +35,10 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
 
     for (int i = 0; i < device_count; i++) {
         cudaSetDevice(i);
+        int can_access = 0;
+        cudaDeviceCanAccessPeer(&can_access, i, i);
         for (int j = 0; j < device_count; j++) {
-            if (i != j) { cudaDeviceEnablePeerAccess(j, 0); }
+            if (i != j && can_access == 1) { cudaDeviceEnablePeerAccess(j, 0); }
         }
     }
 
