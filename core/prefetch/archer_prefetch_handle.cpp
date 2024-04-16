@@ -34,14 +34,18 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
     ARCHER_LOG_INFO("Device count ", device_count);
 
     for (int i = 0; i < device_count; i++) {
-        cudaSetDevice(i);
-        int can_access = 0;
-        cudaDeviceCanAccessPeer(&can_access, i, i);
         for (int j = 0; j < device_count; j++) {
-            if (i != j && can_access == 1) { cudaDeviceEnablePeerAccess(j, 0); }
+            if (i != j) {
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, i, j);
+                if (can_access == 1) {
+                    cudaSetDevice(i);
+                    cudaDeviceEnablePeerAccess(j, 0);
+                }
+            }
         }
     }
-
+    
     ARCHER_LOG_INFO("Enabled peer access for all devices");
 }
 
