@@ -7,9 +7,6 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
 
 # Needed to create release and upload assets
 permissions:
