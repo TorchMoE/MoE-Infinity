@@ -15,3 +15,10 @@ std::size_t GetFreeDeviceMemory(int device_id);
 
 #define DEVICE_CACHE_LIMIT(gid) GetTotalDeviceMemory(gid) * 0.7
 #define NUM_DEVICES GetDeviceCount()
+
+int CudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind);
+int CudaMemcpyAsync(void* dst,
+                               const void* src,
+                               size_t count,
+                               cudaMemcpyKind kind,
+                               cudaStream_t stream = 0);
