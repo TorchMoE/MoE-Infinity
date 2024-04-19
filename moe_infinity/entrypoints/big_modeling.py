@@ -169,7 +169,7 @@ class MoE:
             # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
             return self.model.generate(input_ids, **kwargs)
 
-    def forward(self, *args, **kwargs) -> Any:
+    def forward(self, input_ids: torch.LongTensor, *args, **kwargs) -> Any:
         """
         Forwards the input through the model.
 
@@ -180,7 +180,27 @@ class MoE:
         Returns:
             Any: The output of the model.
         """
-        return self.model(*args, **kwargs)
+        
+        if self.arch == "mixtral":
+            transformers.models.mixtral.modeling_mixtral.apply_rotary_pos_emb = (
+                apply_rotary_pos_emb
+            )
+            
+        if self.arch == "grok":
+            moe_infinity.modeling_grok.modeling_grok1.apply_rotary_pos_emb = (
+                apply_rotary_pos_emb
+            )
+        
+        batch_size = input_ids.shape[0]
+
+        if getattr(self, "seq_id_list", None) is None:
+            self.seq_id_list = [
+                self.engine.expert_tracer.create_entry() for _ in range(batch_size)
+            ]
+            for module in self.engine.expert_layer_modules:
+                module.seq_id_list = self.seq_id_list
+        
+        return self.model(input_ids, *args, **kwargs)
     
     def __call__(self, *args, **kwargs) -> Any:
         """
