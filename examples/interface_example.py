@@ -51,6 +51,8 @@ elif "nllb" in args.model_name_or_path.lower():
     custom_kwargs = {"forced_bos_token_id": 256057} # translate to French
 elif "mixtral" in args.model_name_or_path.lower():
     custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
+elif "arctic" in args.model_name_or_path.lower():
+    custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
 else:
     raise ValueError(f"Model {args.model_name_or_path} not supported")
 
