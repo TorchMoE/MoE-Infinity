@@ -369,6 +369,8 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
                 ss << "]";
                 ARCHER_LOG_FATAL("ExpertDispatcher::GPUExecFunc", ss.str(), "expert_type", expert_type, e.what());
             }
+
+            stream.synchronize();
         }
 
         (void)std::async(std::launch::async,
@@ -414,6 +416,7 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
             gpu_id,
             args.hit, ")");
     }
+    stream.synchronize();
     pending_.fetch_sub(1);
 }
 
