@@ -40,7 +40,16 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                 cudaDeviceCanAccessPeer(&can_access, i, j);
                 if (can_access == 1) {
                     cudaSetDevice(i);
-                    cudaDeviceEnablePeerAccess(j, 0);
+                    cudaError_t status = cudaDeviceEnablePeerAccess(j, 0);
+                    if (status == cudaErrorPeerAccessAlreadyEnabled){
+                        ARCHER_LOG_INFO("Peer access already enabled between device ", i, j);
+                        cudaGetLastError(); // clear error
+                    } else if (status != cudaSuccess) {
+                        ARCHER_LOG_ERROR("Failed to enable peer access between device ", i, j);
+                    } else {
+                        ARCHER_LOG_INFO("Enabled peer access between device ", i, j);
+                    }
+
                 }
             }
         }
