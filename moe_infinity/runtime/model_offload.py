@@ -267,11 +267,15 @@ class OffloadEngine(object):
             @functools.wraps(orig_cast_classifier)
             def archer_cast_classifier(cls, *args, **kwargs):
                 orig_data_ptr = cls.classifier.weight.data.data_ptr()
-                self.offload_set.remove(cls.classifier.weight.data.data_ptr())
-                orig_cast_classifier(cls, *args, **kwargs)
-                new_data_ptr = cls.classifier.weight.data.data_ptr()
-                self.offload_set.add(cls.classifier.weight.data.data_ptr())
-                self.archer_engine.update_tensor_map(orig_data_ptr, new_data_ptr)
+                if orig_data_ptr in self.offload_set:
+                    self.offload_set.remove(cls.classifier.weight.data.data_ptr())
+                    orig_cast_classifier(cls, *args, **kwargs)
+                    new_data_ptr = cls.classifier.weight.data.data_ptr()
+                    self.offload_set.add(cls.classifier.weight.data.data_ptr())
+                    self.archer_engine.update_tensor_map(orig_data_ptr, new_data_ptr)
+                else:
+                    orig_cast_classifier(cls, *args, **kwargs)
+                    self.offload_set.add(cls.classifier.weight.data.data_ptr())
 
             return archer_cast_classifier
 

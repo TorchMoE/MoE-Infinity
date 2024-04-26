@@ -22,6 +22,8 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
     kArcherTensorHandle = std::make_unique<ArcherTensorHandle>(prefix);
     kTopologyHandle = std::make_unique<ArcherTopologyHandle>();
     kTaskPool = std::make_unique<ArcherTaskPool>();
+    kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
+    kHostMemoryPool = std::make_unique<HostMemoryPool>();
     kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
     ARCHER_LOG_DEBUG("Free Device Memory ", kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
 
