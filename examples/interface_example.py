@@ -11,6 +11,7 @@ import datasets
 import multiprocessing as mp
 from transformers import AutoTokenizer, TextStreamer
 from moe_infinity import MoE
+from moe_infinity.models.arctic import ArcticTokenizer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name_or_path", type=str, required=True)
@@ -20,7 +21,11 @@ args = parser.parse_args()
 
 model_name = args.model_name_or_path.split("/")[-1]
 
-tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+tokenizer = None
+if "arctic" in args.model_name_or_path.lower():
+    tokenizer = ArcticTokenizer.from_pretrained(args.model_name_or_path)
+else:
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 streamer = TextStreamer(tokenizer)
 
 dataset_name = "tasksource/bigbench"
