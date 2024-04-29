@@ -16,6 +16,7 @@ import json
 
 from tqdm import tqdm
 
+import moe_infinity.modeling_grok
 from moe_infinity.ops.op_builder.prefetch import PrefetchBuilder
 from moe_infinity.models import (
     SyncSwitchTransformersSparseMLP,
@@ -270,11 +271,15 @@ class OffloadEngine(object):
             @functools.wraps(orig_cast_classifier)
             def archer_cast_classifier(cls, *args, **kwargs):
                 orig_data_ptr = cls.classifier.weight.data.data_ptr()
-                self.offload_set.remove(cls.classifier.weight.data.data_ptr())
-                orig_cast_classifier(cls, *args, **kwargs)
-                new_data_ptr = cls.classifier.weight.data.data_ptr()
-                self.offload_set.add(cls.classifier.weight.data.data_ptr())
-                self.archer_engine.update_tensor_map(orig_data_ptr, new_data_ptr)
+                if orig_data_ptr in self.offload_set:
+                    self.offload_set.remove(cls.classifier.weight.data.data_ptr())
+                    orig_cast_classifier(cls, *args, **kwargs)
+                    new_data_ptr = cls.classifier.weight.data.data_ptr()
+                    self.offload_set.add(cls.classifier.weight.data.data_ptr())
+                    self.archer_engine.update_tensor_map(orig_data_ptr, new_data_ptr)
+                else:
+                    orig_cast_classifier(cls, *args, **kwargs)
+                    self.offload_set.add(cls.classifier.weight.data.data_ptr())
 
             return archer_cast_classifier
 
@@ -329,7 +334,8 @@ class OffloadEngine(object):
             if hasattr(module, "reset_parameters"):
                 module._old_reset_parameters = module.reset_parameters
                 module.reset_parameters = do_nothing_decorator(module.reset_parameters)
-                
+    
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._old_cast_classifier =  transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier
         transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier =  cast_classifier_decorator(transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier)  
 
         transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp = (
@@ -599,17 +605,16 @@ class OffloadEngine(object):
 
         return self
 
+    # clean up initialization hooks
     def __exit__(self, exc_type, exc_value, traceback):
-        # self.cls._load_pretrained_model = self.cls._old_load_pretrained_model
-        # self.cls.from_pretrained = self.cls._old_from_pretrained
         self.cls.__init__ = self.cls._old_init
+        self.cls.from_pretrained = self.cls._old_from_pretrained
+        torch.nn.modules.module.Module.apply = torch.nn.modules.module.Module._old_apply
+        torch.index_select = torch._old_index_select
+        torch.Tensor.index_select = torch.Tensor._old_index_select
+        
         self.cls.post_init = self.cls._old_post_init
         PreTrainedModel.post_init = PreTrainedModel._old_post_init
-        # self.cls.config_class.from_pretrained = (
-        #     self.cls.config_class._old_from_pretrained)
-        # transformers.modeling_utils.load_state_dict = (
-        #     transformers.modeling_utils.old_load_state_dict)
-        torch.nn.modules.module.Module.apply = torch.nn.modules.module.Module._old_apply
 
         for name, module in torch.nn.modules.__dict__.items():
             if not isinstance(module, type):
@@ -629,13 +634,6 @@ class OffloadEngine(object):
 
             if hasattr(module, "reset_parameters"):
                 module.reset_parameters = module._old_reset_parameters
-
-        # transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP = (
-        #     transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp
-        # )
-        # transformers.models.nllb_moe.modeling_nllb_moe.NllbMoeSparseMLP = (
-        #     transformers.models.nllb_moe.modeling_nllb_moe._old_sparse_mlp
-        # )
 
     def get_topology(self, model):
         name_lst = []
@@ -970,3 +968,24 @@ class OffloadEngine(object):
         self.forward_hooks.append(
             module.register_forward_hook(_post_forward_module_hook)
         )
+
+    # clean runtime hooks
+    def clean_up(self):
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier = transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._old_cast_classifier
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP = (
+            transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp
+        )
+        
+        transformers.models.nllb_moe.modeling_nllb_moe.NllbMoeSparseMLP = (
+            transformers.models.nllb_moe.modeling_nllb_moe._old_sparse_mlp
+        )
+        
+        transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock = (
+            transformers.models.mixtral.modeling_mixtral._old_sparse_mlp
+        )
+        
+        moe_infinity.modeling_grok.modeling_grok1.MoeBlock = (
+            moe_infinity.modeling_grok.modeling_grok1._old_sparse_mlp
+        )
+        
+        
