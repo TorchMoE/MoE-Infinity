@@ -597,6 +597,7 @@ class OffloadEngine(object):
     # clean up initialization hooks
     def __exit__(self, exc_type, exc_value, traceback):
         self.cls.__init__ = self.cls._old_init
+        self.cls.from_pretrained = self.cls._old_from_pretrained
         torch.nn.modules.module.Module.apply = torch.nn.modules.module.Module._old_apply
         torch.index_select = torch._old_index_select
         torch.Tensor.index_select = torch.Tensor._old_index_select
