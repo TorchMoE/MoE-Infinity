@@ -17,8 +17,8 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-std::unique_ptr<HostMemoryPool> kHostMemoryPool = std::make_unique<HostMemoryPool>();
-std::unique_ptr<DeviceMemoryPool> kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
+std::unique_ptr<HostMemoryPool> kHostMemoryPool(nullptr);
+std::unique_ptr<DeviceMemoryPool> kDeviceMemoryPool(nullptr);
 
 std::size_t GetTotalSystemMemory()
 {

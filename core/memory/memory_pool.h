@@ -7,7 +7,9 @@
 #include "common/pytorch.h"
 #include "utils/noncopyable.h"
 
-#include <c10/core/CPUAllocator.h>
+#include "utils/archer_logger.h"
+#include "host_caching_allocator.h"
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,7 +37,16 @@ public:
     std::int64_t GetMemoryCapacity();
 
     HostMemoryPool();
-    virtual ~HostMemoryPool() = default;
+    virtual ~HostMemoryPool()
+    {
+        auto allocator = c10::HostCachingAllocator::get();
+        for (auto& [key, data_ptr] : allocated_id_) {
+            if (data_ptr != nullptr) {
+                allocator->free(data_ptr);
+            }
+        }
+        allocated_id_.clear();
+    }
 
 private:
     std::unordered_map<std::uint64_t, void*> allocated_id_;
@@ -59,7 +70,20 @@ public:
     std::int64_t GetMemoryCapacity(const torch::Device& device);
 
     DeviceMemoryPool();
-    virtual ~DeviceMemoryPool() = default;
+    virtual ~DeviceMemoryPool()
+    {
+        auto allocator = c10::cuda::CUDACachingAllocator::get();
+        for(auto &allocated_id : allocated_id_){
+            for (auto& [key, data_ptr] : allocated_id) {
+                if (data_ptr != nullptr) {
+                    allocator->raw_deallocate(data_ptr);
+                }
+            }
+        }
+        allocated_id_.clear();
+        free_memory_.clear();
+        memory_capacity_.clear();
+    }
 
 private:
     std::vector<std::unordered_map<std::uint64_t, void*>> allocated_id_;
