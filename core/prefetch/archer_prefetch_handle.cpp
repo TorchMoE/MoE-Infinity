@@ -65,6 +65,9 @@ ArcherPrefetchHandle::~ArcherPrefetchHandle()
     // served as a global manager for order of destruction
     kTaskPool.reset();
     kArcherTensorHandle.reset();
+    kTopologyHandle.reset();
+    kDeviceMemoryPool.reset();
+    kHostMemoryPool.reset();
 }
 
 void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tensor& buffer)
