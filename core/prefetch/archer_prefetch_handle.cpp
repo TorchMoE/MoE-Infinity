@@ -22,6 +22,8 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
     kArcherTensorHandle = std::make_unique<ArcherTensorHandle>(prefix);
     kTopologyHandle = std::make_unique<ArcherTopologyHandle>();
     kTaskPool = std::make_unique<ArcherTaskPool>();
+    kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
+    kHostMemoryPool = std::make_unique<HostMemoryPool>();
     kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
     ARCHER_LOG_DEBUG("Free Device Memory ", kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
 
@@ -40,7 +42,16 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                 cudaDeviceCanAccessPeer(&can_access, i, j);
                 if (can_access == 1) {
                     cudaSetDevice(i);
-                    cudaDeviceEnablePeerAccess(j, 0);
+                    cudaError_t status = cudaDeviceEnablePeerAccess(j, 0);
+                    if (status == cudaErrorPeerAccessAlreadyEnabled){
+                        ARCHER_LOG_INFO("Peer access already enabled between device ", i, j);
+                        cudaGetLastError(); // clear error
+                    } else if (status != cudaSuccess) {
+                        ARCHER_LOG_ERROR("Failed to enable peer access between device ", i, j);
+                    } else {
+                        ARCHER_LOG_INFO("Enabled peer access between device ", i, j);
+                    }
+
                 }
             }
         }
@@ -54,6 +65,9 @@ ArcherPrefetchHandle::~ArcherPrefetchHandle()
     // served as a global manager for order of destruction
     kTaskPool.reset();
     kArcherTensorHandle.reset();
+    kTopologyHandle.reset();
+    kDeviceMemoryPool.reset();
+    kHostMemoryPool.reset();
 }
 
 void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tensor& buffer)
