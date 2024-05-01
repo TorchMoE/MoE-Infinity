@@ -36,7 +36,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
 
         cudaStream_t out_stream;
         cudaStreamCreateWithFlags(&out_stream, cudaStreamNonBlocking);
-        out_streams_.emplace_back(fetch_stream);
+        out_streams_.emplace_back(out_stream);
     }
 
     for (int i = 0; i < num_gpu; ++i) {
