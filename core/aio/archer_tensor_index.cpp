@@ -95,7 +95,7 @@ std::string TensorStorageMeta::DebugString() const
     return ss.str();
 }
 
-ArcherTensorIndex* kTensorIndex = ArcherTensorIndex::GetInstance();
+std::unique_ptr<ArcherTensorIndex> kTensorIndex(nullptr);
 
 void ArcherTensorIndex::Serialize(const char* path)
 {
