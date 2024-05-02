@@ -16,7 +16,6 @@ import json
 
 from tqdm import tqdm
 
-import moe_infinity.modeling_grok
 from moe_infinity.ops.op_builder.prefetch import PrefetchBuilder
 from moe_infinity.models import (
     SyncSwitchTransformersSparseMLP,
@@ -24,7 +23,6 @@ from moe_infinity.models import (
     SyncMixtralSparseMoeBlock,
     SyncGrokMoeBlock,
     SyncArcticMoeBlock,
-    ArcticConfig,
 )
 from moe_infinity.utils import ArcherConfig
 from moe_infinity.utils.arguments import copy_args_to_device, copy_kwargs_to_device
@@ -984,8 +982,12 @@ class OffloadEngine(object):
             transformers.models.mixtral.modeling_mixtral._old_sparse_mlp
         )
         
-        moe_infinity.modeling_grok.modeling_grok1.MoeBlock = (
+        moe_infinity.models.modeling_grok.modeling_grok1.MoeBlock = (
             moe_infinity.modeling_grok.modeling_grok1._old_sparse_mlp
+        )
+
+        moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = (
+            moe_infinity.models.modeling_arctic._old_sparse_mlp
         )
         
         
