@@ -7,6 +7,7 @@
 #include <cuda_runtime_api.h>
 #include <torch/extension.h>
 #include "aio/archer_tensor_handle.h"
+#include "aio/archer_tensor_index.h"
 #include "common/pytorch.h"
 #include "common/time.h"
 #include "memory/memory_pool.h"
@@ -16,9 +17,10 @@
 
 ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                                            const double device_memory_ratio)
-    : prefix_(prefix), last_layer_id_(0)
+    : prefix_(prefix), last_layer_id_(0), has_cleaned_up_resources_(false)
 {
     InitLogger();
+    kTensorIndex = std::make_unique<ArcherTensorIndex>();
     kArcherTensorHandle = std::make_unique<ArcherTensorHandle>(prefix);
     kTopologyHandle = std::make_unique<ArcherTopologyHandle>();
     kTaskPool = std::make_unique<ArcherTaskPool>();
@@ -63,11 +65,20 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
 ArcherPrefetchHandle::~ArcherPrefetchHandle()
 {
     // served as a global manager for order of destruction
+    if(!has_cleaned_up_resources_) {
+        CleanUpResources();
+    }
+}
+
+void ArcherPrefetchHandle::CleanUpResources()
+{
     kTaskPool.reset();
     kArcherTensorHandle.reset();
+    kTensorIndex.reset();
     kTopologyHandle.reset();
     kDeviceMemoryPool.reset();
     kHostMemoryPool.reset();
+    has_cleaned_up_resources_ = true;
 }
 
 void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tensor& buffer)

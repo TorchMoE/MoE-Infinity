@@ -45,6 +45,8 @@ public:
     bool IsTensorOnDevice(const torch::Tensor& tensor) const;
     bool IsTensorOnDevice(const TensorID tensor_id) const;
 
+    void CleanUpResources();
+
     // void SetNodeCachePriority(const std::uint64_t corr_id, const float priority);
 
 private:
@@ -53,6 +55,7 @@ private:
     std::unordered_set<std::uint32_t> tensors_to_delete_;
     uint64_t last_layer_id_;
     NodePtr last_node_;
+    bool has_cleaned_up_resources_;
 
     std::unordered_map<std::uint64_t, std::unordered_set<NodePtr>> request_id_to_nodes_;
 

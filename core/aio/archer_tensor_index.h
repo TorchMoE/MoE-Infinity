@@ -45,11 +45,9 @@ public:
     void Serialize(const char* path);
     void Deserialize(const char* path);
 
-    STATIC_GET_INSTANCE(ArcherTensorIndex)
-
-private:
     ArcherTensorIndex() = default;
     ~ArcherTensorIndex() = default;
+private:
 };
 
-extern ArcherTensorIndex* kTensorIndex;
+extern std::unique_ptr<ArcherTensorIndex> kTensorIndex;
