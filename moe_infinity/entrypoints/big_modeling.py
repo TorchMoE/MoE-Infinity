@@ -64,7 +64,7 @@ class MoE:
                     f"Please provide a configuration file or create a default one at {default_config_path}."
                 )
             config = default_config_path
-        model_config = AutoConfig.from_pretrained(model_name_or_path)
+        model_config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
         architecture = model_config.architectures[0].lower()
 
         arch = None
@@ -127,6 +127,7 @@ class MoE:
                     "flash_attention_2" if is_flash_attn_available else "eager"
                 ),
                 is_flash_attn_available=is_flash_attn_available,
+                trust_remote_code=True,
             )
     
     def _configure_hook(self, input_ids: torch.LongTensor):

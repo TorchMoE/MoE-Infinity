@@ -26,6 +26,7 @@ from moe_infinity.models import (
 )
 from moe_infinity.utils import ArcherConfig
 from moe_infinity.utils.arguments import copy_args_to_device, copy_kwargs_to_device
+from moe_infinity.distributed import DistributedExpertExecutor
 
 from moe_infinity.memory import ExpertPrefetcher
 import moe_infinity
@@ -154,7 +155,7 @@ class OffloadEngine(object):
         # ):
         #     os.remove(_archer_config.perfect_cache_file)
 
-        # self.expert_executor = DistributedExpertExecutor(archer_config=_archer_config)
+        self.expert_executor = DistributedExpertExecutor(archer_config=_archer_config)
         # self.expert_prefetcher = ExpertPrefetcher(self.config)
         # self.device_map_manager = DeviceMapManager(archer_config=_archer_config)
 
@@ -530,9 +531,7 @@ class OffloadEngine(object):
                 # # make unique and sort
                 # layer_idx = sorted(list(set(layer_idx)))
 
-                # self.expert_executor.set_expert_dispatcher(
-                #     self.expert_dispatcher
-                # )
+                self.expert_executor.set_expert_dispatcher(self.expert_dispatcher)
 
                 module_idx = 0
                 self.expert_layer_modules = []
@@ -551,7 +550,7 @@ class OffloadEngine(object):
                         module.archer_config = self.archer_config
                         # module.expert_dispatcher = self.expert_dispatcher
                         self.expert_modules.append(module)
-                        # module.expert_executor = self.expert_executor
+                        module.expert_executor = self.expert_executor
                         module.expert_prefetcher = self.expert_prefetcher
                         module.expert_tracer = self.expert_tracer
                         module.expert_predictor = self.expert_predictor

@@ -11,7 +11,7 @@
 #include "common/time.h"
 #include "memory/memory_pool.h"
 #include "task_scheduler.h"
-
+#include "utils/cuda_utils.h"
 #include "utils/archer_logger.h"
 
 ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
@@ -335,7 +335,7 @@ void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor, torch::Device 
     cudaSetDevice(device.index());
     cudaMalloc(&device_ptr, byte_size);
 
-    cudaMemcpy(device_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice);
+    CudaMemcpy(device_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice);
 
     auto new_tensor = torch::from_blob(
         device_ptr,
