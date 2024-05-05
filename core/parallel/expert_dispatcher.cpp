@@ -332,6 +332,7 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
 
             auto* expert_module = args.expert_node->module;
             int expert_type = expert_type_;
+            cudaStreamSynchronize(0); // make sure the input is ready
 
             try {
                 switch (expert_type) {
