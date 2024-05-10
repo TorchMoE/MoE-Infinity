@@ -5,12 +5,39 @@
 
 from functools import partial
 import os
+import time
 import torch
 import argparse
 import datasets
 import multiprocessing as mp
 from transformers import AutoTokenizer, TextStreamer, LlamaTokenizerFast
 from moe_infinity import MoE
+
+class StopWatch(TextStreamer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_prefilling = None
+        self.prefilling_time = None
+        self.start_decoding = None
+        self.decoding_time = None
+        self.decoding_iterations = 0
+
+    def put(self, value):
+        if self.start_prefilling is None:
+            self.start_prefilling = time.time()
+            return
+        elif self.prefilling_time is None:
+            self.prefilling_time = time.time() - self.start_prefilling
+            self.start_decoding = time.time()
+        self.decoding_iterations += 1
+        
+        return super().put(value)
+
+    def end(self):
+        if self.decoding_time is None and self.start_decoding is not None:
+            self.decoding_time = time.time() - self.start_decoding
+        
+        return super().end()
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name_or_path", type=str, required=True)
@@ -24,7 +51,6 @@ if "grok" in model_name:
     tokenizer = LlamaTokenizerFast.from_pretrained("Xenova/grok-1-tokenizer", trust_remote_code=True)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-streamer = TextStreamer(tokenizer)
 
 dataset_name = "tasksource/bigbench"
 names = datasets.get_dataset_config_names(dataset_name)
@@ -71,9 +97,12 @@ for input_text in all_inputs:
     )
     print("inputs ...")
     print(input_text)
+    
+    streamer = StopWatch(tokenizer)
 
     with torch.no_grad():
         print("outputs_text ...")
+        start_time = time.time()
         outputs = model.generate(
             inputs.input_ids.to("cuda:0"),
             streamer=streamer,
@@ -82,3 +111,9 @@ for input_text in all_inputs:
             do_sample=False,
             **custom_kwargs,
         )
+        end_time = time.time()
+        print(f"Time taken: {end_time - start_time} seconds")
+        print(f"Prefilling time: {streamer.prefilling_time} seconds")
+        print(f"Decoding time: {streamer.decoding_time} seconds")
+        print(f"Decoding iterations: {streamer.decoding_iterations}")
+        print(f"Input tokens: {len(inputs.input_ids[0])}")
