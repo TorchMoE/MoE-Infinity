@@ -22,6 +22,8 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
     kArcherTensorHandle = std::make_unique<ArcherTensorHandle>(prefix);
     kTopologyHandle = std::make_unique<ArcherTopologyHandle>();
     kTaskPool = std::make_unique<ArcherTaskPool>();
+    kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
+    kHostMemoryPool = std::make_unique<HostMemoryPool>();
     kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
     ARCHER_LOG_DEBUG("Free Device Memory ", kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
 
@@ -34,12 +36,27 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
     ARCHER_LOG_INFO("Device count ", device_count);
 
     for (int i = 0; i < device_count; i++) {
-        cudaSetDevice(i);
         for (int j = 0; j < device_count; j++) {
-            if (i != j) { cudaDeviceEnablePeerAccess(j, 0); }
+            if (i != j) {
+                int can_access = 0;
+                cudaDeviceCanAccessPeer(&can_access, i, j);
+                if (can_access == 1) {
+                    cudaSetDevice(i);
+                    cudaError_t status = cudaDeviceEnablePeerAccess(j, 0);
+                    if (status == cudaErrorPeerAccessAlreadyEnabled){
+                        ARCHER_LOG_INFO("Peer access already enabled between device ", i, j);
+                        cudaGetLastError(); // clear error
+                    } else if (status != cudaSuccess) {
+                        ARCHER_LOG_ERROR("Failed to enable peer access between device ", i, j);
+                    } else {
+                        ARCHER_LOG_INFO("Enabled peer access between device ", i, j);
+                    }
+
+                }
+            }
         }
     }
-
+    
     ARCHER_LOG_INFO("Enabled peer access for all devices");
 }
 
@@ -48,6 +65,9 @@ ArcherPrefetchHandle::~ArcherPrefetchHandle()
     // served as a global manager for order of destruction
     kTaskPool.reset();
     kArcherTensorHandle.reset();
+    kTopologyHandle.reset();
+    kDeviceMemoryPool.reset();
+    kHostMemoryPool.reset();
 }
 
 void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tensor& buffer)
@@ -316,9 +336,6 @@ void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor, torch::Device 
     cudaMalloc(&device_ptr, byte_size);
 
     CudaMemcpy(device_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice);
-
-    auto new_tensor = torch::from_blob(
-        device_ptr,
         tensor.sizes(),
         [](void* ptr) { cudaFree(ptr); },
         tensor.options().device(device).pinned_memory(false));
