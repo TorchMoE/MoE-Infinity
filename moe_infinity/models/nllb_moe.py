@@ -13,11 +13,12 @@ from transformers.models.nllb_moe.modeling_nllb_moe import (
 )
 
 from moe_infinity.utils import ArcherConfig
+from .base import MoELayer
 
 GPU_IDX_COUNTER = 0
 
 
-class SyncNllbMoeSparseMLP(nn.Module):
+class SyncNllbMoeSparseMLP(MoELayer):
 
     archer_config: ArcherConfig = None
     layer_id: int = None

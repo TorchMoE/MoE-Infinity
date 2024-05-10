@@ -23,6 +23,7 @@ from moe_infinity.models import (
     SyncMixtralSparseMoeBlock,
     SyncGrokMoeBlock,
 )
+from moe_infinity.models import MoELayer
 from moe_infinity.utils import ArcherConfig
 from moe_infinity.utils.arguments import copy_args_to_device, copy_kwargs_to_device
 from moe_infinity.distributed import DistributedExpertExecutor
@@ -531,13 +532,7 @@ class OffloadEngine(object):
                 self.expert_layer_modules = []
                 for module in model.modules():
 
-                    if (
-                        isinstance(module, SyncNllbMoeSparseMLP)
-                        or isinstance(module, SyncSwitchTransformersSparseMLP)
-                        or isinstance(module, SyncNllbMoeSparseMLP)
-                        or isinstance(module, SyncMixtralSparseMoeBlock)
-                        or isinstance(module, SyncGrokMoeBlock)
-                    ):
+                    if MoELayer in module.__class__.__bases__:
                         # module.archer_prefetch = self.archer_prefetch
                         # module.archer_tracer = self.archer_tracer
                         module.archer_engine = self.archer_engine

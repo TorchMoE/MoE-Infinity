@@ -7,3 +7,4 @@ from .switch_transformers import SyncSwitchTransformersSparseMLP
 from .nllb_moe import SyncNllbMoeSparseMLP
 from .mixtral import SyncMixtralSparseMoeBlock, apply_rotary_pos_emb
 from .grok import SyncGrokMoeBlock
+from .base import MoELayer

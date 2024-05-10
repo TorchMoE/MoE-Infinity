@@ -15,6 +15,7 @@ from transformers.models.mixtral.modeling_mixtral import (
 )
 
 from moe_infinity.utils import ArcherConfig
+from .base import MoELayer
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     device = position_ids.device
@@ -27,7 +28,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     position_ids = position_ids.to(device)
     return q_embed, k_embed
 
-class SyncMixtralSparseMoeBlock(nn.Module):
+class SyncMixtralSparseMoeBlock(MoELayer):
     archer_config: ArcherConfig = None
     layer_id: int = None
 

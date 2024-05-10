@@ -60,12 +60,12 @@ def get_checkpoint_paths(checkpoint: Union[str, os.PathLike]):
                 raise ValueError(
                     f"{checkpoint} is not a folder containing a `.index.json` file or a {WEIGHTS_NAME} or a {SAFE_WEIGHTS_NAME} file"
                 )
-            elif len(potential_index) == 1:
+            elif len(potential_index) >= 1:
                 index_filename = os.path.join(checkpoint, potential_index[0])
-            else:
-                raise ValueError(
-                    f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
-                )
+            # else:
+            #     raise ValueError(
+            #         f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
+            #     )
     else:
         raise ValueError(
             "`checkpoint` should be the path to a file containing a whole state dict, or the index of a sharded "

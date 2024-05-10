@@ -7,9 +7,10 @@ from ..modeling_grok.modeling_grok1 import MoeBlock, MoeMLP, rotate_half
 
 
 from moe_infinity.utils import ArcherConfig
+from .base import MoELayer
 
 
-class SyncGrokMoeBlock(nn.Module):
+class SyncGrokMoeBlock(MoELayer):
     archer_config: ArcherConfig = None
     layer_id: int = None
     

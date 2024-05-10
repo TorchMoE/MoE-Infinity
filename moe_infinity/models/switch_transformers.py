@@ -14,6 +14,7 @@ from transformers.models.switch_transformers.modeling_switch_transformers import
 from transformers.activations import ACT2FN
 from moe_infinity.memory import ExpertPredictor
 from moe_infinity.utils import ArcherConfig
+from .base import MoELayer
 
 GPU_IDX_COUNTER = 0
 
@@ -37,7 +38,7 @@ class SwitchTransformersDenseGatedActDense(nn.Module):
         return hidden_states
 
 
-class SyncSwitchTransformersSparseMLP(nn.Module):
+class SyncSwitchTransformersSparseMLP(MoELayer):
     r"""
     Implementation of the Switch Transformers Sparse MLP module.
     """
