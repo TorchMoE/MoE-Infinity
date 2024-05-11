@@ -391,7 +391,7 @@ class OffloadEngine(object):
 
                         # convert all tensors in state_dict to self.dtype
                         for k, v in state_dict.items():
-                            state_dict[k] = v.to(self.dtype).to("cpu")
+                            state_dict[k] = v.to(self.dtype_cls).to("cpu")
 
                         self._offload_state_dict(state_dict, empty_state_dict)
 
