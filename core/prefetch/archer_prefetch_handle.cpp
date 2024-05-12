@@ -336,9 +336,11 @@ void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor, torch::Device 
     cudaMalloc(&device_ptr, byte_size);
 
     CudaMemcpy(device_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice);
-        tensor.sizes(),
-        [](void* ptr) { cudaFree(ptr); },
-        tensor.options().device(device).pinned_memory(false));
+    auto new_tensor = torch::from_blob(device_ptr,
+                                       tensor.sizes(),
+                                       tensor.strides(),
+                                       [device_ptr](void* ptr) { cudaFree(ptr); },
+                                       tensor.options().device(device).pinned_memory(false));
     tensor.set_data(new_tensor);
 }
 
