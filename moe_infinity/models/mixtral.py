@@ -11,7 +11,7 @@ import torch.nn as nn
 import transformers
 from transformers import MixtralConfig
 from transformers.models.mixtral.modeling_mixtral import (
-    MixtralBLockSparseTop2MLP,
+    MixtralBlockSparseTop2MLP,
 )
 
 from moe_infinity.utils import ArcherConfig
@@ -30,7 +30,7 @@ class SyncMixtralSparseMoeBlock(nn.Module):
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
-        self.experts = nn.ModuleList([MixtralBLockSparseTop2MLP(config) for _ in range(self.num_experts)])
+        self.experts = nn.ModuleList([MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
 
         self.archer_tracer = None
         self.archer_engine = None
