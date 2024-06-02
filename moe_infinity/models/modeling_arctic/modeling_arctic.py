@@ -26,7 +26,6 @@ import warnings
 import re
 from typing import List, Optional, Tuple, Union
 
-# import deepspeed
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -56,7 +55,7 @@ from transformers.utils import (
 )
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_arctic import ArcticConfig
-from transformers.integrations.deepspeed import is_deepspeed_available 
+from transformers.integrations.deepspeed import is_deepspeed_available
 from transformers.utils.versions import require_version
 
 if is_deepspeed_available():
@@ -109,11 +108,9 @@ def load_balancing_loss_func(
 ) -> float:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
     See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
     function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
     experts is too unbalanced.
-
     Args:
         gate_logits (Union[`torch.Tensor`, Tuple[torch.Tensor]):
             Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
@@ -123,7 +120,6 @@ def load_balancing_loss_func(
             shape [batch_size X sequence_length] if not None.
         num_experts (`int`, *optional*):
             Number of experts
-
     Returns:
         The auxiliary loss.
     """
@@ -259,7 +255,6 @@ def rotate_half(x):
 # Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
-
     Args:
         q (`torch.Tensor`): The query tensor.
         k (`torch.Tensor`): The key tensor.
@@ -618,7 +613,6 @@ class ArcticFlashAttention2(ArcticAttention):
         """
         Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
         first unpad the input, then computes the attention scores and pad the final attention scores.
-
         Args:
             query_states (`torch.Tensor`):
                 Input query states to be passed to Flash Attention API
@@ -873,7 +867,6 @@ class ArcticMLP(nn.Module):
                  shard_base_weights_if_doing_lora=False, 
                  is_residual_mlp=False):
         """MLP class for Arctic supporting vanilla linear layers as well as some deepspeed optimizations.
-
         ds_optimized_lora_config: config of type ds_linear.LoRAConfig that contains lora specific parameter if we want to add lora to this layer.
         ds_optimized_quantization_config: config of type ds_linear.QuantizationConfig.
         ds_optimized_base_weight_sharding: bool. If true, the base weight for lora (provided ds_optimized_lora_config is not None) will be sharded across all available gpus
@@ -1131,11 +1124,9 @@ ARCTIC_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
-
     This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
     Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
     and behavior.
-
     Parameters:
         config ([`ArcticConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
@@ -1187,44 +1178,33 @@ MIXTRAL_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
             it.
-
             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
-
             [What are input IDs?](../glossary#input-ids)
         attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
             Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
             - 1 for tokens that are **not masked**,
             - 0 for tokens that are **masked**.
-
             [What are attention masks?](../glossary#attention-mask)
-
             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
-
             If `past_key_values` is used, optionally only the last `decoder_input_ids` have to be input (see
             `past_key_values`).
-
             If you want to change padding behavior, you should read [`modeling_opt._prepare_decoder_attention_mask`]
             and modify to your needs. See diagram 1 in [the paper](https://arxiv.org/abs/1910.13461) for more
             information on the default strategy.
-
             - 1 indicates the head is **not masked**,
             - 0 indicates the head is **masked**.
         position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
             config.n_positions - 1]`.
-
             [What are position IDs?](../glossary#position-ids)
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
             Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
             `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
-
             Contains pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
             blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-
             If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
             don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
             `decoder_input_ids` of shape `(batch_size, sequence_length)`.
@@ -1254,7 +1234,6 @@ MIXTRAL_INPUTS_DOCSTRING = r"""
 class ArcticModel(ArcticPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`ArcticDecoderLayer`]
-
     Args:
         config: ArcticConfig
     """
@@ -1677,20 +1656,14 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
                 Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
                 config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
                 (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
         Returns:
-
         Example:
-
         ```python
         >>> from transformers import AutoTokenizer, ArcticForCausalLM
-
         >>> model = ArcticForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
         >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
-
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
-
         >>> # Generate
         >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
@@ -1822,10 +1795,8 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
 @add_start_docstrings(
     """
     The Arctic Model transformer with a sequence classification head on top (linear layer).
-
     [`ArcticForSequenceClassification`] uses the last token in order to do the classification, as other causal models
     (e.g. GPT-2) do.
-
     Since it does classification on the last token, it requires to know the position of the last token. If a
     `pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
     no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
