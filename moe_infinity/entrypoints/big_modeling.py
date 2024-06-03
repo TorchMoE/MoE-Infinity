@@ -66,7 +66,7 @@ class MoE:
                 )
             config = default_config_path
         if "arctic" in model_name_or_path:
-            model_config = ArcticConfig.from_pretrained(model_name_or_path)
+            model_config = ArcticConfig.from_pretrained(model_name_or_path, trust_remote=True)
         else:
             model_config = AutoConfig.from_pretrained(model_name_or_path)
         architecture = model_config.architectures[0].lower()

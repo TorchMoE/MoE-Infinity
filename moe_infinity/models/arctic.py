@@ -2,8 +2,9 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from  .modeling_arctic import ArcticConfig
+from .modeling_arctic import ArcticConfig
 from .modeling_arctic import ArcticMLP
+from .modeling_arctic.modeling_arctic import load_balancing_loss_func
 
 from moe_infinity.utils import ArcherConfig
 from .model_utils import apply_rotary_pos_emb
@@ -29,33 +30,56 @@ class SyncArcticMoeBlock(nn.Module):
         self.expert_tensor_ids: Dict[int, int] = None
         
     
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor]:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        num_tokens = batch_size * sequence_length
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
+
+        router_mask = F.one_hot(selected_experts, num_classes=self.num_experts)
+        routing_weights_mask = (routing_weights[:, :, None] * router_mask).permute(
+            0, 2, 1
+        )
+        router_mask = router_mask.permute(0, 2, 1)
+        # assume top-2 here
+        router_mask = torch.logical_or(router_mask[:, :, 0], router_mask[:, :, 1])
+        routing_weights_mask = torch.sum(routing_weights_mask, dim=-1)
+
+        # print("selected_experts", selected_experts)
         expert_index = selected_experts.reshape(batch_size, sequence_length, self.top_k)
         for i in range(batch_size):
             seq_id = self.seq_id_list[i]
+            # start_time = time.time()
             expert_matrix = self.expert_predictor.predict(seq_id, expert_index[i], self.layer_id)
+            # print("predict", time.time() - start_time)
+            # start_time = time.time()
             self.expert_prefetcher.prefetch_experts(self.layer_id, expert_matrix)
+            # print("prefetch", time.time() - start_time)
 
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
-        return final_hidden_states, expert_mask
+
+        for expert_idx in range(self.num_experts):
+            # expert_layer = self.experts[expert_idx]
+            token_indices = router_mask[:, expert_idx]
+            current_state = hidden_states[token_indices, :]
+
+            if token_indices.any():
+                current_hidden_states = (
+                    self.experts[expert_idx](current_state).to(routing_weights_mask.device)
+                    * routing_weights_mask[token_indices, expert_idx][:, None]
+                )
+                final_hidden_states[token_indices, :] += current_hidden_states
+
+        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, load_balancing_loss_func((router_logits, ), self.num_experts, self.top_k)
