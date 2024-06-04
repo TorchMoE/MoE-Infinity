@@ -12,6 +12,7 @@ import datasets
 import multiprocessing as mp
 from transformers import AutoTokenizer, TextStreamer, LlamaTokenizerFast
 from moe_infinity import MoE
+from moe_infinity.models.arctic import ArcticTokenizer
 
 class StopWatch(TextStreamer):
     def __init__(self, *args, **kwargs):
@@ -47,10 +48,12 @@ args = parser.parse_args()
 
 model_name = args.model_name_or_path.split("/")[-1]
 
-if "grok" in model_name:
-    tokenizer = LlamaTokenizerFast.from_pretrained("Xenova/grok-1-tokenizer", trust_remote_code=True)
+tokenizer = None
+if "arctic" in args.model_name_or_path.lower():
+    tokenizer = ArcticTokenizer.from_pretrained(args.model_name_or_path)
 else:
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+streamer = TextStreamer(tokenizer)
 
 dataset_name = "tasksource/bigbench"
 names = datasets.get_dataset_config_names(dataset_name)
@@ -80,8 +83,8 @@ elif "nllb" in args.model_name_or_path.lower():
     custom_kwargs = {"forced_bos_token_id": 256057} # translate to French
 elif "mixtral" in args.model_name_or_path.lower():
     custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
-elif "grok" in args.model_name_or_path.lower():
-    custom_kwargs = {}
+elif "arctic" in args.model_name_or_path.lower():
+    custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
 else:
     raise ValueError(f"Model {args.model_name_or_path} not supported")
 

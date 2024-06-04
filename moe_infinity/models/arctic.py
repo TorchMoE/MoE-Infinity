@@ -1,42 +1,35 @@
-# Copyright (c) TorchMoE.
-# SPDX-License-Identifier: Apache-2.0
-
-# TorchMoE Team
-
-import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-import transformers
-from transformers import MixtralConfig
-from transformers.models.mixtral.modeling_mixtral import (
-    MixtralBlockSparseTop2MLP,
-)
+from .modeling_arctic import ArcticConfig
+from .modeling_arctic import ArcticMLP
+from .modeling_arctic.modeling_arctic import load_balancing_loss_func
 
 from moe_infinity.utils import ArcherConfig
-from .base import MoELayer
+from .model_utils import apply_rotary_pos_emb
 
-class SyncMixtralSparseMoeBlock(nn.Module):
+class SyncArcticMoeBlock(nn.Module):
     archer_config: ArcherConfig = None
     layer_id: int = None
-
-    def __init__(self, config):
+    
+    def __init__(self, config: ArcticConfig, layer_id: int, **kwargs):
         super().__init__()
+
         self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
+        self.layer_id = layer_id  
         self.top_k = config.num_experts_per_tok
+        self.is_moe_layer = (layer_id+1) % config.moe_layer_frequency == 0
 
-        # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-
-        self.experts = nn.ModuleList([MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
+        self.experts = nn.ModuleList([ArcticMLP(config) for i in range(self.num_experts)])
 
         self.archer_tracer = None
         self.archer_engine = None
         self.expert_tensor_ids: Dict[int, int] = None
-
+        
+    
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -76,24 +69,17 @@ class SyncMixtralSparseMoeBlock(nn.Module):
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )
 
-        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
-        for output, _, idx, _ in results:
-            token_indices = router_mask[:, idx].bool()
-            final_hidden_states[token_indices, :] += output.to(routing_weights_mask.device) * routing_weights_mask[token_indices, idx][:, None]
+        for expert_idx in range(self.num_experts):
+            # expert_layer = self.experts[expert_idx]
+            token_indices = router_mask[:, expert_idx]
+            current_state = hidden_states[token_indices, :]
 
-        # for expert_idx in range(self.num_experts):
-        #     # expert_layer = self.experts[expert_idx]
-        #     token_indices = router_mask[:, expert_idx]
-        #     current_state = hidden_states[token_indices, :]
+            if token_indices.any():
+                current_hidden_states = (
+                    self.experts[expert_idx](current_state).to(routing_weights_mask.device)
+                    * routing_weights_mask[token_indices, expert_idx][:, None]
+                )
+                final_hidden_states[token_indices, :] += current_hidden_states
 
-        #     if token_indices.any():
-        #         current_hidden_states = (
-        #             self.experts[expert_idx](current_state).to(routing_weights_mask.device)
-        #             * routing_weights_mask[token_indices, expert_idx][:, None]
-        #         )
-        #         final_hidden_states[token_indices, :] += current_hidden_states
-
-        
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
-
+        return final_hidden_states, load_balancing_loss_func((router_logits, ), self.num_experts, self.top_k)

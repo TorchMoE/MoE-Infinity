@@ -2,12 +2,13 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from ..modeling_grok.configuration_grok1 import Grok1Config
-from ..modeling_grok.modeling_grok1 import MoeBlock, MoeMLP, rotate_half
+from .modeling_grok import Grok1Config
+from .modeling_grok import MoeBlock, MoeMLP
 
 
 from moe_infinity.utils import ArcherConfig
-from .base import MoELayer
+from .model_utils import apply_rotary_pos_emb
+
 
 
 class SyncGrokMoeBlock(MoELayer):

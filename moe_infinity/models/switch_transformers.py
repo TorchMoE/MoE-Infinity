@@ -12,9 +12,8 @@ from transformers.models.switch_transformers.modeling_switch_transformers import
     SwitchTransformersDenseActDense,
 )
 from transformers.activations import ACT2FN
-from moe_infinity.memory import ExpertPredictor
-from moe_infinity.utils import ArcherConfig
-from .base import MoELayer
+from ..memory import ExpertPredictor
+from ..utils import ArcherConfig
 
 GPU_IDX_COUNTER = 0
 

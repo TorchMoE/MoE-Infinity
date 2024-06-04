@@ -8,11 +8,12 @@ from huggingface_hub import snapshot_download
 from accelerate import init_empty_weights
 
 from accelerate.utils.versions import is_torch_version
-from moe_infinity.utils.constants import MODEL_MAPPING_NAMES
+from moe_infinity.common.constants import MODEL_MAPPING_NAMES
 from moe_infinity.runtime import OffloadEngine
 from moe_infinity.utils import get_checkpoint_paths, ArcherConfig
 from moe_infinity.models import apply_rotary_pos_emb
 import moe_infinity
+from moe_infinity.models.modeling_arctic import ArcticConfig
 
 
 class MoE:
@@ -64,7 +65,10 @@ class MoE:
                     f"Please provide a configuration file or create a default one at {default_config_path}."
                 )
             config = default_config_path
-        model_config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+        if "arctic" in model_name_or_path:
+            model_config = ArcticConfig.from_pretrained(model_name_or_path, trust_remote=True)
+        else:
+            model_config = AutoConfig.from_pretrained(model_name_or_path)
         architecture = model_config.architectures[0].lower()
 
         arch = None
@@ -137,7 +141,12 @@ class MoE:
             )
 
         if self.arch == "grok":
-            moe_infinity.modeling_grok.modeling_grok1.apply_rotary_pos_emb = (
+            moe_infinity.models.modeling_grok.modeling_grok1.apply_rotary_pos_emb = (
+                apply_rotary_pos_emb
+            )
+
+        if self.arch == "arctic":
+            moe_infinity.models.modeling_arctic.modeling_arctic.apply_rotary_pos_emb = (
                 apply_rotary_pos_emb
             )
 

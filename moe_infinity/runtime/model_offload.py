@@ -22,6 +22,7 @@ from moe_infinity.models import (
     SyncNllbMoeSparseMLP,
     SyncMixtralSparseMoeBlock,
     SyncGrokMoeBlock,
+    SyncArcticMoeBlock,
 )
 from moe_infinity.models import MoELayer
 from moe_infinity.utils import ArcherConfig
@@ -32,10 +33,10 @@ from moe_infinity.memory import ExpertPrefetcher
 import moe_infinity
 from moe_infinity.utils import (
     parse_moe_param,
-    parse_expert_type,
     parse_expert_id,
     parse_expert_dtype,
 )
+from moe_infinity.common import parse_expert_type
 from moe_infinity.memory import ExpertTracer, ExpertPredictor, ExpertCache
 
 from typing import Dict, Type, Union
@@ -231,19 +232,20 @@ class OffloadEngine(object):
 
             @functools.wraps(orig_init)
             def archer_init(cls, config, *args, **kwargs):
-                self.config = config
+                # self.config = config
+                pass
 
             return archer_init
 
-        def config_decorator(orig_config: Callable) -> Callable:
+        # def config_decorator(orig_config: Callable) -> Callable:
 
-            @functools.wraps(orig_config)
-            def archer_config(cls, *args, **kwargs):
-                config, model_kwargs = orig_config(*args, **kwargs)
-                self.config = config
-                return config, model_kwargs
+        #     @functools.wraps(orig_config)
+        #     def archer_config(cls, *args, **kwargs):
+        #         config, model_kwargs = orig_config(*args, **kwargs)
+        #         self.config = config
+        #         return config, model_kwargs
 
-            return archer_config
+        #     return archer_config
 
         def param_init_decorator(orig_param_init: Callable) -> Callable:
 
@@ -354,9 +356,11 @@ class OffloadEngine(object):
         transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock = (
             SyncMixtralSparseMoeBlock
         )
-        moe_infinity.modeling_grok.modeling_grok1._old_sparse_mlp = moe_infinity.modeling_grok.modeling_grok1.MoeBlock
-        moe_infinity.modeling_grok.modeling_grok1.MoeBlock = SyncGrokMoeBlock
+        moe_infinity.models.modeling_grok.modeling_grok1._old_sparse_mlp = moe_infinity.models.modeling_grok.MoeBlock
+        moe_infinity.models.modeling_grok.modeling_grok1.MoeBlock = SyncGrokMoeBlock
         
+        moe_infinity.models.modeling_arctic._old_sparse_mlp = moe_infinity.models.modeling_arctic.ArcticMoE
+        moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = SyncArcticMoeBlock
         
 
         def from_pretrained_decorator(orig_from_pretrained: Callable) -> Callable:
@@ -366,7 +370,12 @@ class OffloadEngine(object):
                 # print("Creating model from scratch ...")
 
                 name_id_map_file = os.path.join(self.checkpoint, "name_id_map.json")
-                self.config = AutoConfig.from_pretrained(*args, **kwargs)
+
+                model_name = args[0]
+                # if "arctic" in model_name:
+                #     self.config = ArcticConfig.from_pretrained(*args, **kwargs)
+                # else:
+                #     self.config = AutoConfig.from_pretrained(*args, **kwargs)
                 self.num_layers, self.num_experts, self.num_encoder_layers = (
                     parse_moe_param(self.config)
                 )
@@ -537,7 +546,14 @@ class OffloadEngine(object):
                 self.expert_layer_modules = []
                 for module in model.modules():
 
-                    if MoELayer in module.__class__.__bases__:
+                    if (
+                        isinstance(module, SyncNllbMoeSparseMLP)
+                        or isinstance(module, SyncSwitchTransformersSparseMLP)
+                        or isinstance(module, SyncNllbMoeSparseMLP)
+                        or isinstance(module, SyncMixtralSparseMoeBlock)
+                        or isinstance(module, SyncGrokMoeBlock)
+                        or isinstance(module, SyncArcticMoeBlock)
+                    ):
                         # module.archer_prefetch = self.archer_prefetch
                         # module.archer_tracer = self.archer_tracer
                         module.archer_engine = self.archer_engine
@@ -799,7 +815,7 @@ class OffloadEngine(object):
                 for expert_idx, expert_tensors in enumerate(tensors):
                     expert_key = (
                         f"{key}.expert_{expert_idx}"
-                        if self.config.model_type != "mixtral" and self.config.model_type != "grok-1"
+                        if self.config.model_type != "mixtral" and self.config.model_type != "grok-1" and self.config.model_type != "arctic"
                         else f"{key}.{expert_idx}"
                     )
                     input_device_index = self.archer_engine.get_node_default_device(
@@ -966,8 +982,12 @@ class OffloadEngine(object):
             transformers.models.mixtral.modeling_mixtral._old_sparse_mlp
         )
         
-        moe_infinity.modeling_grok.modeling_grok1.MoeBlock = (
+        moe_infinity.models.modeling_grok.modeling_grok1.MoeBlock = (
             moe_infinity.modeling_grok.modeling_grok1._old_sparse_mlp
+        )
+
+        moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = (
+            moe_infinity.models.modeling_arctic._old_sparse_mlp
         )
         
         
