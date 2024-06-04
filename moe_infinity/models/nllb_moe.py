@@ -71,7 +71,7 @@ class SyncNllbMoeSparseMLP(MoELayer):
         
         results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
         for output, _, idx, _ in results:
-            token_indices = router_mask[:, idx].bool()
+            token_indices = router_mask[..., idx].bool()
             weights = combining_weights[..., idx]
             next_states[token_indices] += torch.einsum("b,be->be", weights[token_indices], output.to(weights.device))
 
