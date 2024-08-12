@@ -9,6 +9,8 @@ import numpy as np
 import math
 import torch.distributed as dist
 from torch.distributed import rpc
+from auto_gptq.nn_modules.qlinear.qlinear_cuda import QuantLinear
+from auto_gptq.nn_modules.qlinear.qlinear_cuda_old import QuantLinear as QuantLinearOld
 
 import torch
 import functools
@@ -280,6 +282,13 @@ class OffloadEngine(object):
                     self.offload_set.add(cls.classifier.weight.data.data_ptr())
 
             return archer_cast_classifier
+        
+        
+        # GPTQ Override
+        QuantLinear._old_init = QuantLinear.__init__
+        QuantLinear.__init__ = param_init_decorator(QuantLinear.__init__)
+        QuantLinearOld._old_init = QuantLinearOld.__init__
+        QuantLinearOld.__init__ = param_init_decorator(QuantLinearOld.__init__)
 
         self.cls._old_init = self.cls.__init__
         self.cls.__init__ = init_decorator(self.cls._old_init)
@@ -605,6 +614,11 @@ class OffloadEngine(object):
 
     # clean up initialization hooks
     def __exit__(self, exc_type, exc_value, traceback):
+        
+        # GPTQ Override
+        QuantLinear.__init__ = QuantLinear._old_init
+        QuantLinearOld.__init__ = QuantLinearOld._old_init
+        
         self.cls.__init__ = self.cls._old_init
         self.cls.from_pretrained = self.cls._old_from_pretrained
         torch.nn.modules.module.Module.apply = torch.nn.modules.module.Module._old_apply
