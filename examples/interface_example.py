@@ -11,6 +11,7 @@ import datasets
 import multiprocessing as mp
 from transformers import AutoTokenizer, TextStreamer, LlamaTokenizerFast
 from moe_infinity import MoE
+from moe_infinity.models.arctic import ArcticTokenizer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name_or_path", type=str, required=True)
@@ -20,8 +21,11 @@ args = parser.parse_args()
 
 model_name = args.model_name_or_path.split("/")[-1]
 
+tokenizer = None
 if "grok" in model_name:
     tokenizer = LlamaTokenizerFast.from_pretrained("Xenova/grok-1-tokenizer", trust_remote_code=True)
+elif "arctic" in args.model_name_or_path.lower():
+    tokenizer = ArcticTokenizer.from_pretrained(args.model_name_or_path)
 else:
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 streamer = TextStreamer(tokenizer)
@@ -56,6 +60,8 @@ elif "mixtral" in args.model_name_or_path.lower():
     custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
 elif "grok" in args.model_name_or_path.lower():
     custom_kwargs = {}
+elif "arctic" in args.model_name_or_path.lower():
+    custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
 else:
     raise ValueError(f"Model {args.model_name_or_path} not supported")
 
