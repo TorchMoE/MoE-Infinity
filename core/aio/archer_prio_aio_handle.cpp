@@ -90,7 +90,7 @@ std::int64_t ArcherPrioAioHandle::Write(const std::string& filename,
 
     auto mem_type = IsDevicePointer(buffer) ? cudaMemcpyDeviceToHost : cudaMemcpyHostToHost;
     cudaHostAlloc(&write_buffer, num_bytes_aligned, cudaHostAllocDefault);
-    cudaMemcpy(write_buffer, buffer, num_bytes, mem_type);
+    CudaMemcpy(write_buffer, buffer, num_bytes, mem_type);
     auto callbacks =
         aio_context_.PrepIocbs(false, write_buffer, fd, kBlockSize, offset, num_bytes_aligned);
     auto io_request = std::make_shared<struct AioRequest>();

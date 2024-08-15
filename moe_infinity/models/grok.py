@@ -43,6 +43,15 @@ class SyncGrokMoeBlock(nn.Module):
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
+        router_mask = F.one_hot(selected_experts, num_classes=self.num_experts)
+        routing_weights_mask = (routing_weights[:, :, None] * router_mask).permute(
+            0, 2, 1
+        )
+        router_mask = router_mask.permute(0, 2, 1)
+        # assume top-2 here
+        router_mask = torch.logical_or(router_mask[:, :, 0], router_mask[:, :, 1])
+        routing_weights_mask = torch.sum(routing_weights_mask, dim=-1)
+
         expert_index = selected_experts.reshape(batch_size, sequence_length, self.top_k)
         for i in range(batch_size):
             seq_id = self.seq_id_list[i]
@@ -54,39 +63,46 @@ class SyncGrokMoeBlock(nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
 
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
+        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
+        for output, _, idx, _ in results:
+            token_indices = router_mask[:, idx].bool()
+            final_hidden_states[token_indices, :] += output.to(routing_weights_mask.device) * routing_weights_mask[token_indices, idx][:, None]
 
-            if top_x.shape[0] == 0:
-                continue
+        # # One hot encode the selected experts to create an expert mask
+        # # this will be used to easily index which expert is going to be sollicitated
+        # expert_mask = torch.nn.functional.one_hot(
+        #     selected_experts, num_classes=self.num_experts
+        # ).permute(2, 1, 0)
 
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
+        # # Loop over all available experts in the model and perform the computation on each expert
+        # for expert_idx in range(self.num_experts):
+        #     expert_layer = self.experts[expert_idx]
+        #     idx, top_x = torch.where(expert_mask[expert_idx])
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-            # print(f"current hidden_states device: {current_state.device} expert_layer device: {expert_layer}")
-            current_hidden_states = (
-                expert_layer(current_state).to(routing_weights.device)
-                * routing_weights[top_x_list, idx_list, None]
-            )
+        #     if top_x.shape[0] == 0:
+        #         continue
 
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
+        #     # in torch it is faster to index using lists than torch tensors
+        #     top_x_list = top_x.tolist()
+        #     idx_list = idx.tolist()
+
+        #     # Index the correct hidden states and compute the expert hidden state for
+        #     # the current expert. We need to make sure to multiply the output hidden
+        #     # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+        #     current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+        #     # print(f"current hidden_states device: {current_state.device} expert_layer device: {expert_layer}")
+        #     current_hidden_states = (
+        #         expert_layer(current_state).to(routing_weights.device)
+        #         * routing_weights[top_x_list, idx_list, None]
+        #     )
+
+        #     # However `index_add_` only support torch tensors for indexing so we'll use
+        #     # the `top_x` tensor here.
+        #     final_hidden_states.index_add_(
+        #         0, top_x, current_hidden_states.to(hidden_states.dtype)
+        #     )
+        
         final_hidden_states = final_hidden_states.reshape(
             batch_size, sequence_length, hidden_dim
         )

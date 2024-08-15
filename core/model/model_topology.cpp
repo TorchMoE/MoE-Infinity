@@ -114,9 +114,9 @@ void Node::SetDevice(const torch::Device& target_device,
 
             auto start_time = MCIROSECONDS_SINCE_EPOCH;
             if (stream == nullptr) {
-                cudaMemcpy(device_memory_ptr, host_memory_ptr, byte_size, cudaMemcpyHostToDevice);
+                CudaMemcpy(device_memory_ptr, host_memory_ptr, byte_size, cudaMemcpyHostToDevice);
             } else {
-                cudaMemcpyAsync(
+                CudaMemcpyAsync(
                     device_memory_ptr, host_memory_ptr, byte_size, cudaMemcpyHostToDevice, stream);
                 cudaStreamSynchronize(stream);
             }
