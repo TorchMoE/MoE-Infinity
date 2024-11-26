@@ -31,6 +31,7 @@ struct Task {
     std::uint64_t request_id;
     torch::Device src_device = DISK_DEVICE;
     torch::Device dst_device = DISK_DEVICE;
+    cudaStream_t stream = nullptr;
 
     bool remove_layer = false;
 

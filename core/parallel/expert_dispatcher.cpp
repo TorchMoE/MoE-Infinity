@@ -325,7 +325,7 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
         at::InferenceMode infer_guard(true);
 
         c10::cuda::CUDAStream stream =
-            c10::cuda::getStreamFromExternal(fetch_streams_[gpu_id], gpu_id);
+            c10::cuda::getStreamFromExternal(exec_streams_[gpu_id], gpu_id);
 
         {
             c10::cuda::CUDAStreamGuard guard(stream);

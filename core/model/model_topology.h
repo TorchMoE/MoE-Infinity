@@ -24,7 +24,7 @@ enum NodeState {
     NODE_STATE_VISITED = 0x4,
 };
 
-extern cudaStream_t kCudaStreamH2D;
+// extern cudaStream_t kCudaStreamH2D;
 
 struct Node {
     std::vector<TensorID> tensor_ids;

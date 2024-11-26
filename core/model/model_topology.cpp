@@ -22,7 +22,7 @@
 #include "prefetch/task_scheduler.h"
 #include "utils/archer_logger.h"
 
-cudaStream_t kCudaStreamH2D = NULL;
+// cudaStream_t kCudaStreamH2D = NULL;
 std::unique_ptr<ArcherTopologyHandle> kTopologyHandle = nullptr;
 
 const std::string Node::str() noexcept
@@ -73,13 +73,13 @@ void Node::SetDevice(const torch::Device& target_device,
         return;
     }
 
-    if (kCudaStreamH2D == NULL) {
-        auto cudaError = cudaStreamCreateWithFlags(&kCudaStreamH2D, cudaStreamNonBlocking);
-        if (cudaError != cudaSuccess) {
-            ARCHER_LOG_ERROR("cudaStreamCreate failed: {}", cudaGetErrorString(cudaError));
-            exit(-1);
-        }
-    }
+    // if (kCudaStreamH2D == NULL) {
+    //     auto cudaError = cudaStreamCreateWithFlags(&kCudaStreamH2D, cudaStreamNonBlocking);
+    //     if (cudaError != cudaSuccess) {
+    //         ARCHER_LOG_ERROR("cudaStreamCreate failed: {}", cudaGetErrorString(cudaError));
+    //         exit(-1);
+    //     }
+    // }
 
     if (target_device == DISK_DEVICE) {
         SetModuleDisk(tensor_ids);

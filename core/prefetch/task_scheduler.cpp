@@ -9,6 +9,7 @@
 
 #include "common/time.h"
 #include "memory/memory_pool.h"
+#include "memory/stream_pool.h"
 #include "task_scheduler.h"
 #include "task_thread.h"
 #include "utils/archer_logger.h"
@@ -518,7 +519,8 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task)
     auto start_time = MCIROSECONDS_SINCE_EPOCH;
 
     // node->SetDevice(task->dst_device);
-    node->SetDevice(task->dst_device, task->on_demand);
+    task->stream = TORCH_STREAM_H2D_VIEW(task->dst_device.index()).stream();
+    node->SetDevice(task->dst_device, task->on_demand, task->stream);
     auto end_time = MCIROSECONDS_SINCE_EPOCH;
     ARCHER_LOG_DEBUG(
         "SetNodeDevice: task: {}, emplace time {} us", task->DebugString(), end_time - start_time);
