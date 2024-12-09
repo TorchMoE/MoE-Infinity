@@ -68,18 +68,20 @@ class SyncNllbMoeSparseMLP(nn.Module):
             expert_matrix = self.expert_predictor.predict(seq_id, expert_index[i], self.layer_id)
             self.expert_prefetcher.prefetch_experts(self.layer_id, expert_matrix)
         
-        # self.expert_prefetcher.prefetch_tensors(self.layer_id, router_mask,
-        #                                         self.expert_tensor_ids,
-        #                                         n_tokens)
-            
-        for expert_id, expert in self.experts.items():
-            idx = int(expert_id.split("_")[-1])
-            token_indices = router_mask[:, :, idx].bool()
+        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
+        for output, _, idx, _ in results:
+            token_indices = router_mask[:, idx].bool()
             weights = combining_weights[..., idx]
+            next_states[token_indices] += torch.einsum("b,be->be", weights[token_indices], output.to(weights.device))
 
-            if token_indices.any():
-                expert_output = expert(hidden_states[token_indices]).to(weights.device)
-                next_states[token_indices] += torch.einsum("b,be->be", weights[token_indices], expert_output)
+        # for expert_id, expert in self.experts.items():
+        #     idx = int(expert_id.split("_")[-1])
+        #     token_indices = router_mask[:, :, idx].bool()
+        #     weights = combining_weights[..., idx]
+
+        #     if token_indices.any():
+        #         expert_output = expert(hidden_states[token_indices]).to(weights.device)
+        #         next_states[token_indices] += torch.einsum("b,be->be", weights[token_indices], expert_output)
 
         next_states[next_states == 0] = hidden_states[next_states == 0]
         hidden_states = next_states
