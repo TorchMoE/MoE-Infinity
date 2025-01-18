@@ -24,7 +24,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
     main_thread_stop_flag_.store(false);
 
     int num_gpu = GetDeviceCount();
-    for (int i = 0; i < num_gpu; ++i) {
+    for (int i = 0; i < num_gpu * 8; ++i) {
         std::thread t(&ExpertDispatcher::GPUFetchFunc, this, i);
         SetThreadAffinity(t);
         threads_.emplace_back(std::move(t));
@@ -39,7 +39,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
         out_streams_.emplace_back(out_stream);
     }
 
-    for (int i = 0; i < num_gpu; ++i) {
+    for (int i = 0; i < num_gpu * 8; ++i) {
         std::thread t(&ExpertDispatcher::GPUThreadFunc, this, i);
         SetThreadAffinity(t);
         threads_.emplace_back(std::move(t));
@@ -47,7 +47,7 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
         gpu_overload_.emplace_back(false);
     }
 
-    for (int i = 0; i < num_gpu; ++i) {
+    for (int i = 0; i < num_gpu * 8; ++i) {
         std::thread t(&ExpertDispatcher::GPUExecFunc, this, i);
         SetThreadAffinity(t);
         threads_.emplace_back(std::move(t));
@@ -374,19 +374,23 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
             stream.synchronize();
         }
 
-        (void)std::async(std::launch::async,
-                         &ExpertDispatcher::OutputFunc,
-                         this,
-                         std::move(args),
-                         std::move(output),
-                         gpu_id);
+        std::thread([this, args = std::move(args), output = std::move(output), gpu_id]() {
+            this->OutputFunc(std::move(args), std::move(output), gpu_id);
+        }).detach();
+
+        // (void)std::async(std::launch::async,
+        //                  &ExpertDispatcher::OutputFunc,
+        //                  this,
+        //                  std::move(args),
+        //                  std::move(output),
+        //                  gpu_id);
     }
 }
 
 void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_id)
 {
-    c10::cuda::CUDAStream stream = c10::cuda::getStreamFromExternal(out_streams_[gpu_id], gpu_id);
-    c10::cuda::CUDAStreamGuard guard(stream);
+    // c10::cuda::CUDAStream stream = c10::cuda::getStreamFromExternal(out_streams_[gpu_id], gpu_id);
+    // c10::cuda::CUDAStreamGuard guard(stream);
 
     auto output_device = (args.out_gpu_id < 0) ? CPU_DEVICE : CUDA_DEVICE(args.out_gpu_id);
     torch::Tensor output_tensor = output.to(output_device).to(args.out_dtype);
@@ -417,7 +421,7 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
             gpu_id,
             args.hit, ")");
     }
-    stream.synchronize();
+    // stream.synchronize();
     pending_.fetch_sub(1);
 }
 

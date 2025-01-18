@@ -3,7 +3,7 @@ ninja
 packaging>=20.0
 py-cpuinfo
 torch>=2.1.1
-transformers>=4.37.1, <4.40
+transformers>=4.39.1, <4.40
 sentencepiece
 pydantic==1.10.12 
 datasets>=2.12.0

@@ -9,3 +9,4 @@ from .mixtral import SyncMixtralSparseMoeBlock
 from .grok import SyncGrokMoeBlock
 from .arctic import SyncArcticMoeBlock, ArcticConfig
 from .model_utils import apply_rotary_pos_emb
+from .deepseek import DeepseekV2MoEBlock

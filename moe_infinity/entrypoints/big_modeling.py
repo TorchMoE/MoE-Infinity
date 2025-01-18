@@ -124,6 +124,8 @@ class MoE:
                 "[WARNING] FlashAttention is not available in the current environment. Using default attention."
             )
             pass
+        
+        
         with self.engine.init(cls=model_cls, ar_config=config):
             self.model = model_cls.from_pretrained(
                 model_name_or_path,
@@ -133,6 +135,7 @@ class MoE:
                 is_flash_attn_available=is_flash_attn_available,
                 trust_remote_code=True,
             )
+        
     
     def _configure_hook(self, input_ids: torch.LongTensor):
         if self.arch == "mixtral":
@@ -147,6 +150,11 @@ class MoE:
 
         if self.arch == "arctic":
             moe_infinity.models.modeling_arctic.modeling_arctic.apply_rotary_pos_emb = (
+                apply_rotary_pos_emb
+            )
+            
+        if self.arch == "deepseek":
+            moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = (
                 apply_rotary_pos_emb
             )
 

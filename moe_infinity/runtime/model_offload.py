@@ -25,6 +25,7 @@ from moe_infinity.models import (
     SyncMixtralSparseMoeBlock,
     SyncGrokMoeBlock,
     SyncArcticMoeBlock,
+    DeepseekV2MoEBlock,
 )
 from moe_infinity.utils import ArcherConfig
 from moe_infinity.utils.arguments import copy_args_to_device, copy_kwargs_to_device
@@ -364,11 +365,15 @@ class OffloadEngine(object):
         transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock = (
             SyncMixtralSparseMoeBlock
         )
+        
         moe_infinity.models.modeling_grok.modeling_grok1._old_sparse_mlp = moe_infinity.models.modeling_grok.MoeBlock
         moe_infinity.models.modeling_grok.modeling_grok1.MoeBlock = SyncGrokMoeBlock
         
         moe_infinity.models.modeling_arctic._old_sparse_mlp = moe_infinity.models.modeling_arctic.ArcticMoE
         moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = SyncArcticMoeBlock
+        
+        moe_infinity.models.modeling_deepseek._old_sparse_mlp = moe_infinity.models.modeling_deepseek.DeepseekV2MoE
+        moe_infinity.models.modeling_deepseek.DeepseekV2MoE = DeepseekV2MoEBlock
         
 
         def from_pretrained_decorator(orig_from_pretrained: Callable) -> Callable:
@@ -561,6 +566,7 @@ class OffloadEngine(object):
                         or isinstance(module, SyncMixtralSparseMoeBlock)
                         or isinstance(module, SyncGrokMoeBlock)
                         or isinstance(module, SyncArcticMoeBlock)
+                        or isinstance(module, DeepseekV2MoEBlock)
                     ):
                         # module.archer_prefetch = self.archer_prefetch
                         # module.archer_tracer = self.archer_tracer
@@ -659,7 +665,7 @@ class OffloadEngine(object):
                 print("param not in self.name_id_map", name)
                 continue
             if match:
-                if "expert" in name:
+                if "expert" in name and not "shared_experts" in name:
                     match = re.match(r"(.*experts)", name)
                     assert match, "Not correct expert name!"
                     stored_name = match.group(1)
@@ -706,7 +712,7 @@ class OffloadEngine(object):
                 # print("buffer not in self.name_id_map", name)
                 continue
             if match:
-                if "expert" in name:
+                if "expert" in name and not "shared_experts" in name:
                     match = re.match(r"(.*experts)", name)
                     assert match, "Not correct expert name!"
                     stored_name = match.group(1)
@@ -828,7 +834,7 @@ class OffloadEngine(object):
                 for expert_idx, expert_tensors in enumerate(tensors):
                     expert_key = (
                         f"{key}.expert_{expert_idx}"
-                        if self.config.model_type != "mixtral" and self.config.model_type != "grok-1" and self.config.model_type != "arctic"
+                        if self.config.model_type != "mixtral" and self.config.model_type != "grok-1" and self.config.model_type != "arctic" and self.config.model_type != "deepseek_v2"
                         else f"{key}.{expert_idx}"
                     )
                     input_device_index = self.archer_engine.get_node_default_device(
@@ -1001,6 +1007,10 @@ class OffloadEngine(object):
 
         moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = (
             moe_infinity.models.modeling_arctic._old_sparse_mlp
+        )
+        
+        moe_infinity.models.modeling_deepseek.modeling_deepseek.DeepseekV2MoE = (
+            moe_infinity.models.modeling_deepseek._old_sparse_mlp
         )
         
         

@@ -40,6 +40,11 @@ def parse_moe_param(config: PretrainedConfig) -> Tuple[int, int, int]:
         num_decoder_layers = config.num_hidden_layers
         num_layers = config.num_hidden_layers
         num_experts = config.num_experts
+    elif "deepseek" in arch:
+        num_encoder_layers = 0
+        num_decoder_layers = config.num_hidden_layers
+        num_layers = config.num_hidden_layers
+        num_experts = config.n_routed_experts
     else:
         raise RuntimeError(f"Unsupported architecture {arch}")
 
@@ -85,6 +90,20 @@ def parse_expert_id(param_name: str, config: PretrainedConfig) -> Tuple[int, int
         # example "model.layers.0.moe_block.experts.0.linear_1.weight"
         result = re.findall(
             r"layers\.(\d+)\.moe_block\.experts\.(\d+)\.", param_name
+        )
+        if result:
+            layer_id, expert_id = result[0]
+            # print(f"layer_id: {layer_id}, expert_id: {expert_id}")
+            layer_id = int(layer_id)
+            expert_id = int(expert_id)
+    elif "deepseek" in arch:
+        encoder_sparse_step = None
+        decoder_sparse_step = 1
+        layer_type = "decoder"
+
+        # example "model.layers.1.mlp.experts.0.gate_proj.weight"
+        result = re.findall(
+            r"layers\.(\d+)\.mlp\.experts\.(\d+)\.", param_name
         )
         if result:
             layer_id, expert_id = result[0]

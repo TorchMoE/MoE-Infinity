@@ -8,6 +8,7 @@ from transformers import (
 
 from ..models.modeling_grok.modeling_grok1 import Grok1ModelForCausalLM # TODO: Replace this with huggingface transformers
 from ..models.modeling_arctic import ArcticForCausalLM # TODO: Replace this with huggingface transformers
+from ..models.modeling_deepseek import DeepseekV2ForCausalLM
 
 MODEL_MAPPING_NAMES = {
     "switch": SwitchTransformersForConditionalGeneration,
@@ -16,6 +17,7 @@ MODEL_MAPPING_NAMES = {
     "opt": OPTForCausalLM,
     "grok": Grok1ModelForCausalLM,
     "arctic": ArcticForCausalLM,
+    "deepseek": DeepseekV2ForCausalLM,
 }
 
 MODEL_MAPPING_TYPES = {
@@ -24,6 +26,7 @@ MODEL_MAPPING_TYPES = {
     "mixtral": 4,
     "grok": 4,
     "arctic": 4,
+    "deepseek": 4,
 }
 
 def parse_expert_type(config: PretrainedConfig) -> int:

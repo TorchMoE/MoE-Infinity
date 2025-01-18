@@ -28,7 +28,6 @@ class SyncArcticMoeBlock(nn.Module):
         self.archer_engine = None
         self.expert_tensor_ids: Dict[int, int] = None
         
-    
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
