@@ -11,7 +11,7 @@ import datasets
 import multiprocessing as mp
 from transformers import AutoTokenizer, TextStreamer, LlamaTokenizerFast
 from moe_infinity import MoE
-from moe_infinity.models.arctic import ArcticTokenizer
+from moe_infinity.models.modeling_arctic import ArcticTokenizer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name_or_path", type=str, required=True)
@@ -27,7 +27,7 @@ if "grok" in model_name:
 elif "arctic" in args.model_name_or_path.lower():
     tokenizer = ArcticTokenizer.from_pretrained(args.model_name_or_path)
 else:
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True, use_fast=False)
 streamer = TextStreamer(tokenizer)
 
 dataset_name = "tasksource/bigbench"
