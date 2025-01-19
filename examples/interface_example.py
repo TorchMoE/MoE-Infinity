@@ -34,6 +34,7 @@ else:
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path, trust_remote_code=True, use_fast=False
     )
+
 streamer = TextStreamer(tokenizer)
 
 dataset_name = "tasksource/bigbench"
