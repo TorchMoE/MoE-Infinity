@@ -70,7 +70,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("enqueue_prefetch", &ArcherPrefetchHandle::EnqueuePrefetch)
         .def("fetch_tensors", &ArcherPrefetchHandle::FetchTensors)
         .def("clean_up_resources", &ArcherPrefetchHandle::CleanUpResources);
-     //    .def("set_node_cache_priority", &ArcherPrefetchHandle::SetNodeCachePriority);
+    //    .def("set_node_cache_priority", &ArcherPrefetchHandle::SetNodeCachePriority);
 
     py::class_<ExpertDispatcher>(m, "expert_dispatcher")
         .def(py::init<int, int, int, int>())

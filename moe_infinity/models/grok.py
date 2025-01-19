@@ -1,35 +1,36 @@
-from typing import Dict, Optional, Tuple
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
-from .modeling_grok import Grok1Config
-from .modeling_grok import MoeBlock, MoeMLP
+from typing import Dict, Tuple
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from moe_infinity.utils import ArcherConfig
-from .model_utils import apply_rotary_pos_emb
 
+from .modeling_grok import MoeMLP
 
 
 class SyncGrokMoeBlock(nn.Module):
     archer_config: ArcherConfig = None
     layer_id: int = None
-    
-    def __init__(self, hidden_dim: int, ffn_dim: int, num_experts: int, top_k: int):
+
+    def __init__(
+        self, hidden_dim: int, ffn_dim: int, num_experts: int, top_k: int
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.ffn_dim = ffn_dim
         self.num_experts = num_experts
         self.top_k = top_k
         # gating
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)        
-        self.experts = nn.ModuleList([MoeMLP(hidden_dim, ffn_dim) for _ in range(self.num_experts)])
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [MoeMLP(hidden_dim, ffn_dim) for _ in range(self.num_experts)]
+        )
 
         self.archer_tracer = None
         self.archer_engine = None
         self.expert_tensor_ids: Dict[int, int] = None
-        
-    
+
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -44,19 +45,27 @@ class SyncGrokMoeBlock(nn.Module):
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         router_mask = F.one_hot(selected_experts, num_classes=self.num_experts)
-        routing_weights_mask = (routing_weights[:, :, None] * router_mask).permute(
-            0, 2, 1
-        )
+        routing_weights_mask = (
+            routing_weights[:, :, None] * router_mask
+        ).permute(0, 2, 1)
         router_mask = router_mask.permute(0, 2, 1)
         # assume top-2 here
-        router_mask = torch.logical_or(router_mask[:, :, 0], router_mask[:, :, 1])
+        router_mask = torch.logical_or(
+            router_mask[:, :, 0], router_mask[:, :, 1]
+        )
         routing_weights_mask = torch.sum(routing_weights_mask, dim=-1)
 
-        expert_index = selected_experts.reshape(batch_size, sequence_length, self.top_k)
+        expert_index = selected_experts.reshape(
+            batch_size, sequence_length, self.top_k
+        )
         for i in range(batch_size):
             seq_id = self.seq_id_list[i]
-            expert_matrix = self.expert_predictor.predict(seq_id, expert_index[i], self.layer_id)
-            self.expert_prefetcher.prefetch_experts(self.layer_id, expert_matrix)
+            expert_matrix = self.expert_predictor.predict(
+                seq_id, expert_index[i], self.layer_id
+            )
+            self.expert_prefetcher.prefetch_experts(
+                self.layer_id, expert_matrix
+            )
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim),
@@ -64,10 +73,15 @@ class SyncGrokMoeBlock(nn.Module):
             device=hidden_states.device,
         )
 
-        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
+        results = self.expert_executor.dispatch_local(
+            hidden_states, router_mask, self.layer_id
+        )
         for output, _, idx, _ in results:
             token_indices = router_mask[:, idx].bool()
-            final_hidden_states[token_indices, :] += output.to(routing_weights_mask.device) * routing_weights_mask[token_indices, idx][:, None]
+            final_hidden_states[token_indices, :] += (
+                output.to(routing_weights_mask.device)
+                * routing_weights_mask[token_indices, idx][:, None]
+            )
 
         # # One hot encode the selected experts to create an expert mask
         # # this will be used to easily index which expert is going to be sollicitated
@@ -102,7 +116,7 @@ class SyncGrokMoeBlock(nn.Module):
         #     final_hidden_states.index_add_(
         #         0, top_x, current_hidden_states.to(hidden_states.dtype)
         #     )
-        
+
         final_hidden_states = final_hidden_states.reshape(
             batch_size, sequence_length, hidden_dim
         )

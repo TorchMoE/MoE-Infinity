@@ -7,7 +7,7 @@ MoE-Infinity is cost-effective yet fast:
 - Offloading MoE's experts to host memory, allowing memory-constrained GPUs to serve MoE models.
 - Minimizing the expert offloading overheads through several novel techniques: expert activation tracing, activation-aware expert prefetching, and activation-aware expert caching.
 - Supporting LLM acceleration techniques (such as [FlashAttention](https://github.com/Dao-AILab/flash-attention)).
-- Supporting multi-GPU environments with numeorous OS-level performance optimizations. 
+- Supporting multi-GPU environments with numeorous OS-level performance optimizations.
 - Achieving SOTA latency and throughput performance when serving MoEs in a resource-constrained GPU environment (in comparison with HuggingFace [Accelerate](https://github.com/huggingface/accelerate), [DeepSpeed](https://github.com/microsoft/DeepSpeed), [Mixtral-Offloading](https://github.com/dvmazur/mixtral-offloading), and [Ollama/LLama.cpp](https://github.com/ollama/ollama)).
 
 MoE-Infinity is easy-to-use:
@@ -41,7 +41,7 @@ Lower per-token-latency is preferable.
 | <ins>MoE-Infinity</ins> | <ins>*0.230*</ins>	| <ins>*0.239*</ins> | <ins>*0.895*</ins> |
 | Accelerate | 1.043 | 3.071 | 6.633 |
 |DeepSpeed | 4.578 | 8.381 | 2.486 |
-|Mixtral Offloading| X | X | 1.752 | 
+|Mixtral Offloading| X | X | 1.752 |
 |Ollama | X | X | 0.903 |
 
 
@@ -53,7 +53,7 @@ Higher throughput is preferable.
 | <ins>MoE-Infinity</ins> | <ins>*69.105*</ins>	| <ins>*30.300*</ins> | <ins>*12.579*</ins> |
 | Accelerate | 5.788 | 4.344 | 1.245 |
 |DeepSpeed | 7.416 | 4.334 | 7.727 |
-|Mixtral Offloading| X | X | 7.684 | 
+|Mixtral Offloading| X | X | 7.684 |
 |Ollama | X | X | 1.107 |
 
 > The Mixtral Offloading experiment was carried out with a batch size of 16, as utilizing a batch size of 32 would result in Out of Memory errors on the GPU.
@@ -145,14 +145,14 @@ CUDA_VISIBLE_DEVICES=0,1 python script.py
 We provide a simple example to run inference on a Huggingface LLM model. The script will download the model checkpoint and run inference on the specified input text. The output will be printed to the console.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python examples/interface_example.py --model_name_or_path "mistralai/Mixtral-8x7B-Instruct-v0.1" --offload_dir <your local path on SSD> 
+CUDA_VISIBLE_DEVICES=0 python examples/interface_example.py --model_name_or_path "mistralai/Mixtral-8x7B-Instruct-v0.1" --offload_dir <your local path on SSD>
 ```
 
 ## Release Plan
 
 We plan to release two functions in the following months:
 
-* We currently support PyTorch as the default inference engine, and we are in the process of supporting vLLM as another inference runtime, which includes the support of KV cache offloading. 
+* We currently support PyTorch as the default inference engine, and we are in the process of supporting vLLM as another inference runtime, which includes the support of KV cache offloading.
 * Supporting expert parallelism for distributed MoE inference.
 * More (We welcome contributors to join us!)
 

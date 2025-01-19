@@ -32,7 +32,7 @@ ArcherTensorHandle::ArcherTensorHandle(const std::string& prefix)
         ARCHER_LOG_FATAL("Invalid prefix: ", prefix_, " is not a directory");
     }
     if (stat(prefix_.c_str(), &st) == -1) {
-        ARCHER_LOG_WARN("Invalid prefix: ", prefix_," does not exist, creating");
+        ARCHER_LOG_WARN("Invalid prefix: ", prefix_, " does not exist, creating");
         mkdir(prefix_.c_str(), 0777);
     }
 
@@ -44,7 +44,7 @@ ArcherTensorHandle::ArcherTensorHandle(const std::string& prefix)
         kTensorIndex->Deserialize(ckpt_index_path.c_str());
         is_serialized_ = true;
     } else {
-        ARCHER_LOG_INFO("Index file", ckpt_index_path," does not exist, creating");
+        ARCHER_LOG_INFO("Index file", ckpt_index_path, " does not exist, creating");
     }
     ARCHER_LOG_INFO("Index file size ", kTensorIndex->size());
 }

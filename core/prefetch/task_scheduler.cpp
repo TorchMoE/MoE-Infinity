@@ -382,9 +382,8 @@ bool ArcherTaskPool::RemoveCachedDenseNode(const NodePtr& node)
 
 //     auto device_id = node->default_device.index();
 
-//     auto cache_limit = kDeviceMemoryPool->GetMemoryCapacity(torch::Device(torch::kCUDA, device_id));
-//     cache_limit -= node->byte_size;
-//     int64_t cache_size = 0;
+//     auto cache_limit = kDeviceMemoryPool->GetMemoryCapacity(torch::Device(torch::kCUDA,
+//     device_id)); cache_limit -= node->byte_size; int64_t cache_size = 0;
 
 //     NodePtrList device_nodes;
 //     for (auto& n : nodes) {

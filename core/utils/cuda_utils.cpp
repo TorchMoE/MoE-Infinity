@@ -46,11 +46,10 @@ int CudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind)
 }
 
 int CudaMemcpyAsync(void* dst,
-                               const void* src,
-                               size_t count,
-                               cudaMemcpyKind kind,
-                               cudaStream_t stream)
+                    const void* src,
+                    size_t count,
+                    cudaMemcpyKind kind,
+                    cudaStream_t stream)
 {
-    return cudaMemcpyAsync(
-        dst, src, count, kind, stream);
+    return cudaMemcpyAsync(dst, src, count, kind, stream);
 }

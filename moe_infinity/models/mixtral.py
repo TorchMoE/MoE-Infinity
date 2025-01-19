@@ -3,18 +3,17 @@
 
 # TorchMoE Team
 
-import time
-from typing import Dict, Optional
+from typing import Dict
+
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
-import transformers
-from transformers import MixtralConfig
+import torch.nn.functional as F
 from transformers.models.mixtral.modeling_mixtral import (
     MixtralBlockSparseTop2MLP,
 )
 
 from moe_infinity.utils import ArcherConfig
+
 
 class SyncMixtralSparseMoeBlock(nn.Module):
     archer_config: ArcherConfig = None
@@ -30,7 +29,9 @@ class SyncMixtralSparseMoeBlock(nn.Module):
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
-        self.experts = nn.ModuleList([MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)])
+        self.experts = nn.ModuleList(
+            [MixtralBlockSparseTop2MLP(config) for _ in range(self.num_experts)]
+        )
 
         self.archer_tracer = None
         self.archer_engine = None
@@ -45,40 +46,56 @@ class SyncMixtralSparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-
         router_mask = F.one_hot(selected_experts, num_classes=self.num_experts)
-        routing_weights_mask = (routing_weights[:, :, None] * router_mask).permute(
-            0, 2, 1
-        )
+        routing_weights_mask = (
+            routing_weights[:, :, None] * router_mask
+        ).permute(0, 2, 1)
         router_mask = router_mask.permute(0, 2, 1)
         # assume top-2 here
-        router_mask = torch.logical_or(router_mask[:, :, 0], router_mask[:, :, 1])
+        router_mask = torch.logical_or(
+            router_mask[:, :, 0], router_mask[:, :, 1]
+        )
         routing_weights_mask = torch.sum(routing_weights_mask, dim=-1)
 
         # print("selected_experts", selected_experts)
-        expert_index = selected_experts.reshape(batch_size, sequence_length, self.top_k)
+        expert_index = selected_experts.reshape(
+            batch_size, sequence_length, self.top_k
+        )
         for i in range(batch_size):
             seq_id = self.seq_id_list[i]
             # start_time = time.time()
-            expert_matrix = self.expert_predictor.predict(seq_id, expert_index[i], self.layer_id)
+            expert_matrix = self.expert_predictor.predict(
+                seq_id, expert_index[i], self.layer_id
+            )
             # print("predict", time.time() - start_time)
             # start_time = time.time()
-            self.expert_prefetcher.prefetch_experts(self.layer_id, expert_matrix)
+            self.expert_prefetcher.prefetch_experts(
+                self.layer_id, expert_matrix
+            )
             # print("prefetch", time.time() - start_time)
 
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
 
-        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
+        results = self.expert_executor.dispatch_local(
+            hidden_states, router_mask, self.layer_id
+        )
         for output, _, idx, _ in results:
             token_indices = router_mask[:, idx].bool()
-            final_hidden_states[token_indices, :] += output.to(routing_weights_mask.device) * routing_weights_mask[token_indices, idx][:, None]
+            final_hidden_states[token_indices, :] += (
+                output.to(routing_weights_mask.device)
+                * routing_weights_mask[token_indices, idx][:, None]
+            )
 
         # for expert_idx in range(self.num_experts):
         #     # expert_layer = self.experts[expert_idx]
@@ -92,7 +109,7 @@ class SyncMixtralSparseMoeBlock(nn.Module):
         #         )
         #         final_hidden_states[token_indices, :] += current_hidden_states
 
-        
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        final_hidden_states = final_hidden_states.reshape(
+            batch_size, sequence_length, hidden_dim
+        )
         return final_hidden_states, router_logits
-

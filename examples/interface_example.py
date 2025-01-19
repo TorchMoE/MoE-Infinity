@@ -3,15 +3,17 @@
 
 # TorchMoE Team
 
-from functools import partial
-import os
-import torch
 import argparse
-import datasets
 import multiprocessing as mp
-from transformers import AutoTokenizer, TextStreamer, LlamaTokenizerFast
+import os
+from functools import partial
+
+import datasets
+import torch
+from transformers import AutoTokenizer, LlamaTokenizerFast, TextStreamer
+
 from moe_infinity import MoE
-from moe_infinity.models.arctic import ArcticTokenizer
+from moe_infinity.models.modeling_arctic import ArcticTokenizer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name_or_path", type=str, required=True)
@@ -23,11 +25,15 @@ model_name = args.model_name_or_path.split("/")[-1]
 
 tokenizer = None
 if "grok" in model_name:
-    tokenizer = LlamaTokenizerFast.from_pretrained("Xenova/grok-1-tokenizer", trust_remote_code=True)
+    tokenizer = LlamaTokenizerFast.from_pretrained(
+        "Xenova/grok-1-tokenizer", trust_remote_code=True
+    )
 elif "arctic" in args.model_name_or_path.lower():
     tokenizer = ArcticTokenizer.from_pretrained(args.model_name_or_path)
 else:
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path, trust_remote_code=True, use_fast=False
+    )
 streamer = TextStreamer(tokenizer)
 
 dataset_name = "tasksource/bigbench"
@@ -42,7 +48,9 @@ pool = mp.Pool(mp.cpu_count())
 all_inputs = [None] * len(names)
 all_inputs = pool.map(partial(datasets.load_dataset, dataset_name), names)
 
-all_inputs = [text for dataset in all_inputs for text in dataset["validation"]["inputs"] ]
+all_inputs = [
+    text for dataset in all_inputs for text in dataset["validation"]["inputs"]
+]
 
 config = {
     "offload_path": os.path.join(args.offload_dir, model_name),
@@ -55,19 +63,20 @@ custom_kwargs = {}
 if "switch" in args.model_name_or_path.lower():
     custom_kwargs = {"decoder_start_token_id": 0}
 elif "nllb" in args.model_name_or_path.lower():
-    custom_kwargs = {"forced_bos_token_id": 256057} # translate to French
+    custom_kwargs = {"forced_bos_token_id": 256057}  # translate to French
 elif "mixtral" in args.model_name_or_path.lower():
     custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
 elif "grok" in args.model_name_or_path.lower():
     custom_kwargs = {}
 elif "arctic" in args.model_name_or_path.lower():
     custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
+elif "deepseek" in args.model_name_or_path.lower():
+    custom_kwargs = {"pad_token_id": tokenizer.eos_token_id}
 else:
     raise ValueError(f"Model {args.model_name_or_path} not supported")
 
 tokenizer.pad_token = tokenizer.eos_token
 for input_text in all_inputs:
-
     inputs = tokenizer(
         input_text,
         truncation=True,

@@ -1,16 +1,17 @@
+accelerate
+auto_gptq
+chardet
+datasets>=2.12.0
 hjson
 ninja
+optimum>=1.17.1
 packaging>=20.0
+pre-commit
 py-cpuinfo
+pyarrow==12.0.0
+pydantic==1.10.12
+scipy
+sentencepiece
+sphinx
 torch>=2.1.1
 transformers>=4.37.1, <4.40
-sentencepiece
-pydantic==1.10.12 
-datasets>=2.12.0
-pyarrow==12.0.0
-accelerate
-sphinx
-scipy
-chardet
-optimum>=1.17.1
-auto_gptq

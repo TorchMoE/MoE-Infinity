@@ -43,13 +43,13 @@ extern std::mutex kLogMutex;
 
 extern void InitLogger();
 
-#define ARCHER_LOG_DEBUG(...)                                    \
-    do {                                                         \
-        if (kLogLevel <= kDebug) {                               \
-            std::lock_guard<std::mutex> lock(kLogMutex);         \
+#define ARCHER_LOG_DEBUG(...)                                     \
+    do {                                                          \
+        if (kLogLevel <= kDebug) {                                \
+            std::lock_guard<std::mutex> lock(kLogMutex);          \
             std::cout << formatstr() << level2str(kDebug) << " "; \
-            print(__VA_ARGS__);                              \
-        }                                                        \
+            print(__VA_ARGS__);                                   \
+        }                                                         \
     } while (0)
 
 #define ARCHER_LOG_INFO(...)                                     \
@@ -57,17 +57,17 @@ extern void InitLogger();
         if (kLogLevel <= kInfo) {                                \
             std::lock_guard<std::mutex> lock(kLogMutex);         \
             std::cout << formatstr() << level2str(kInfo) << " "; \
-            print(__VA_ARGS__);                             \
+            print(__VA_ARGS__);                                  \
         }                                                        \
     } while (0)
 
-#define ARCHER_LOG_ERROR(...)                                    \
-    do {                                                         \
-        if (kLogLevel <= kError) {                               \
-            std::lock_guard<std::mutex> lock(kLogMutex);         \
+#define ARCHER_LOG_ERROR(...)                                     \
+    do {                                                          \
+        if (kLogLevel <= kError) {                                \
+            std::lock_guard<std::mutex> lock(kLogMutex);          \
             std::cout << formatstr() << level2str(kError) << " "; \
-            print(__VA_ARGS__);                         \
-        }                                                        \
+            print(__VA_ARGS__);                                   \
+        }                                                         \
     } while (0)
 
 #define ARCHER_LOG_WARN(...)                                     \
@@ -75,17 +75,16 @@ extern void InitLogger();
         if (kLogLevel <= kWarn) {                                \
             std::lock_guard<std::mutex> lock(kLogMutex);         \
             std::cout << formatstr() << level2str(kWarn) << " "; \
-            print(__VA_ARGS__);                              \
+            print(__VA_ARGS__);                                  \
         }                                                        \
     } while (0)
 
-#define ARCHER_LOG_FATAL(...)                                    \
-    do {                                                         \
-        if (kLogLevel <= kError) {                               \
-            std::lock_guard<std::mutex> lock(kLogMutex);         \
+#define ARCHER_LOG_FATAL(...)                                     \
+    do {                                                          \
+        if (kLogLevel <= kError) {                                \
+            std::lock_guard<std::mutex> lock(kLogMutex);          \
             std::cout << formatstr() << level2str(kFatal) << " "; \
-            print(__VA_ARGS__);                              \
-            throw std::runtime_error("Logged a FATAL error");    \
-        }                                                        \
+            print(__VA_ARGS__);                                   \
+            throw std::runtime_error("Logged a FATAL error");     \
+        }                                                         \
     } while (0)
-

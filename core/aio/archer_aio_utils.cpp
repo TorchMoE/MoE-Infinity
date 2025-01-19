@@ -4,10 +4,10 @@
 // TorchMoE Team
 
 #include "archer_aio_utils.h"
-#include <future>
-#include "utils/archer_logger.h"
 #include <string.h>
 #include <cmath>
+#include <future>
+#include "utils/archer_logger.h"
 
 const size_t kBlockSize = 1 * 1024 * 1024;
 const size_t kQueueDepth =
@@ -86,7 +86,7 @@ int ArcherWriteFileBatch(const int fd,
         const auto ret = future.get();
         if (ret < 0) {
             ARCHER_LOG_FATAL(
-                "Failed to write file: ", fd,", errno: ", errno,", msg: ", strerror(errno));
+                "Failed to write file: ", fd, ", errno: ", errno, ", msg: ", strerror(errno));
             return -1;
         }
     }
@@ -98,7 +98,8 @@ int ArcherReadFile(int fd, void* buffer, const size_t num_bytes, const size_t of
 {
     const auto ret = pread(fd, buffer, num_bytes, offset);
     if (ret < 0) {
-        ARCHER_LOG_FATAL("Failed to read file: ", fd,", errno: ", errno,", msg: ", strerror(errno));
+        ARCHER_LOG_FATAL(
+            "Failed to read file: ", fd, ", errno: ", errno, ", msg: ", strerror(errno));
         return -1;
     }
 
@@ -110,7 +111,7 @@ int ArcherWriteFile(int fd, const void* buffer, size_t num_bytes, size_t offset)
     const auto ret = pwrite(fd, buffer, num_bytes, offset);
     if (ret < 0) {
         ARCHER_LOG_FATAL(
-            "Failed to write file: ", fd,", errno: ", errno,", msg: ", strerror(errno));
+            "Failed to write file: ", fd, ", errno: ", errno, ", msg: ", strerror(errno));
         return -1;
     }
 

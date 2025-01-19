@@ -6,7 +6,6 @@ from transformers.models.llama import LlamaTokenizer
 
 
 class ArcticTokenizer(LlamaTokenizer):
-
     def __init__(
         self,
         vocab_file,

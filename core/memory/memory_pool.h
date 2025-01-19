@@ -7,12 +7,12 @@
 #include "common/pytorch.h"
 #include "utils/noncopyable.h"
 
-#include "utils/archer_logger.h"
-#include "host_caching_allocator.h"
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include "host_caching_allocator.h"
+#include "utils/archer_logger.h"
 
 std::size_t GetTotalSystemMemory();
 
@@ -41,9 +41,7 @@ public:
     {
         auto allocator = c10::HostCachingAllocator::get();
         for (auto& [key, data_ptr] : allocated_id_) {
-            if (data_ptr != nullptr) {
-                allocator->free(data_ptr);
-            }
+            if (data_ptr != nullptr) { allocator->free(data_ptr); }
         }
         allocated_id_.clear();
     }
@@ -73,11 +71,9 @@ public:
     virtual ~DeviceMemoryPool()
     {
         auto allocator = c10::cuda::CUDACachingAllocator::get();
-        for(auto &allocated_id : allocated_id_){
+        for (auto& allocated_id : allocated_id_) {
             for (auto& [key, data_ptr] : allocated_id) {
-                if (data_ptr != nullptr) {
-                    allocator->raw_deallocate(data_ptr);
-                }
+                if (data_ptr != nullptr) { allocator->raw_deallocate(data_ptr); }
             }
         }
         allocated_id_.clear();

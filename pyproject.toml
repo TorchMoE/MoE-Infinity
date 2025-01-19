@@ -1,3 +1,32 @@
 [build-system]
 requires = ["setuptools", "wheel", "torch"]
 build-backend = "setuptools.build_meta"
+
+
+[tool.ruff]
+line-length = 80
+exclude = []
+
+[tool.ruff.lint]
+fixable = ["ALL"]
+unfixable = [
+    # star imports
+    "F405",
+    "F403",
+    # lambda expression assignment
+    "E731",
+    # Loop control variable not used within loop body
+    "B007",
+    # raise distinguish errors
+    "B904",
+    # f-string format
+    "UP032",
+]
+select = [
+    # isort
+    "I",
+]
+ignore = [
+    # Loop control variable not used within loop body
+    "B007"
+]

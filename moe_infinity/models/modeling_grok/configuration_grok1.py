@@ -28,7 +28,7 @@ class Grok1Config(PretrainedConfig):
         num_experts=8,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
-        **kwargs
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.attn_output_multiplier = attn_output_multiplier

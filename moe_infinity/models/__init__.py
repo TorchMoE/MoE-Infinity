@@ -3,9 +3,10 @@
 
 # TorchMoE Team
 
-from .switch_transformers import SyncSwitchTransformersSparseMLP
-from .nllb_moe import SyncNllbMoeSparseMLP
-from .mixtral import SyncMixtralSparseMoeBlock
+from .arctic import ArcticConfig, SyncArcticMoeBlock
+from .deepseek import DeepseekV2MoEBlock
 from .grok import SyncGrokMoeBlock
-from .arctic import SyncArcticMoeBlock, ArcticConfig
+from .mixtral import SyncMixtralSparseMoeBlock
 from .model_utils import apply_rotary_pos_emb
+from .nllb_moe import SyncNllbMoeSparseMLP
+from .switch_transformers import SyncSwitchTransformersSparseMLP

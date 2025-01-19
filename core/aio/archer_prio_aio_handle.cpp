@@ -108,8 +108,7 @@ std::int64_t ArcherPrioAioHandle::Write(const std::string& filename,
     return num_bytes_aligned;
 }
 
-ArcherPrioAioContext::ArcherPrioAioContext(const int block_size)
-    : block_size_(block_size)
+ArcherPrioAioContext::ArcherPrioAioContext(const int block_size) : block_size_(block_size)
 {
     thread_pool_ = std::make_unique<ArcherAioThreadPool>(1);  // only one SSD device
     thread_pool_->Start();

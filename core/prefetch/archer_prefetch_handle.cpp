@@ -12,8 +12,8 @@
 #include "common/time.h"
 #include "memory/memory_pool.h"
 #include "task_scheduler.h"
-#include "utils/cuda_utils.h"
 #include "utils/archer_logger.h"
+#include "utils/cuda_utils.h"
 
 ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                                            const double device_memory_ratio)
@@ -45,29 +45,26 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                 if (can_access == 1) {
                     cudaSetDevice(i);
                     cudaError_t status = cudaDeviceEnablePeerAccess(j, 0);
-                    if (status == cudaErrorPeerAccessAlreadyEnabled){
+                    if (status == cudaErrorPeerAccessAlreadyEnabled) {
                         ARCHER_LOG_INFO("Peer access already enabled between device ", i, j);
-                        cudaGetLastError(); // clear error
+                        cudaGetLastError();  // clear error
                     } else if (status != cudaSuccess) {
                         ARCHER_LOG_ERROR("Failed to enable peer access between device ", i, j);
                     } else {
                         ARCHER_LOG_INFO("Enabled peer access between device ", i, j);
                     }
-
                 }
             }
         }
     }
-    
+
     ARCHER_LOG_INFO("Enabled peer access for all devices");
 }
 
 ArcherPrefetchHandle::~ArcherPrefetchHandle()
 {
     // served as a global manager for order of destruction
-    if(!has_cleaned_up_resources_) {
-        CleanUpResources();
-    }
+    if (!has_cleaned_up_resources_) { CleanUpResources(); }
 }
 
 void ArcherPrefetchHandle::CleanUpResources()
@@ -393,7 +390,8 @@ int ArcherPrefetchHandle::GetNodeDevice(std::vector<std::uint32_t> tensor_ids) c
     return node->device.index();
 }
 
-// void ArcherPrefetchHandle::SetNodeCachePriority(const std::uint32_t tensor_id, const float priority) {
+// void ArcherPrefetchHandle::SetNodeCachePriority(const std::uint32_t tensor_id, const float
+// priority) {
 //     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
 //     node->cache_priority = priority;
 // }

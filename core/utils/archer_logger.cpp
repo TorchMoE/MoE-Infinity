@@ -6,13 +6,12 @@
 #include "archer_logger.h"
 
 #include <stdio.h>
-#include <iostream>
 #include <string.h>
+#include <iostream>
 
 std::once_flag kLoggerFlag;
 int kLogLevel = -1;
 std::mutex kLogMutex;
-
 
 int str2level(const char* level)
 {
@@ -34,18 +33,12 @@ int str2level(const char* level)
 std::string level2str(int level)
 {
     switch (level) {
-        case kInfo:
-            return "INFO";
-        case kError:
-            return "ERROR";
-        case kWarn:
-            return "WARN";
-        case kDebug:
-            return "DEBUG";
-        case kFatal:
-            return "FATAL";
-        default:
-            return "UNKNOWN";
+        case kInfo: return "INFO";
+        case kError: return "ERROR";
+        case kWarn: return "WARN";
+        case kDebug: return "DEBUG";
+        case kFatal: return "FATAL";
+        default: return "UNKNOWN";
     }
 }
 
@@ -56,7 +49,7 @@ std::string formatstr()
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(time.time_since_epoch()) % 1000;
     auto timer = std::chrono::system_clock::to_time_t(time);
     auto tm = *std::localtime(&timer);
-    
+
     auto year = tm.tm_year + 1900;
     auto month = tm.tm_mon + 1;
     auto day = tm.tm_mday;

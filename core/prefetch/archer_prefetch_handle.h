@@ -6,8 +6,8 @@
 #pragma once
 
 #include "aio/archer_tensor_handle.h"
-#include "parallel/expert_dispatcher.h"
 #include "model/model_topology.h"
+#include "parallel/expert_dispatcher.h"
 
 class ArcherPrefetchHandle {
 public:

@@ -16,9 +16,9 @@ SwitchTransformersDenseActDense::SwitchTransformersDenseActDense(int dtype)
 }
 
 void SwitchTransformersDenseActDense::SetTensorsFromBlob(
-    void *ptr,
-    const std::vector<std::uint32_t> &tensor_ids,
-    const torch::Device &device)
+    void* ptr,
+    const std::vector<std::uint32_t>& tensor_ids,
+    const torch::Device& device)
 {
     wi = kTensorIndex->find(tensor_ids[0])->second.tensor;
     wo = kTensorIndex->find(tensor_ids[1])->second.tensor;
@@ -46,9 +46,9 @@ SwitchTransformersDenseGatedActDense::SwitchTransformersDenseGatedActDense(int d
 }
 
 void SwitchTransformersDenseGatedActDense::SetTensorsFromBlob(
-    void *ptr,
-    const std::vector<std::uint32_t> &tensor_ids,
-    const torch::Device &device)
+    void* ptr,
+    const std::vector<std::uint32_t>& tensor_ids,
+    const torch::Device& device)
 {
     wi_0 = kTensorIndex->find(tensor_ids[0])->second.tensor;
     wi_1 = kTensorIndex->find(tensor_ids[1])->second.tensor;
@@ -72,9 +72,9 @@ NllbMoeDenseActDense::NllbMoeDenseActDense(int dtype)
     fc2_bias = register_parameter("fc2_bias", torch::zeros({1}, options));
 }
 
-void NllbMoeDenseActDense::SetTensorsFromBlob(void *ptr,
-                                              const std::vector<std::uint32_t> &tensor_ids,
-                                              const torch::Device &device)
+void NllbMoeDenseActDense::SetTensorsFromBlob(void* ptr,
+                                              const std::vector<std::uint32_t>& tensor_ids,
+                                              const torch::Device& device)
 {
     fc1 = kTensorIndex->find(tensor_ids[0])->second.tensor;
     fc1_bias = kTensorIndex->find(tensor_ids[1])->second.tensor;
@@ -84,7 +84,8 @@ void NllbMoeDenseActDense::SetTensorsFromBlob(void *ptr,
 
 torch::Tensor NllbMoeDenseActDense::forward(torch::Tensor hidden_states)
 {
-    // ARCHER_LOG_DEBUG("NllbMoeDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states {}",
+    // ARCHER_LOG_DEBUG("NllbMoeDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states
+    // {}",
     //                  fc1.device().str(),
     //                  fc1_bias.device().str(),
     //                  fc2.device().str(),
@@ -105,9 +106,9 @@ FSGPTMoEDenseActDense::FSGPTMoEDenseActDense(int dtype)
     fc2_bias = register_parameter("fc2_bias", torch::zeros({1}, options));
 }
 
-void FSGPTMoEDenseActDense::SetTensorsFromBlob(void *ptr,
-                                               const std::vector<std::uint32_t> &tensor_ids,
-                                               const torch::Device &device)
+void FSGPTMoEDenseActDense::SetTensorsFromBlob(void* ptr,
+                                               const std::vector<std::uint32_t>& tensor_ids,
+                                               const torch::Device& device)
 {
     fc1 = kTensorIndex->find(tensor_ids[0])->second.tensor;
     fc1_bias = kTensorIndex->find(tensor_ids[1])->second.tensor;
@@ -117,14 +118,14 @@ void FSGPTMoEDenseActDense::SetTensorsFromBlob(void *ptr,
 
 torch::Tensor FSGPTMoEDenseActDense::forward(torch::Tensor hidden_states)
 {
-    // ARCHER_LOG_DEBUG("FSGPTMoEDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states {}",
+    // ARCHER_LOG_DEBUG("FSGPTMoEDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {} hidden_states
+    // {}",
     //                  fc1.device().str(),
     //                  fc1_bias.device().str(),
     //                  fc2.device().str(),
     //                  fc2_bias.device().str(),
     //                  hidden_states.device().str());
-    if (hidden_states.dtype() != fc1.dtype())
-        hidden_states = hidden_states.to(fc1.dtype());
+    if (hidden_states.dtype() != fc1.dtype()) hidden_states = hidden_states.to(fc1.dtype());
     return torch::matmul(torch::relu(torch::matmul(hidden_states, fc1.transpose(0, 1)) + fc1_bias),
                          fc2.transpose(0, 1)) +
            fc2_bias;
@@ -139,9 +140,9 @@ MixtralMoEDenseActDense::MixtralMoEDenseActDense(int dtype)
     w3 = register_parameter("w3", torch::zeros({1}, options));
 }
 
-void MixtralMoEDenseActDense::SetTensorsFromBlob(void *ptr,
-                                                 const std::vector<std::uint32_t> &tensor_ids,
-                                                 const torch::Device &device)
+void MixtralMoEDenseActDense::SetTensorsFromBlob(void* ptr,
+                                                 const std::vector<std::uint32_t>& tensor_ids,
+                                                 const torch::Device& device)
 {
     w1 = kTensorIndex->find(tensor_ids[0])->second.tensor;
     w2 = kTensorIndex->find(tensor_ids[1])->second.tensor;
@@ -159,42 +160,43 @@ torch::Tensor MixtralMoEDenseActDense::forward(torch::Tensor hidden_states)
     int w2_nan = torch::sum(torch::isnan(w2)).item<int>();
     int w3_nan = torch::sum(torch::isnan(w3)).item<int>();
     int hidden_states_nan = torch::sum(torch::isnan(hidden_states)).item<int>();
-    // std::cout << "MixtralMoEDenseActDense w1 " << w1_nan << " w2 " << w2_nan << " w3 " << w3_nan << " hidden_states " << hidden_states_nan << std::endl;
+    // std::cout << "MixtralMoEDenseActDense w1 " << w1_nan << " w2 " << w2_nan << " w3 " << w3_nan
+    // << " hidden_states " << hidden_states_nan << std::endl;
 
     assert(w1_nan == 0);
     assert(w2_nan == 0);
     assert(w3_nan == 0);
     assert(hidden_states_nan == 0);
 
-    return torch::matmul(torch::silu(torch::matmul(hidden_states, w1.transpose(0, 1))) * torch::matmul(hidden_states, w3.transpose(0, 1)), w2.transpose(0, 1));
+    return torch::matmul(torch::silu(torch::matmul(hidden_states, w1.transpose(0, 1))) *
+                             torch::matmul(hidden_states, w3.transpose(0, 1)),
+                         w2.transpose(0, 1));
 }
 
-void ExpertNode::SetTensorsFromBlob(const torch::Device &device)
+void ExpertNode::SetTensorsFromBlob(const torch::Device& device)
 {
     int expert_type = this->expert_type;
-    switch (expert_type)
-    {
-    case SWITCH_TRANSFORMERS_DENSE_ACT_DENSE:
-        reinterpret_cast<SwitchTransformersDenseActDense *>(module)->SetTensorsFromBlob(
-            node->device_memory_ptr, node->tensor_ids, device);
-        break;
-    case SWITCH_TRANSFORMERS_DENSE_GATED_ACT_DENSE:
-        reinterpret_cast<SwitchTransformersDenseGatedActDense *>(module)->SetTensorsFromBlob(
-            node->device_memory_ptr, node->tensor_ids, device);
-        break;
-    case NLLB_MOE_DENSE_ACT_DENSE:
-        reinterpret_cast<NllbMoeDenseActDense *>(module)->SetTensorsFromBlob(
-            node->device_memory_ptr, node->tensor_ids, device);
-        break;
-    case FSGPT_MOE_DENSE_ACT_DENSE:
-        reinterpret_cast<FSGPTMoEDenseActDense *>(module)->SetTensorsFromBlob(
-            node->device_memory_ptr, node->tensor_ids, device);
-        break;
-    case MIXTRAL_MOE_DENSE_ACT_DENSE:
-        reinterpret_cast<MixtralMoEDenseActDense *>(module)->SetTensorsFromBlob(
-            node->device_memory_ptr, node->tensor_ids, device);
-        break;
-    default:
-        assert(false);
+    switch (expert_type) {
+        case SWITCH_TRANSFORMERS_DENSE_ACT_DENSE:
+            reinterpret_cast<SwitchTransformersDenseActDense*>(module)->SetTensorsFromBlob(
+                node->device_memory_ptr, node->tensor_ids, device);
+            break;
+        case SWITCH_TRANSFORMERS_DENSE_GATED_ACT_DENSE:
+            reinterpret_cast<SwitchTransformersDenseGatedActDense*>(module)->SetTensorsFromBlob(
+                node->device_memory_ptr, node->tensor_ids, device);
+            break;
+        case NLLB_MOE_DENSE_ACT_DENSE:
+            reinterpret_cast<NllbMoeDenseActDense*>(module)->SetTensorsFromBlob(
+                node->device_memory_ptr, node->tensor_ids, device);
+            break;
+        case FSGPT_MOE_DENSE_ACT_DENSE:
+            reinterpret_cast<FSGPTMoEDenseActDense*>(module)->SetTensorsFromBlob(
+                node->device_memory_ptr, node->tensor_ids, device);
+            break;
+        case MIXTRAL_MOE_DENSE_ACT_DENSE:
+            reinterpret_cast<MixtralMoEDenseActDense*>(module)->SetTensorsFromBlob(
+                node->device_memory_ptr, node->tensor_ids, device);
+            break;
+        default: assert(false);
     }
 }

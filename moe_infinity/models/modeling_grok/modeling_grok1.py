@@ -7,16 +7,19 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
 try:
-    from transformers.modeling_attn_mask_utils import \
-        _prepare_4d_causal_attention_mask
+    from transformers.modeling_attn_mask_utils import (
+        _prepare_4d_causal_attention_mask,
+    )
 
     HAS_MASK_UTILS = True
 except ImportError:
     HAS_MASK_UTILS = False
 
 from .configuration_grok1 import Grok1Config
-from .modeling_grok1_outputs import (MoeCausalLMOutputWithPast,
-                                     MoeModelOutputWithPast)
+from .modeling_grok1_outputs import (
+    MoeCausalLMOutputWithPast,
+    MoeModelOutputWithPast,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -69,7 +72,8 @@ def load_balancing_loss_func(
 
     router_prob_per_group_and_expert = torch.mean(routing_weights, axis=-1)
     return torch.mean(
-        tokens_per_group_and_expert * router_prob_per_group_and_expert.unsqueeze(-1)
+        tokens_per_group_and_expert
+        * router_prob_per_group_and_expert.unsqueeze(-1)
     ) * (num_experts**2)
 
 
@@ -85,7 +89,9 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(
         batch, num_key_value_heads, n_rep, slen, head_dim
     )
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    return hidden_states.reshape(
+        batch, num_key_value_heads * n_rep, slen, head_dim
+    )
 
 
 class RMSNorm(nn.Module):
@@ -106,7 +112,9 @@ class RMSNorm(nn.Module):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = hidden_states * torch.rsqrt(
+            variance + self.variance_epsilon
+        )
         hidden_states = self.scale * hidden_states
         return hidden_states.to(input_dtype)
 
@@ -140,13 +148,19 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.outer(t, self.inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        self.register_buffer(
+            "cos_cached", emb.cos().to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin().to(dtype), persistent=False
+        )
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+            self._set_cos_sin_cache(
+                seq_len=seq_len, device=x.device, dtype=x.dtype
+            )
 
         return (
             self.cos_cached[:seq_len].to(dtype=x.dtype),
@@ -217,14 +231,18 @@ class MultiHeadAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        self.q_proj = nn.Linear(hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(
+            hidden_size, self.num_heads * self.head_dim, bias=False
+        )
         self.k_proj = nn.Linear(
             hidden_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
             hidden_size, self.num_key_value_heads * self.head_dim, bias=False
         )
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, hidden_size, bias=False)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, hidden_size, bias=False
+        )
 
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
@@ -240,7 +258,9 @@ class MultiHeadAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]
+    ]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -277,11 +297,13 @@ class MultiHeadAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)).to(
-            torch.float
-        )
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(2, 3)
+        ).to(torch.float)
         attn_weights = attn_weights * self.attn_output_multiplier
-        attn_weights = self.max_attn_val * F.tanh(attn_weights / self.max_attn_val)
+        attn_weights = self.max_attn_val * F.tanh(
+            attn_weights / self.max_attn_val
+        )
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -330,9 +352,9 @@ class MoeMLP(nn.Module):
         self.act_fn = nn.GELU()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        current_hidden_states = self.act_fn(self.linear(hidden_states)) * self.linear_v(
-            hidden_states
-        )
+        current_hidden_states = self.act_fn(
+            self.linear(hidden_states)
+        ) * self.linear_v(hidden_states)
         current_hidden_states = self.linear_1(current_hidden_states)
         return current_hidden_states
 
@@ -392,7 +414,9 @@ class MoeBlock(nn.Module):
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+            current_state = hidden_states[None, top_x_list].reshape(
+                -1, hidden_dim
+            )
             current_hidden_states = (
                 expert_layer(current_state)
                 * routing_weights[top_x_list, idx_list, None]
@@ -432,7 +456,9 @@ class DecoderLayer(nn.Module):
             attn_output_multiplier=attn_output_multiplier,
             max_attn_val=max_attn_val,
         )
-        self.moe_block = MoeBlock(hidden_size, intermediate_size, num_experts, top_k)
+        self.moe_block = MoeBlock(
+            hidden_size, intermediate_size, num_experts, top_k
+        )
         self.pre_attn_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.post_attn_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.pre_moe_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -530,14 +556,18 @@ def _make_causal_mask(
 
 
 # Copied from transformers.models.bart.modeling_bart._expand_mask
-def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+def _expand_mask(
+    mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None
+):
     """
     Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
     """
     bsz, src_len = mask.size()
     tgt_len = tgt_len if tgt_len is not None else src_len
 
-    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    expanded_mask = (
+        mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    )
 
     inverted_mask = 1.0 - expanded_mask
 
@@ -634,10 +664,14 @@ class Grok1Model(Grok1PretrainedModel):
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        use_cache = (
+            use_cache if use_cache is not None else self.config.use_cache
+        )
 
         return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
         )
 
         # retrieve input_ids and inputs_embeds
@@ -650,7 +684,9 @@ class Grok1Model(Grok1PretrainedModel):
         elif inputs_embeds is not None:
             batch_size, seq_length = inputs_embeds.shape[:2]
         else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+            raise ValueError(
+                "You have to specify either input_ids or inputs_embeds"
+            )
 
         seq_length_with_past = seq_length
         past_key_values_length = 0
@@ -659,7 +695,11 @@ class Grok1Model(Grok1PretrainedModel):
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
         if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            device = (
+                input_ids.device
+                if input_ids is not None
+                else inputs_embeds.device
+            )
             position_ids = torch.arange(
                 past_key_values_length,
                 seq_length + past_key_values_length,
@@ -723,7 +763,9 @@ class Grok1Model(Grok1PretrainedModel):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, past_key_value, output_attentions)
+                        return module(
+                            *inputs, past_key_value, output_attentions
+                        )
 
                     return custom_forward
 
@@ -746,7 +788,9 @@ class Grok1Model(Grok1PretrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+                next_decoder_cache += (
+                    layer_outputs[2 if output_attentions else 1],
+                )
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -790,7 +834,9 @@ class Grok1ModelForCausalLM(Grok1PretrainedModel):
         self.model = Grok1Model(config)
         self.vocab_size = config.vocab_size
         self.output_multiplier_scale = config.output_multiplier_scale
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -845,7 +891,9 @@ class Grok1ModelForCausalLM(Grok1PretrainedModel):
             else self.config.output_hidden_states
         )
         return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)

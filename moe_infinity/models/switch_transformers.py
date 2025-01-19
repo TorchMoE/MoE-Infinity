@@ -4,14 +4,16 @@
 # TorchMoE Team
 
 from typing import Dict
+
 import torch
 import torch.nn as nn
 from transformers import SwitchTransformersConfig
-from transformers.models.switch_transformers.modeling_switch_transformers import (
-    SwitchTransformersTop1Router,
-    SwitchTransformersDenseActDense,
-)
 from transformers.activations import ACT2FN
+from transformers.models.switch_transformers.modeling_switch_transformers import (
+    SwitchTransformersDenseActDense,
+    SwitchTransformersTop1Router,
+)
+
 from ..memory import ExpertPredictor
 from ..utils import ArcherConfig
 
@@ -19,7 +21,6 @@ GPU_IDX_COUNTER = 0
 
 
 class SwitchTransformersDenseGatedActDense(nn.Module):
-
     def __init__(self, config: SwitchTransformersConfig):
         super().__init__()
         self.wi_0 = nn.Linear(config.d_model, config.d_ff, bias=False)
@@ -71,7 +72,7 @@ class SyncSwitchTransformersSparseMLP(nn.Module):
         self.expert_predictor: ExpertPredictor = None
 
     def forward(self, hidden_states):
-        # Step 1: Get the router_mask from the router as wel as the probabilities
+        # Step 1: Get the router_mask from the router as well as the probabilities
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1)
 
@@ -84,16 +85,21 @@ class SyncSwitchTransformersSparseMLP(nn.Module):
         expert_index = expert_index.reshape(batch_size, -1)
         for i in range(batch_size):
             seq_id = self.seq_id_list[i]
-            expert_matrix = self.expert_predictor.predict(seq_id, expert_index[i], self.layer_id)
-            self.expert_prefetcher.prefetch_experts(self.layer_id, expert_matrix)
+            expert_matrix = self.expert_predictor.predict(
+                seq_id, expert_index[i], self.layer_id
+            )
+            self.expert_prefetcher.prefetch_experts(
+                self.layer_id, expert_matrix
+            )
 
-
-        results = self.expert_executor.dispatch_local(hidden_states, router_mask, self.layer_id)
+        results = self.expert_executor.dispatch_local(
+            hidden_states, router_mask, self.layer_id
+        )
 
         for output, _, idx, _ in results:
             token_indices = router_mask[:, :, idx].bool()
             next_states[token_indices] = output.to(next_states.device)
-            
+
         # for expert_id, expert in self.experts.items():
         #     idx = int(expert_id.split("_")[-1])
         #     token_indices = router_mask[:, :, idx].bool()
@@ -101,5 +107,7 @@ class SyncSwitchTransformersSparseMLP(nn.Module):
         #         next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.device)
 
         hidden_states = router_probs * next_states
-        return hidden_states, (router_logits.to("cuda:0", non_blocking=True),
-                               expert_index.to("cuda:0", non_blocking=True))
+        return hidden_states, (
+            router_logits.to("cuda:0", non_blocking=True),
+            expert_index.to("cuda:0", non_blocking=True),
+        )

@@ -120,13 +120,18 @@ void ExpertDispatcher::Enqueue(const CallArgs& args)
 
     auto& a = input_queue_.back();
     if (expert_node->node->device.is_cuda()) { a.gpu_id = expert_node->node->device.index(); }
-    ARCHER_LOG_DEBUG(
-        "ExpertDispatcher::Enqueue: num_enqueued_ ", num_enqueued_.load(),
-        "input_queue_ ", input_queue_.size(), \
-        "gpu_id ", a.gpu_id,
-        "layer_idx ", a.layer_idx,
-        "expert_idx ", a.expert_idx,
-        "remote ", a.remote);
+    ARCHER_LOG_DEBUG("ExpertDispatcher::Enqueue: num_enqueued_ ",
+                     num_enqueued_.load(),
+                     "input_queue_ ",
+                     input_queue_.size(),
+                     "gpu_id ",
+                     a.gpu_id,
+                     "layer_idx ",
+                     a.layer_idx,
+                     "expert_idx ",
+                     a.expert_idx,
+                     "remote ",
+                     a.remote);
 }
 
 void ExpertDispatcher::RegisterExpert(int layer_idx,
@@ -220,10 +225,8 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
                 wait_count++;
                 // if (wait_count % 100000 == 0) {
                 //     ARCHER_LOG_WARN(
-                //         "ExpertDispatcher::EnqueueTask: gpu_overload_ gpu_id {} wait_count {} {}",
-                //         gpu_id,
-                //         wait_count,
-                //         expert_node->node->str());
+                //         "ExpertDispatcher::EnqueueTask: gpu_overload_ gpu_id {} wait_count {}
+                //         {}", gpu_id, wait_count, expert_node->node->str());
                 // }
             }
 
@@ -277,12 +280,16 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
                                  expert_type);
         }
 
-        ARCHER_LOG_DEBUG(
-            "ExpertDispatcher::GPUFetchFunc gpu_id ",  gpu_id,
-            "layer_idx ", layer_idx,
-            "expert_idx ", expert_idx,
-            "input ", input.device().str(),
-            "node ", expert_node->node->device.str());
+        ARCHER_LOG_DEBUG("ExpertDispatcher::GPUFetchFunc gpu_id ",
+                         gpu_id,
+                         "layer_idx ",
+                         layer_idx,
+                         "expert_idx ",
+                         expert_idx,
+                         "input ",
+                         input.device().str(),
+                         "node ",
+                         expert_node->node->device.str());
         {
             ExecArgs exec_args;
             exec_args.hidden_states = std::move(input);
@@ -332,7 +339,7 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
 
             auto* expert_module = args.expert_node->module;
             int expert_type = expert_type_;
-            cudaStreamSynchronize(0); // make sure the input is ready
+            cudaStreamSynchronize(0);  // make sure the input is ready
 
             try {
                 switch (expert_type) {
@@ -358,9 +365,8 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
                                      ->forward(args.hidden_states);
                         break;
                     default:
-                        ARCHER_LOG_FATAL(
-                            "ExpertDispatcher::ExpertDispatcher: unknown expert type",
-                            expert_type);
+                        ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type",
+                                         expert_type);
                 }
 
             } catch (const std::exception& e) {
@@ -368,7 +374,11 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
                 ss << "DenseActDense tensor_ids: [";
                 for (auto& id : args.expert_node->node->tensor_ids) { ss << id << " "; }
                 ss << "]";
-                ARCHER_LOG_FATAL("ExpertDispatcher::GPUExecFunc", ss.str(), "expert_type", expert_type, e.what());
+                ARCHER_LOG_FATAL("ExpertDispatcher::GPUExecFunc",
+                                 ss.str(),
+                                 "expert_type",
+                                 expert_type,
+                                 e.what());
             }
 
             stream.synchronize();
@@ -407,15 +417,18 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
                                    args.expert_node->layer_idx,
                                    args.expert_node->expert_idx,
                                    args.hit);
-        ARCHER_LOG_DEBUG(
-            "ExpertDispatcher::OutputFunc: output_queue_", output_queue_.size(),
-            "output", std::get<0>(output_queue_.back()).device().str(),
-            "evict", args.evict,
-            "(", 
-            args.expert_node->layer_idx,
-            args.expert_node->expert_idx,
-            gpu_id,
-            args.hit, ")");
+        ARCHER_LOG_DEBUG("ExpertDispatcher::OutputFunc: output_queue_",
+                         output_queue_.size(),
+                         "output",
+                         std::get<0>(output_queue_.back()).device().str(),
+                         "evict",
+                         args.evict,
+                         "(",
+                         args.expert_node->layer_idx,
+                         args.expert_node->expert_idx,
+                         gpu_id,
+                         args.hit,
+                         ")");
     }
     stream.synchronize();
     pending_.fetch_sub(1);

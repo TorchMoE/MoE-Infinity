@@ -47,6 +47,7 @@ public:
 
     ArcherTensorIndex() = default;
     ~ArcherTensorIndex() = default;
+
 private:
 };
 

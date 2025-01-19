@@ -32,7 +32,7 @@ For developers who prefer to manually build and publish their package to PyPI, t
 2. Install the required dependencies to build the package:
     ```bash
     pip install -r requirements.txt
-    pip install build 
+    pip install build
     ```
 3. Build the source distribution and wheel for the package using:
     ```bash
@@ -46,4 +46,4 @@ For developers who prefer to manually build and publish their package to PyPI, t
     Ensure that you have the necessary credentials configured for `twine` to authenticate to PyPI.
 
 
-To build the package wheel for multiple Python versions, you should execute the build process individually for each version by specifying the corresponding Python interpreter. 
+To build the package wheel for multiple Python versions, you should execute the build process individually for each version by specifying the corresponding Python interpreter.

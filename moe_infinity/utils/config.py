@@ -3,10 +3,11 @@
 
 # TorchMoE Team
 
-from dataclasses import dataclass, field
 import os
-from transformers import HfArgumentParser
+from dataclasses import dataclass, field
+
 import torch
+from transformers import HfArgumentParser
 
 
 @dataclass
@@ -54,7 +55,9 @@ class ArcherConfig:
         return self
 
     def __post_init__(self):
-        self.perfect_cache_file = os.path.join(self.offload_path, "perfect_cache")
+        self.perfect_cache_file = os.path.join(
+            self.offload_path, "perfect_cache"
+        )
 
         self.device_per_node = (
             torch.cuda.device_count()

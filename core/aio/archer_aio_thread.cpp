@@ -48,7 +48,6 @@ void ArcherAioThread::Wait()
 
 void ArcherAioThread::Run()
 {
-
     while (is_running_) {
         std::function<void()> callback;
         {
@@ -60,5 +59,4 @@ void ArcherAioThread::Run()
         callback();
         pending_callbacks_.fetch_sub(1);
     }
-
 }

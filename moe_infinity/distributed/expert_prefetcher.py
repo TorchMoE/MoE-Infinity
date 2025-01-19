@@ -3,13 +3,10 @@
 
 # TorchMoE Team
 
-import time
-import numpy as np
-import torch
-from torch.distributed import rpc
 import torch.distributed as dist
-
+from torch.distributed import rpc
 from transformers import PretrainedConfig
+
 from moe_infinity.utils import parse_moe_param
 
 
@@ -24,8 +21,8 @@ class DistributedExpertPrefetcher(object):
 
     def __init__(self, config: PretrainedConfig):
         print(config)
-        self.num_layers, self.num_experts, self.num_encoder_layers = parse_moe_param(
-            config
+        self.num_layers, self.num_experts, self.num_encoder_layers = (
+            parse_moe_param(config)
         )
 
     def set_archer_engine(self, archer_engine):
@@ -46,9 +43,11 @@ class DistributedExpertPrefetcher(object):
             for j in range(self.num_experts):
                 if expert_matrix[i, j] > 0:
                     expert_list.append(
-                        (self.expert_tensor_map[(i,j)], expert_matrix[i, j])
+                        (self.expert_tensor_map[(i, j)], expert_matrix[i, j])
                     )
-        ordered_expert_list = sorted(expert_list, key=lambda x: x[1], reverse=True)
+        ordered_expert_list = sorted(
+            expert_list, key=lambda x: x[1], reverse=True
+        )
         tensor_ids = [x[0] for x in ordered_expert_list]
 
         device_list = self.device_map_manager.get_target_device(tensor_ids)
