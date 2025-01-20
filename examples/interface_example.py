@@ -97,3 +97,6 @@ for input_text in all_inputs:
             do_sample=False,
             **custom_kwargs,
         )
+
+# sudo CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1,2 numactl --membind=0 /mnt/data/xly/.conda/envs/moe-infinity/bin/python interface_example.py --model_name_or_path mistralai/Mixtral-8x7B-Instruct-v0.1 --offload_dir /mnt/raid0nvme1/xly/test-data
+# sudo CUDA_LAUNCH_BLOCKING=1 CUDA_VISIBLE_DEVICES=1,2 numactl --membind=0 gdb --args /mnt/data/xly/.conda/envs/moe-infinity/bin/python /home/xly/MoE-Infinity/examples/interface_example.py --model_name_or_path deepseek-ai/DeepSeek-V2-Lite --offload_dir /mnt/raid0nvme1/xly/test-data

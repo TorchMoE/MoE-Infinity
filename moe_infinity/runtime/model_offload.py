@@ -406,7 +406,7 @@ class OffloadEngine(object):
                     self.checkpoint, "name_id_map.json"
                 )
 
-                model_name = args[0]
+                self.model_name = model_name = args[0]
                 # if "arctic" in model_name:
                 #     self.config = ArcticConfig.from_pretrained(*args, **kwargs)
                 # else:
@@ -883,6 +883,9 @@ class OffloadEngine(object):
                 )
 
         expert_layer_id = 0
+        if "deepseek" in self.model_name:
+            expert_layer_id = self.config.first_k_dense_replace
+
         output_device_index = None
         for key, tensors in topo:
             # print(key, tensors)

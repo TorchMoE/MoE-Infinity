@@ -30,7 +30,7 @@ MODEL_MAPPING_TYPES = {
     "mixtral": 4,
     "grok": 4,
     "arctic": 4,
-    "deepseek": 4,
+    "deepseek": 5,
 }
 
 

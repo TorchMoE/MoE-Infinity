@@ -49,7 +49,6 @@ class DistributedExpertPrefetcher(object):
             expert_list, key=lambda x: x[1], reverse=True
         )
         tensor_ids = [x[0] for x in ordered_expert_list]
-
         device_list = self.device_map_manager.get_target_device(tensor_ids)
 
         if len(tensor_ids) > 0:

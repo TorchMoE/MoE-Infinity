@@ -156,21 +156,50 @@ torch::Tensor MixtralMoEDenseActDense::forward(torch::Tensor hidden_states)
     current_hidden_states = self.w2(current_hidden_states)
     return current_hidden_states
     */
-    int w1_nan = torch::sum(torch::isnan(w1)).item<int>();
-    int w2_nan = torch::sum(torch::isnan(w2)).item<int>();
-    int w3_nan = torch::sum(torch::isnan(w3)).item<int>();
-    int hidden_states_nan = torch::sum(torch::isnan(hidden_states)).item<int>();
+    // int w1_nan = torch::sum(torch::isnan(w1)).item<int>();
+    // int w2_nan = torch::sum(torch::isnan(w2)).item<int>();
+    // int w3_nan = torch::sum(torch::isnan(w3)).item<int>();
+    // int hidden_states_nan = torch::sum(torch::isnan(hidden_states)).item<int>();
     // std::cout << "MixtralMoEDenseActDense w1 " << w1_nan << " w2 " << w2_nan << " w3 " << w3_nan
     // << " hidden_states " << hidden_states_nan << std::endl;
 
-    assert(w1_nan == 0);
-    assert(w2_nan == 0);
-    assert(w3_nan == 0);
-    assert(hidden_states_nan == 0);
+    // assert(w1_nan == 0);
+    // assert(w2_nan == 0);
+    // assert(w3_nan == 0);
+    // assert(hidden_states_nan == 0);
+
+    // auto gate_proj = torch::silu(torch::matmul(hidden_states, w1.transpose(0, 1)));
+    // auto up_proj = torch::matmul(hidden_states, w3.transpose(0, 1));
+    // auto down_proj = torch::matmul(gate_proj * up_proj, w2.transpose(0, 1));
 
     return torch::matmul(torch::silu(torch::matmul(hidden_states, w1.transpose(0, 1))) *
                              torch::matmul(hidden_states, w3.transpose(0, 1)),
                          w2.transpose(0, 1));
+}
+
+DeepSeekMoEDenseActDense::DeepSeekMoEDenseActDense(int dtype)
+{
+    auto tensor_dtype = dtype_to_torch(dtype);
+    auto options = torch::TensorOptions().dtype(tensor_dtype).device(torch::kCPU);
+    gate_proj = register_parameter("gate_proj", torch::zeros({1}, options));
+    up_proj = register_parameter("up_proj", torch::zeros({1}, options));
+    down_proj = register_parameter("down_proj", torch::zeros({1}, options));
+}
+
+void DeepSeekMoEDenseActDense::SetTensorsFromBlob(void* ptr,
+                                                  const std::vector<std::uint32_t>& tensor_ids,
+                                                  const torch::Device& device)
+{
+    gate_proj = kTensorIndex->find(tensor_ids[0])->second.tensor;
+    up_proj = kTensorIndex->find(tensor_ids[1])->second.tensor;
+    down_proj = kTensorIndex->find(tensor_ids[2])->second.tensor;
+}
+
+torch::Tensor DeepSeekMoEDenseActDense::forward(torch::Tensor hidden_states)
+{
+    return torch::matmul(torch::silu(torch::matmul(hidden_states, gate_proj.transpose(0, 1))) *
+                             torch::matmul(hidden_states, up_proj.transpose(0, 1)),
+                         down_proj.transpose(0, 1));
 }
 
 void ExpertNode::SetTensorsFromBlob(const torch::Device& device)
@@ -195,6 +224,10 @@ void ExpertNode::SetTensorsFromBlob(const torch::Device& device)
             break;
         case MIXTRAL_MOE_DENSE_ACT_DENSE:
             reinterpret_cast<MixtralMoEDenseActDense*>(module)->SetTensorsFromBlob(
+                node->device_memory_ptr, node->tensor_ids, device);
+            break;
+        case DEEPSEEK_MOE_DENSE_ACT_DENSE:
+            reinterpret_cast<DeepSeekMoEDenseActDense*>(module)->SetTensorsFromBlob(
                 node->device_memory_ptr, node->tensor_ids, device);
             break;
         default: assert(false);

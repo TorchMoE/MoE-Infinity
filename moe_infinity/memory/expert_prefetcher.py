@@ -4,6 +4,7 @@
 # TorchMoE Team
 
 
+import numpy as np
 from transformers import PretrainedConfig
 
 from moe_infinity.utils import parse_moe_param
@@ -37,7 +38,7 @@ class ExpertPrefetcher(object):
             expert_list, key=lambda x: x[1], reverse=True
         )
         tensor_ids = [x[0] for x in ordered_expert_list]
-
+        assert len(np.unique(tensor_ids)) == len(tensor_ids)
         self.archer_engine.replace_cache_candidates(tensor_ids)
         for tensor_id in tensor_ids:
             gpu_id = self.archer_engine.get_node_default_device([tensor_id])

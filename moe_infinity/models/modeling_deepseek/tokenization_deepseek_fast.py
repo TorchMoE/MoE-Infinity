@@ -1,11 +1,9 @@
 from typing import List, Optional, Union
 
-
 from transformers.models.llama import LlamaTokenizerFast
 
 
 class DeepseekTokenizerFast(LlamaTokenizerFast):
-
     def convert_ids_to_tokens(
         self, ids: Union[int, List[int]], skip_special_tokens: bool = False
     ) -> Union[str, List[str]]:
@@ -32,7 +30,7 @@ class DeepseekTokenizerFast(LlamaTokenizerFast):
             token = self._tokenizer.id_to_token(index)
             tokens.append(token if token is not None else "")
         return tokens
-    
+
     def _convert_id_to_token(self, index: int) -> Optional[str]:
         token = self._tokenizer.id_to_token(int(index))
         return token if token is not None else ""

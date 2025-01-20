@@ -15,6 +15,7 @@
 #define NLLB_MOE_DENSE_ACT_DENSE 2
 #define FSGPT_MOE_DENSE_ACT_DENSE 3
 #define MIXTRAL_MOE_DENSE_ACT_DENSE 4
+#define DEEPSEEK_MOE_DENSE_ACT_DENSE 5
 
 #define DTYPE_BFLOAT16 0
 #define DTYPE_FLOAT32 1
@@ -72,6 +73,16 @@ struct MixtralMoEDenseActDense : public torch::nn::Module, public ModuleUtils {
     MixtralMoEDenseActDense(int dtype);
     torch::Tensor forward(torch::Tensor hidden_states);
     torch::Tensor w1, w2, w3;
+
+    void SetTensorsFromBlob(void* ptr,
+                            const std::vector<std::uint32_t>& tensor_ids,
+                            const torch::Device& device) override;
+};
+
+struct DeepSeekMoEDenseActDense : public torch::nn::Module, public ModuleUtils {
+    DeepSeekMoEDenseActDense(int dtype);
+    torch::Tensor forward(torch::Tensor hidden_states);
+    torch::Tensor gate_proj, up_proj, down_proj;
 
     void SetTensorsFromBlob(void* ptr,
                             const std::vector<std::uint32_t>& tensor_ids,

@@ -83,6 +83,9 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
                 case MIXTRAL_MOE_DENSE_ACT_DENSE:
                     experts_[i][j]->module = new MixtralMoEDenseActDense(dtype);
                     break;
+                case DEEPSEEK_MOE_DENSE_ACT_DENSE:
+                    experts_[i][j]->module = new DeepSeekMoEDenseActDense(dtype);
+                    break;
                 default:
                     ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type ",
                                      expert_type);
@@ -107,11 +110,20 @@ void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id, 
 void ExpertDispatcher::Enqueue(const CallArgs& args)
 {
     std::lock_guard<std::mutex> lock(input_mutex_);
-
     int layer_idx = args.layer_idx;
     int expert_idx = args.expert_idx;
     auto expert_node = experts_[expert_idx][layer_idx];
 
+    // if (!expert_node->node->mutex.try_lock()) {
+    //     ARCHER_LOG_WARN("ExpertDispatcher::Enqueue: mutex try_lock failed (expert_idx ",
+    //                     expert_idx,
+    //                     " layer_idx ",
+    //                     layer_idx,
+    //                     "node ",
+    //                     expert_node->node->str(),
+    //                     ")");
+    //     return;
+    // }
     expert_node->node->mutex.lock();
     expert_node->node->last_access_time = MCIROSECONDS_SINCE_EPOCH;
 
@@ -273,10 +285,11 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
             case NLLB_MOE_DENSE_ACT_DENSE:
             case FSGPT_MOE_DENSE_ACT_DENSE:
             case MIXTRAL_MOE_DENSE_ACT_DENSE:
+            case DEEPSEEK_MOE_DENSE_ACT_DENSE:
                 input = hidden_states_.index({token_indices}).to(expert_node->node->device);
                 break;
             default:
-                ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type ",
+                ARCHER_LOG_FATAL("ExpertDispatcher::expert_type: unknown expert type ",
                                  expert_type);
         }
 
@@ -364,8 +377,12 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
                         output = reinterpret_cast<MixtralMoEDenseActDense*>(expert_module)
                                      ->forward(args.hidden_states);
                         break;
+                    case DEEPSEEK_MOE_DENSE_ACT_DENSE:
+                        output = reinterpret_cast<DeepSeekMoEDenseActDense*>(expert_module)
+                                     ->forward(args.hidden_states);
+                        break;
                     default:
-                        ARCHER_LOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type",
+                        ARCHER_LOG_FATAL("ExpertDispatcher::GPUExecFunc: unknown expert type",
                                          expert_type);
                 }
 
@@ -395,8 +412,8 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
 
 void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_id)
 {
-    c10::cuda::CUDAStream stream = c10::cuda::getStreamFromExternal(out_streams_[gpu_id], gpu_id);
-    c10::cuda::CUDAStreamGuard guard(stream);
+    // c10::cuda::CUDAStream stream = c10::cuda::getStreamFromExternal(out_streams_[gpu_id],
+    // gpu_id); c10::cuda::CUDAStreamGuard guard(stream);
 
     auto output_device = (args.out_gpu_id < 0) ? CPU_DEVICE : CUDA_DEVICE(args.out_gpu_id);
     torch::Tensor output_tensor = output.to(output_device).to(args.out_dtype);
@@ -430,7 +447,7 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
                          args.hit,
                          ")");
     }
-    stream.synchronize();
+    // stream.synchronize();
     pending_.fetch_sub(1);
 }
 
