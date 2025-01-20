@@ -148,6 +148,46 @@ We provide a simple example to run inference on a Huggingface LLM model. The scr
 CUDA_VISIBLE_DEVICES=0 python examples/interface_example.py --model_name_or_path "mistralai/Mixtral-8x7B-Instruct-v0.1" --offload_dir <your local path on SSD> 
 ```
 
+### OpenAI-Compatible Server
+
+Start the OpenAI-compatible server locally
+```bash
+python -m moe_infinity.entrypoints.openai.api_server --model facebook/opt-125m --offload-dir ./offload_dir
+```
+
+Query the model via `/v1/components/`. (We currently only support the required fields, i.e., "model" and "prompt").
+```bash
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "facebook/opt-125m",
+        "prompt": "Hello, my name is"
+    }'
+```
+You can also use `openai` python package to query the model.
+```bash
+pip install openai
+python tests/test_oai_completions.py
+```
+
+Query the model via `/v1/chat/completions`. (We currently only support the required fields, i.e., "model" and "messages").
+```bash
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "facebook/opt-125m",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Tell me a joke"}
+        ]
+    }'
+```
+You can also use `openai` python package to query the model.
+```bash
+pip install openai
+python tests/test_oai_chat_completions.py
+```
+
 ## Release Plan
 
 We plan to release two functions in the following months:
