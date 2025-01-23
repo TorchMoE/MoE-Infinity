@@ -151,7 +151,8 @@ class MoE:
             moe_infinity.models.modeling_arctic.modeling_arctic.apply_rotary_pos_emb = apply_rotary_pos_emb
 
         if self.arch == "deepseek":
-            moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = apply_rotary_pos_emb
+            # moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = apply_rotary_pos_emb
+            pass # apply_rotary_pos_emb is defined in deepseek and differs from this version.
 
         batch_size = input_ids.shape[0]
         self.seq_id_list = [
