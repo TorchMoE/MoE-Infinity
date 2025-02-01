@@ -16,6 +16,8 @@
 #include "expert_module.h"
 #include "utils/noncopyable.h"
 
+enum MUTEX_TYPE { INPUT_MUTEX = 0, OUTPUT_MUTEX = 1, EXEC_MUTEX = 2, PENDING_MUTEX = 3 };
+
 class ExpertDispatcher : public noncopyable {
 public:
     typedef struct {
@@ -58,7 +60,7 @@ public:
     void RegisterExpert(int layer_idx,
                         int expert_idx,
                         const std::vector<std::uint32_t>& tensor_ids);
-
+    void ClearExpertCacheCounts();
     void SetExpectedQueue(int expected_pending = 0) { pending_.store(expected_pending); }
 
     std::vector<CallResult> WaitExpert() { return Wait(); }
@@ -86,11 +88,18 @@ private:
     std::vector<ExecArgs> exec_queue_;
     std::vector<CallResult> output_queue_;
     std::vector<std::vector<ExpertNodePtr>> experts_;
-    std::atomic<size_t> pending_;
     std::atomic<size_t> num_enqueued_;
     bool start_;
     int expert_type_;
     std::atomic<bool> main_thread_stop_flag_;
+
+    std::atomic<size_t> pending_;
+
+    std::vector<std::mutex> mutexes_;
+    std::vector<std::condition_variable> cvs_;
+
+    std::mutex pending_mutex_;
+    std::condition_variable pending_cv_;
 
     std::mutex input_mutex_;
     std::mutex output_mutex_;

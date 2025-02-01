@@ -277,7 +277,7 @@ bool ArcherTaskPool::RemoveCachedSparseNode(const NodePtr& node, int device_id)
             if (n->mutex.try_lock()) {
                 ARCHER_LOG_DEBUG("RemoveCachedSparseNode: {}", n->str());
                 n->SetDevice(n->default_host);
-                n->incache_visit_count = 0;
+                // n->incache_visit_count = 0;
                 n->mutex.unlock();
                 cache_size -= n->byte_size;
                 if ((node->io_state & NODE_STATE_VISITED) == 0) node->unused_count += 1;

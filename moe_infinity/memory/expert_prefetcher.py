@@ -25,6 +25,14 @@ class ExpertPrefetcher(object):
         _expert_prefetcher = archer_engine
         self.archer_engine = archer_engine
 
+    def prefetch_experts_list(self, layer_id, expert_list):
+        tensor_ids = []
+        for j in expert_list:
+            tensor_ids.append(self.expert_tensor_map[(layer_id, j)])
+        for tensor_id in tensor_ids:
+            gpu_id = self.archer_engine.get_node_default_device([tensor_id])
+            self.archer_engine.enqueue_prefetch(tensor_id, gpu_id)
+
     def prefetch_experts(self, layer_id, expert_matrix):
         expert_list = []
         # print("expert_tensor_map", self.expert_tensor_map)

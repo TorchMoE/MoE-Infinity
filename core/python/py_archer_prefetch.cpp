@@ -78,5 +78,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("enqueue_expert", &ExpertDispatcher::EnqueueExpert)
         .def("set_inputs", &ExpertDispatcher::SetInputs)
         .def("set_expected_queue", &ExpertDispatcher::SetExpectedQueue)
-        .def("wait_expert", &ExpertDispatcher::WaitExpert);
+        .def("wait_expert", &ExpertDispatcher::WaitExpert)
+        .def("clear_expert_cache_counts", &ExpertDispatcher::ClearExpertCacheCounts);
 }

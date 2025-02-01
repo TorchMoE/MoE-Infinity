@@ -19,7 +19,7 @@
 #include <future>
 
 ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, int expert_type)
-    : pending_(0), num_enqueued_(0), start_(false), expert_type_(expert_type)
+    : pending_(0), num_enqueued_(0), start_(false), expert_type_(expert_type), mutexes_(5), cvs_(5)
 {
     main_thread_stop_flag_.store(false);
 
@@ -47,15 +47,16 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
         gpu_overload_.emplace_back(false);
     }
 
-    for (int i = 0; i < num_gpu; ++i) {
+    for (int i = 0; i < num_gpu * 8; ++i) {
         std::thread t(&ExpertDispatcher::GPUExecFunc, this, i);
         SetThreadAffinity(t);
         threads_.emplace_back(std::move(t));
 
-        cudaSetDevice(i);
+        cudaSetDevice(i % num_gpu);
         cudaStream_t exec_stream;
         cudaStreamCreateWithFlags(&exec_stream, cudaStreamNonBlocking);
         exec_streams_.emplace_back(exec_stream);
+        // cudaDeviceSynchronize();
     }
 
     at::InferenceMode infer_guard(0);
@@ -109,7 +110,7 @@ void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id, 
 
 void ExpertDispatcher::Enqueue(const CallArgs& args)
 {
-    std::lock_guard<std::mutex> lock(input_mutex_);
+    std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::INPUT_MUTEX]);
     int layer_idx = args.layer_idx;
     int expert_idx = args.expert_idx;
     auto expert_node = experts_[expert_idx][layer_idx];
@@ -144,6 +145,8 @@ void ExpertDispatcher::Enqueue(const CallArgs& args)
                      a.expert_idx,
                      "remote ",
                      a.remote);
+    lock.unlock();
+    cvs_[MUTEX_TYPE::INPUT_MUTEX].notify_all();
 }
 
 void ExpertDispatcher::RegisterExpert(int layer_idx,
@@ -162,6 +165,16 @@ void ExpertDispatcher::RegisterExpert(int layer_idx,
     }
 }
 
+void ExpertDispatcher::ClearExpertCacheCounts()
+{
+    for (auto& expert : experts_) {
+        for (auto& expert_node : expert) {
+            if (expert_node->node == nullptr) { continue; }
+            expert_node->node->incache_visit_count = 0;
+        }
+    }
+}
+
 void ExpertDispatcher::GPUThreadFunc(int gpu_id)
 {
     while (!main_thread_stop_flag_.load()) {}
@@ -170,10 +183,9 @@ void ExpertDispatcher::GPUThreadFunc(int gpu_id)
 void ExpertDispatcher::GPUFetchFunc(int gpu_id)
 {
     while (!main_thread_stop_flag_.load()) {
-        std::unique_lock<std::mutex> lock(input_mutex_);
+        std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::INPUT_MUTEX]);
         if (input_queue_.empty()) {
-            lock.unlock();
-            continue;
+            cvs_[MUTEX_TYPE::INPUT_MUTEX].wait(lock, [&] { return !input_queue_.empty(); });
         }
 
         CallArgs args;
@@ -311,7 +323,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
             exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
             exec_args.evict = !success;
             exec_args.hit = cache_hit;
-            std::lock_guard<std::mutex> lock(exec_mutex_);
+            std::lock_guard<std::mutex> lock(mutexes_[MUTEX_TYPE::EXEC_MUTEX]);
             exec_queue_.emplace_back(std::move(exec_args));
         }
     }
@@ -320,10 +332,9 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
 void ExpertDispatcher::GPUExecFunc(int gpu_id)
 {
     while (!main_thread_stop_flag_.load()) {
-        std::unique_lock<std::mutex> lock(exec_mutex_);
+        std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::EXEC_MUTEX]);
         if (exec_queue_.empty()) {
-            lock.unlock();
-            continue;
+            cvs_[MUTEX_TYPE::EXEC_MUTEX].wait(lock, [&] { return !exec_queue_.empty(); });
         }
 
         ExecArgs args;
@@ -344,10 +355,13 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
 
         at::InferenceMode infer_guard(true);
 
+        // random int [0,8)
+        int rnd = std::rand() % 8;
         c10::cuda::CUDAStream stream =
-            c10::cuda::getStreamFromExternal(exec_streams_[gpu_id], gpu_id);
+            c10::cuda::getStreamFromExternal(exec_streams_[gpu_id + rnd], gpu_id);
 
         {
+            auto start = TIME_NOW;
             c10::cuda::CUDAStreamGuard guard(stream);
 
             auto* expert_module = args.expert_node->module;
@@ -399,6 +413,10 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
             }
 
             stream.synchronize();
+            auto end = TIME_NOW;
+            // ARCHER_LOG_INFO("ExpertDispatcher::GPUExecFunc: forward time ",
+            //                  std::chrono::duration_cast<MCIROSECONDS>(end - start).count(),
+            //                  "us");
         }
 
         (void)std::async(std::launch::async,
@@ -449,14 +467,17 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
     }
     // stream.synchronize();
     pending_.fetch_sub(1);
+    pending_cv_.notify_all();
 }
 
 std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait()
 {
     int wait_count = 0;
     while (pending_.load() > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        wait_count++;
+        std::unique_lock<std::mutex> lock(pending_mutex_);
+        pending_cv_.wait(lock, [&] { return pending_.load() == 0; });
+        // std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // wait_count++;
         // if (wait_count % 1000 == 0) {
         //     ARCHER_LOG_WARN(
         //         "ExpertDispatcher::Wait: wait_count {} pending_ {} num_enqueued {} input_queue_ "

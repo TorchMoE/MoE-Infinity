@@ -44,17 +44,17 @@ class DeepseekV2MoEBlock(nn.Module):
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        print("topk_idx", topk_idx.shape)
-        print("topk_weight", topk_weight.shape)
-        print(self.config.n_routed_experts, self.config.num_experts_per_tok)
+        # print("topk_idx", topk_idx.shape)
+        # print("topk_weight", topk_weight.shape)
+        # print(self.config.n_routed_experts, self.config.num_experts_per_tok)
 
-        cnts = topk_idx.new_zeros((topk_idx.shape[0], len(self.experts)))
-        cnts.scatter_(1, topk_idx, 1)
-        tokens_per_expert = cnts.sum(dim=0)
-        idxs = topk_idx.view(-1).argsort()
+        # cnts = topk_idx.new_zeros((topk_idx.shape[0], len(self.experts)))
+        # cnts.scatter_(1, topk_idx, 1)
+        # tokens_per_expert = cnts.sum(dim=0)
+        # idxs = topk_idx.view(-1).argsort()
         # sorted_tokens = hidden_states[idxs // topk_idx.shape[1]]
 
-        tokens_per_expert = tokens_per_expert.cpu().numpy()
+        # tokens_per_expert = tokens_per_expert.cpu().numpy()
 
         batch_size, sequence_length, hidden_dim = orig_shape
         router_mask = F.one_hot(
@@ -72,20 +72,24 @@ class DeepseekV2MoEBlock(nn.Module):
                 router_mask[:, :, 0], router_mask[:, :, i]
             )
         router_mask = router_mask[:, :, 0]
-        print("router_mask", router_mask.shape)
-        print("routing_weights_mask", routing_weights_mask.shape)
+        # print("router_mask", router_mask.shape)
+        # print("routing_weights_mask", routing_weights_mask.shape)
 
-        expert_index = topk_idx.reshape(
-            batch_size, sequence_length, self.config.num_experts_per_tok
-        )
-        for i in range(batch_size):
-            seq_id = self.seq_id_list[i]
-            expert_matrix = self.expert_predictor.predict(
-                seq_id, expert_index[i], self.layer_id
-            )
-            self.expert_prefetcher.prefetch_experts(
-                self.layer_id, expert_matrix
-            )
+        # overlap current layer with unique expert list
+        # unique_expert_list = torch.unique(topk_idx).tolist()
+        # self.expert_prefetcher.prefetch_experts_list(self.layer_id, unique_expert_list)
+
+        # expert_index = topk_idx.reshape(
+        #     batch_size, sequence_length, self.config.num_experts_per_tok
+        # )
+        # for i in range(batch_size):
+        #     seq_id = self.seq_id_list[i]
+        #     expert_matrix = self.expert_predictor.predict(
+        #         seq_id, expert_index[i], self.layer_id
+        #     )
+        #     self.expert_prefetcher.prefetch_experts(
+        #         self.layer_id, expert_matrix
+        #     )
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim),
@@ -101,6 +105,15 @@ class DeepseekV2MoEBlock(nn.Module):
                 output.to(routing_weights_mask.device)
                 * routing_weights_mask[token_indices, idx][:, None]
             )
+
+        final_hidden_states = final_hidden_states.view(
+            batch_size, sequence_length, hidden_dim
+        )
+        if self.config.n_shared_experts is not None:
+            final_hidden_states = final_hidden_states + self.shared_experts(
+                identity
+            )
+        return final_hidden_states
 
         # outputs = []
         # start_idx = 0
@@ -125,11 +138,4 @@ class DeepseekV2MoEBlock(nn.Module):
         #     .sum(dim=1)
         #     .type(new_x.dtype)
         # )
-        final_hidden_states = final_hidden_states.view(
-            batch_size, sequence_length, hidden_dim
-        )
-        if self.config.n_shared_experts is not None:
-            final_hidden_states = final_hidden_states + self.shared_experts(
-                identity
-            )
-        return final_hidden_states
+        # return y

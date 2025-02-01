@@ -152,7 +152,7 @@ class MoE:
 
         if self.arch == "deepseek":
             # moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = apply_rotary_pos_emb
-            pass # apply_rotary_pos_emb is defined in deepseek and differs from this version.
+            pass  # apply_rotary_pos_emb is defined in deepseek and differs from this version.
 
         batch_size = input_ids.shape[0]
         self.seq_id_list = [
@@ -183,6 +183,7 @@ class MoE:
         self.model.eval()
         with torch.no_grad():
             return self.model.generate(input_ids, **kwargs)
+        self.engine.expert_dispatcher.clear_expert_cache_counts()
 
     def forward(self, input_ids: torch.LongTensor, *args, **kwargs) -> Any:
         """
