@@ -33,6 +33,9 @@ class ArcherConfig:
     #     default=1,
     #     metadata={"help": "Number of devices per node"},
     # )
+    prefetch: bool = field(
+        default=False, metadata={"help": "Enable prefetching"}
+    )
     device_memory_ratio: float = field(
         default=0.9,
         metadata={"help": "Ratio of device memory to use"},

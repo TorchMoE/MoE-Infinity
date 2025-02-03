@@ -28,7 +28,7 @@ from moe_infinity.common import parse_expert_type
 from moe_infinity.distributed import DistributedExpertExecutor
 from moe_infinity.memory import ExpertPredictor, ExpertPrefetcher, ExpertTracer
 from moe_infinity.models import (
-    DeepseekV2MoEBlock,
+    DeepseekMoEBlock,
     SyncArcticMoeBlock,
     SyncGrokMoeBlock,
     SyncMixtralSparseMoeBlock,
@@ -393,7 +393,7 @@ class OffloadEngine(object):
         moe_infinity.models.modeling_deepseek._old_sparse_mlp = (
             moe_infinity.models.modeling_deepseek.DeepseekV2MoE
         )
-        moe_infinity.models.modeling_deepseek.modeling_deepseek.DeepseekV2MoE = DeepseekV2MoEBlock
+        moe_infinity.models.modeling_deepseek.modeling_deepseek.DeepseekV2MoE = DeepseekMoEBlock
 
         def from_pretrained_decorator(
             orig_from_pretrained: Callable,
@@ -616,7 +616,7 @@ class OffloadEngine(object):
                         or isinstance(module, SyncMixtralSparseMoeBlock)
                         or isinstance(module, SyncGrokMoeBlock)
                         or isinstance(module, SyncArcticMoeBlock)
-                        or isinstance(module, DeepseekV2MoEBlock)
+                        or isinstance(module, DeepseekMoEBlock)
                     ):
                         # module.archer_prefetch = self.archer_prefetch
                         # module.archer_tracer = self.archer_tracer

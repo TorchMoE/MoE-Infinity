@@ -4,7 +4,7 @@
 # TorchMoE Team
 
 from .arctic import ArcticConfig, SyncArcticMoeBlock
-from .deepseek import DeepseekV2MoEBlock
+from .deepseek import DeepseekMoEBlock
 from .grok import SyncGrokMoeBlock
 from .mixtral import SyncMixtralSparseMoeBlock
 from .model_utils import apply_rotary_pos_emb

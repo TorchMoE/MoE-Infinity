@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from .modeling_deepseek import DeepseekV2MLP, MoEGate
 
 
-class DeepseekV2MoEBlock(nn.Module):
+class DeepseekMoEBlock(nn.Module):
     """
     A mixed expert module containing shared experts.
     """

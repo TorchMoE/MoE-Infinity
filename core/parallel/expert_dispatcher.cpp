@@ -145,8 +145,8 @@ void ExpertDispatcher::Enqueue(const CallArgs& args)
                      a.expert_idx,
                      "remote ",
                      a.remote);
-    lock.unlock();
-    cvs_[MUTEX_TYPE::INPUT_MUTEX].notify_all();
+    // lock.unlock();
+    // cvs_[MUTEX_TYPE::INPUT_MUTEX].notify_all();
 }
 
 void ExpertDispatcher::RegisterExpert(int layer_idx,
@@ -185,7 +185,10 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
     while (!main_thread_stop_flag_.load()) {
         std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::INPUT_MUTEX]);
         if (input_queue_.empty()) {
-            cvs_[MUTEX_TYPE::INPUT_MUTEX].wait(lock, [&] { return !input_queue_.empty(); });
+            // cvs_[MUTEX_TYPE::INPUT_MUTEX].wait(lock, [&] { return !input_queue_.empty(); });
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            continue;
         }
 
         CallArgs args;
@@ -326,6 +329,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
             std::lock_guard<std::mutex> lock(mutexes_[MUTEX_TYPE::EXEC_MUTEX]);
             exec_queue_.emplace_back(std::move(exec_args));
         }
+        cvs_[MUTEX_TYPE::EXEC_MUTEX].notify_all();
     }
 }
 
@@ -334,7 +338,10 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
     while (!main_thread_stop_flag_.load()) {
         std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::EXEC_MUTEX]);
         if (exec_queue_.empty()) {
-            cvs_[MUTEX_TYPE::EXEC_MUTEX].wait(lock, [&] { return !exec_queue_.empty(); });
+            // cvs_[MUTEX_TYPE::EXEC_MUTEX].wait(lock, [&] { return !exec_queue_.empty(); });
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            continue;
         }
 
         ExecArgs args;
@@ -473,21 +480,24 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
 std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait()
 {
     int wait_count = 0;
+
+    // std::unique_lock<std::mutex> lock(pending_mutex_);
+    // pending_cv_.wait(lock, [&] { return pending_.load() == 0; });
+
     while (pending_.load() > 0) {
         std::unique_lock<std::mutex> lock(pending_mutex_);
-        pending_cv_.wait(lock, [&] { return pending_.load() == 0; });
-        // std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        // wait_count++;
-        // if (wait_count % 1000 == 0) {
-        //     ARCHER_LOG_WARN(
-        //         "ExpertDispatcher::Wait: wait_count {} pending_ {} num_enqueued {} input_queue_ "
-        //         "{}, exec_queue_ {}",
-        //         wait_count,
-        //         pending_.load(),
-        //         num_enqueued_.load(),
-        //         input_queue_.size(),
-        //         exec_queue_.size());
-        // }
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+        wait_count++;
+        if (wait_count % 1000 == 0) {
+            ARCHER_LOG_WARN(
+                "ExpertDispatcher::Wait: wait_count {} pending_ {} num_enqueued {} input_queue_ "
+                "{}, exec_queue_ {}",
+                wait_count,
+                pending_.load(),
+                num_enqueued_.load(),
+                input_queue_.size(),
+                exec_queue_.size());
+        }
     }
     input_queue_.clear();
     exec_queue_.clear();
@@ -498,12 +508,12 @@ std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait()
         output_queue.swap(output_queue_);
     }
 
-    std::stringstream ss;
-    ss << "ExpertDispatcher::Wait: output_queue_ " << output_queue.size();
-    for (auto& output : output_queue) {
-        ss << " (" << std::get<0>(output).sizes() << "," << std::get<1>(output) << ","
-           << std::get<2>(output) << "," << std::get<3>(output) << ")";
-    }
-    ARCHER_LOG_DEBUG(ss.str());
+    // std::stringstream ss;
+    // ss << "ExpertDispatcher::Wait: output_queue_ " << output_queue.size();
+    // for (auto& output : output_queue) {
+    //     ss << " (" << std::get<0>(output).sizes() << "," << std::get<1>(output) << ","
+    //        << std::get<2>(output) << "," << std::get<3>(output) << ")";
+    // }
+    // ARCHER_LOG_DEBUG(ss.str());
     return output_queue;
 }

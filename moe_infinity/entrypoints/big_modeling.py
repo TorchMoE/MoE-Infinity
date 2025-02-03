@@ -123,12 +123,13 @@ class MoE:
             is_flash_attn_available = True
 
             if arch == "switch":
+                is_flash_attn_available = False 
+            if arch == "deepseek":
                 is_flash_attn_available = False
         except ImportError:
             print(
                 "[WARNING] FlashAttention is not available in the current environment. Using default attention."
             )
-            pass
 
         with self.engine.init(cls=model_cls, ar_config=config):
             self.model = model_cls.from_pretrained(
