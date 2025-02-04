@@ -393,7 +393,11 @@ class OffloadEngine(object):
         moe_infinity.models.modeling_deepseek._old_sparse_mlp = (
             moe_infinity.models.modeling_deepseek.DeepseekV2MoE
         )
+        moe_infinity.models.modeling_deepseek_v3._old_sparse_mlp = (
+            moe_infinity.models.modeling_deepseek_v3.DeepseekV3MoE
+        )
         moe_infinity.models.modeling_deepseek.modeling_deepseek.DeepseekV2MoE = DeepseekMoEBlock
+        moe_infinity.models.modeling_deepseek_v3.modeling_deepseek.DeepseekV3MoE = DeepseekMoEBlock
 
         def from_pretrained_decorator(
             orig_from_pretrained: Callable,
@@ -901,6 +905,7 @@ class OffloadEngine(object):
                         and self.config.model_type != "grok-1"
                         and self.config.model_type != "arctic"
                         and self.config.model_type != "deepseek_v2"
+                        and self.config.model_type != "deepseek_v3"
                         else f"{key}.{expert_idx}"
                     )
                     input_device_index = (
@@ -1079,3 +1084,4 @@ class OffloadEngine(object):
         )
 
         moe_infinity.models.modeling_deepseek.modeling_deepseek.DeepseekV2MoE = moe_infinity.models.modeling_deepseek._old_sparse_mlp
+        moe_infinity.models.modeling_deepseek_v3.modeling_deepseek.DeepseekV3MoE = moe_infinity.models.modeling_deepseek_v3._old_sparse_mlp

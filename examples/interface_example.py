@@ -48,6 +48,8 @@ class StopWatch(TextStreamer):
             print(
                 f"Decoding time per iteration: {(current_time-self.start_decoding) / self.decoding_iterations} seconds"
             )
+            
+        return super().put(value)
 
     def end(self):
         if self.decoding_time is None and self.start_decoding is not None:

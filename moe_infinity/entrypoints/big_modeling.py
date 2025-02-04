@@ -124,7 +124,7 @@ class MoE:
 
             if arch == "switch":
                 is_flash_attn_available = False 
-            if arch == "deepseek":
+            if arch == "deepseek" or arch == "deepseek_v3":
                 is_flash_attn_available = False
         except ImportError:
             print(
@@ -151,7 +151,7 @@ class MoE:
         if self.arch == "arctic":
             moe_infinity.models.modeling_arctic.modeling_arctic.apply_rotary_pos_emb = apply_rotary_pos_emb
 
-        if self.arch == "deepseek":
+        if self.arch == "deepseek" or self.arch == "deepseek_v3":
             # moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = apply_rotary_pos_emb
             pass  # apply_rotary_pos_emb is defined in deepseek and differs from this version.
 
