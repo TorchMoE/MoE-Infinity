@@ -20,106 +20,109 @@
 #define DTYPE_BFLOAT16 0
 #define DTYPE_FLOAT32 1
 #define DTYPE_FLOAT16 2
+#define DTYPE_FP8_E4M3FN 3
 
 struct ModuleUtils {
-    virtual void SetTensorsFromBlob(void* ptr,
-                                    const std::vector<std::uint32_t>& tensor_ids,
-                                    const torch::Device& device) = 0;
+  virtual void SetTensorsFromBlob(void* ptr,
+                                  const std::vector<std::uint32_t>& tensor_ids,
+                                  const torch::Device& device) = 0;
 };
 
 struct SwitchTransformersDenseActDense : public torch::nn::Module, public ModuleUtils {
-    SwitchTransformersDenseActDense(int dtype);
-    torch::Tensor forward(torch::Tensor hidden_states);
-    torch::Tensor wi, wo;
+  SwitchTransformersDenseActDense(int dtype);
+  torch::Tensor forward(torch::Tensor hidden_states);
+  torch::Tensor wi, wo;
 
-    void SetTensorsFromBlob(void* ptr,
-                            const std::vector<std::uint32_t>& tensor_ids,
-                            const torch::Device& device) override;
+  void SetTensorsFromBlob(void* ptr,
+                          const std::vector<std::uint32_t>& tensor_ids,
+                          const torch::Device& device) override;
 };
 
 struct SwitchTransformersDenseGatedActDense : public torch::nn::Module, public ModuleUtils {
-    SwitchTransformersDenseGatedActDense(int dtype);
-    torch::Tensor forward(torch::Tensor hidden_states);
-    torch::Tensor wi_0, wi_1, wo;
+  SwitchTransformersDenseGatedActDense(int dtype);
+  torch::Tensor forward(torch::Tensor hidden_states);
+  torch::Tensor wi_0, wi_1, wo;
 
-    void SetTensorsFromBlob(void* ptr,
-                            const std::vector<std::uint32_t>& tensor_ids,
-                            const torch::Device& device) override;
+  void SetTensorsFromBlob(void* ptr,
+                          const std::vector<std::uint32_t>& tensor_ids,
+                          const torch::Device& device) override;
 };
 
 struct NllbMoeDenseActDense : public torch::nn::Module, public ModuleUtils {
-    NllbMoeDenseActDense(int dtype);
-    torch::Tensor forward(torch::Tensor hidden_states);
-    torch::Tensor fc1, fc2;
-    torch::Tensor fc1_bias, fc2_bias;
+  NllbMoeDenseActDense(int dtype);
+  torch::Tensor forward(torch::Tensor hidden_states);
+  torch::Tensor fc1, fc2;
+  torch::Tensor fc1_bias, fc2_bias;
 
-    void SetTensorsFromBlob(void* ptr,
-                            const std::vector<std::uint32_t>& tensor_ids,
-                            const torch::Device& device) override;
+  void SetTensorsFromBlob(void* ptr,
+                          const std::vector<std::uint32_t>& tensor_ids,
+                          const torch::Device& device) override;
 };
 
 struct FSGPTMoEDenseActDense : public torch::nn::Module, public ModuleUtils {
-    FSGPTMoEDenseActDense(int dtype);
-    torch::Tensor forward(torch::Tensor hidden_states);
-    torch::Tensor fc1, fc2;
-    torch::Tensor fc1_bias, fc2_bias;
+  FSGPTMoEDenseActDense(int dtype);
+  torch::Tensor forward(torch::Tensor hidden_states);
+  torch::Tensor fc1, fc2;
+  torch::Tensor fc1_bias, fc2_bias;
 
-    void SetTensorsFromBlob(void* ptr,
-                            const std::vector<std::uint32_t>& tensor_ids,
-                            const torch::Device& device) override;
+  void SetTensorsFromBlob(void* ptr,
+                          const std::vector<std::uint32_t>& tensor_ids,
+                          const torch::Device& device) override;
 };
 
 struct MixtralMoEDenseActDense : public torch::nn::Module, public ModuleUtils {
-    MixtralMoEDenseActDense(int dtype);
-    torch::Tensor forward(torch::Tensor hidden_states);
-    torch::Tensor w1, w2, w3;
+  MixtralMoEDenseActDense(int dtype);
+  torch::Tensor forward(torch::Tensor hidden_states);
+  torch::Tensor w1, w2, w3;
 
-    void SetTensorsFromBlob(void* ptr,
-                            const std::vector<std::uint32_t>& tensor_ids,
-                            const torch::Device& device) override;
+  void SetTensorsFromBlob(void* ptr,
+                          const std::vector<std::uint32_t>& tensor_ids,
+                          const torch::Device& device) override;
 };
 
 struct DeepSeekMoEDenseActDense : public torch::nn::Module, public ModuleUtils {
-    DeepSeekMoEDenseActDense(int dtype);
-    torch::Tensor forward(torch::Tensor hidden_states);
-    torch::Tensor gate_proj, up_proj, down_proj;
+  DeepSeekMoEDenseActDense(int dtype);
+  torch::Tensor forward(torch::Tensor hidden_states);
+  torch::Tensor gate_proj, up_proj, down_proj;
 
-    void SetTensorsFromBlob(void* ptr,
-                            const std::vector<std::uint32_t>& tensor_ids,
-                            const torch::Device& device) override;
+  void SetTensorsFromBlob(void* ptr,
+                          const std::vector<std::uint32_t>& tensor_ids,
+                          const torch::Device& device) override;
 };
 
 struct ExpertNode {
-    NodePtr node;
-    torch::nn::Module* module;
-    void SetTensorsFromBlob(const torch::Device& device);
-    int layer_idx;
-    int expert_idx;
-    int expert_type;
+  NodePtr node;
+  torch::nn::Module* module;
+  void SetTensorsFromBlob(const torch::Device& device);
+  int layer_idx;
+  int expert_idx;
+  int expert_type;
 };
 
 typedef std::shared_ptr<ExpertNode> ExpertNodePtr;
 
 inline torch::ScalarType dtype_to_torch(int dtype)
 {
-    auto tensor_dtype = torch::kFloat32;
-    switch (dtype) {
-        case DTYPE_BFLOAT16: tensor_dtype = torch::kBFloat16; break;
-        case DTYPE_FLOAT16: tensor_dtype = torch::kHalf; break;
-        case DTYPE_FLOAT32: tensor_dtype = torch::kFloat32; break;
-        default: assert(false);
-    }
-    return tensor_dtype;
+  auto tensor_dtype = torch::kFloat32;
+  switch (dtype) {
+    case DTYPE_BFLOAT16: tensor_dtype = torch::kBFloat16; break;
+    case DTYPE_FLOAT16: tensor_dtype = torch::kHalf; break;
+    case DTYPE_FLOAT32: tensor_dtype = torch::kFloat32; break;
+    case DTYPE_FP8_E4M3FN: tensor_dtype = torch::kFloat8_e4m3fn; break;
+    default: assert(false);
+  }
+  return tensor_dtype;
 }
 
 inline int torch_dtype_to_int(torch::ScalarType dtype)
 {
-    auto tensor_dtype = DTYPE_FLOAT32;
-    switch (dtype) {
-        case torch::kBFloat16: tensor_dtype = DTYPE_BFLOAT16; break;
-        case torch::kHalf: tensor_dtype = DTYPE_FLOAT16; break;
-        case torch::kFloat32: tensor_dtype = DTYPE_FLOAT32; break;
-        default: assert(false);
-    }
-    return tensor_dtype;
+  auto tensor_dtype = DTYPE_FLOAT32;
+  switch (dtype) {
+    case torch::kBFloat16: tensor_dtype = DTYPE_BFLOAT16; break;
+    case torch::kHalf: tensor_dtype = DTYPE_FLOAT16; break;
+    case torch::kFloat32: tensor_dtype = DTYPE_FLOAT32; break;
+    case torch::kFloat8_e4m3fn: tensor_dtype = DTYPE_FP8_E4M3FN; break;
+    default: assert(false);
+  }
+  return tensor_dtype;
 }

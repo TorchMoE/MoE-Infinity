@@ -9,7 +9,7 @@ from transformers import AutoConfig
 
 import moe_infinity
 from moe_infinity.common.constants import MODEL_MAPPING_NAMES
-from moe_infinity.models import apply_rotary_pos_emb
+from moe_infinity.models import apply_rotary_pos_emb, apply_rotary_pos_emb_deepseek
 from moe_infinity.models.modeling_arctic import ArcticConfig
 from moe_infinity.runtime import OffloadEngine
 from moe_infinity.utils import ArcherConfig, get_checkpoint_paths
@@ -123,7 +123,7 @@ class MoE:
             is_flash_attn_available = True
 
             if arch == "switch":
-                is_flash_attn_available = False 
+                is_flash_attn_available = False
             if arch == "deepseek" or arch == "deepseek_v3":
                 is_flash_attn_available = False
         except ImportError:
@@ -152,8 +152,8 @@ class MoE:
             moe_infinity.models.modeling_arctic.modeling_arctic.apply_rotary_pos_emb = apply_rotary_pos_emb
 
         if self.arch == "deepseek" or self.arch == "deepseek_v3":
-            # moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = apply_rotary_pos_emb
-            pass  # apply_rotary_pos_emb is defined in deepseek and differs from this version.
+            moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = apply_rotary_pos_emb_deepseek
+            # apply_rotary_pos_emb is defined in deepseek and differs from this version.
 
         batch_size = input_ids.shape[0]
         self.seq_id_list = [

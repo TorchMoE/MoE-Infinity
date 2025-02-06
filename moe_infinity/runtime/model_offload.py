@@ -418,9 +418,13 @@ class OffloadEngine(object):
                 self.num_layers, self.num_experts, self.num_encoder_layers = (
                     parse_moe_param(self.config)
                 )
-                self.dtype = parse_expert_dtype(self.config)
 
+                self.dtype = parse_expert_dtype(self.config)
                 self.dtype_cls = self.config.torch_dtype
+
+                if self.config.model_type == "deepseek_v3":
+                    self.dtype_cls = torch.float8_e4m3fn
+                    self.dtype = 3
 
                 if (
                     not self.archer_engine.is_tensor_index_initialized()
@@ -480,21 +484,36 @@ class OffloadEngine(object):
                     "is_flash_attn_available", False
                 )
                 # self.archer_prefetch.n_layer, self.archer_prefetch.n_expert, n_encoder_layers = parse_moe_param(self.config)
-                if (
-                    self.dtype_cls is torch.bfloat16
-                    or self.dtype_cls is torch.float16
-                ):
-                    model = cls._from_config(
-                        self.config,
-                        torch_dtype=self.dtype_cls,
-                        attn_implementation=(
-                            "flash_attention_2"
-                            if is_flash_attn_available
-                            else "eager"
-                        ),
-                    )
-                else:
-                    model = cls._from_config(self.config)
+                model = cls._from_config(
+                    self.config,
+                    torch_dtype=self.dtype_cls
+                    if self.config.model_type != "deepseek_v3"
+                    else torch.bfloat16,
+                    attn_implementation=(
+                        "flash_attention_2"
+                        if is_flash_attn_available
+                        else "eager"
+                    ),
+                )
+
+                if self.config.model_type == "deepseek_v3":
+                    model = model.to(torch.float8_e4m3fn)
+
+                # if (
+                #     self.dtype_cls is torch.bfloat16
+                #     or self.dtype_cls is torch.float16
+                # ):
+                #     model = cls._from_config(
+                #         self.config,
+                #         torch_dtype=self.dtype_cls,
+                #         attn_implementation=(
+                #             "flash_attention_2"
+                #             if is_flash_attn_available
+                #             else "eager"
+                #         ),
+                #     )
+                # else:
+                #     model = cls._from_config(self.config)
 
                 base_model_prefix = model.base_model_prefix
                 # model = model.to(self.dtype).to("cpu")

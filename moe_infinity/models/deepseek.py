@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .modeling_deepseek import DeepseekV2MLP, MoEGate
-
 
 class DeepseekMoEBlock(nn.Module):
     """
@@ -17,20 +15,32 @@ class DeepseekMoEBlock(nn.Module):
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
 
+        if self.config.model_type == "deepseek_v2":
+            from .modeling_deepseek import DeepseekV2MLP, MoEGate
+
+            self.mlp_cls = DeepseekV2MLP
+            self.gate_cls = MoEGate
+        if self.config.model_type == "deepseek_v3":
+            from .modeling_deepseek_v3 import DeepseekV3MLP, MoEGate
+
+            self.mlp_cls = DeepseekV3MLP
+            self.gate_cls = MoEGate
+
         self.experts = nn.ModuleList(
             [
-                DeepseekV2MLP(
+                self.mlp_cls(
                     config, intermediate_size=config.moe_intermediate_size
                 )
                 for i in range(config.n_routed_experts)
             ]
         )
-        self.gate = MoEGate(config)
+
+        self.gate = self.gate_cls(config)
         if config.n_shared_experts is not None:
             intermediate_size = (
                 config.moe_intermediate_size * config.n_shared_experts
             )
-            self.shared_experts = DeepseekV2MLP(
+            self.shared_experts = self.mlp_cls(
                 config=config, intermediate_size=intermediate_size
             )
 
@@ -41,7 +51,14 @@ class DeepseekMoEBlock(nn.Module):
     def forward(self, hidden_states):
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+
+        gate_output = self.gate(hidden_states)
+        if len(gate_output) == 3:
+            topk_idx, topk_weight, aux_loss = gate_output
+        else:
+            topk_idx, topk_weight = gate_output
+            aux_loss = None
+        # topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         # print("topk_idx", topk_idx.shape)

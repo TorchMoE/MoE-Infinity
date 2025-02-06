@@ -36,16 +36,16 @@ Note that: The open-sourced MoE-Infinity has been redesigned for making it Huggi
 Single GPU A5000 (24GB Memory), per-token-latency (seconds) for generation with a mixed dataset that includes [FLAN](https://huggingface.co/datasets/Muennighoff/flan), [BIG-Bench](https://huggingface.co/datasets/bigbench) and [MMLU](https://huggingface.co/datasets/lukaemon/mmlu) datasets.
 Lower per-token-latency is preferable.
 
-|  | switch-large-128 | NLLB-MoE-54B | Mixtral-8x7b |
-| :---: | :---: | :---: | :---: |
-| <ins>MoE-Infinity</ins> | <ins>*0.230*</ins>	| <ins>*0.239*</ins> | <ins>*0.895*</ins> |
-| Accelerate | 1.043 | 3.071 | 6.633 |
-|DeepSpeed | 4.578 | 8.381 | 2.486 |
-|Mixtral Offloading| X | X | 1.752 |
-|Ollama | X | X | 0.903 |
+|  | switch-large-128 | NLLB-MoE-54B | Mixtral-8x7b | DeepSeel-V2-Lite
+| :---: | :---: | :---: | :---: | :---: |
+| <ins>MoE-Infinity</ins> | <ins>*0.230*</ins>	| <ins>*0.239*</ins> | <ins>*0.895*</ins> | <ins>*0.181*</ins> |
+| Accelerate | 1.043 | 3.071 | 6.633 |  1.743  |
+|DeepSpeed | 4.578 | 8.381 | 2.486 | 0.737 |
+|Mixtral Offloading| X | X | 1.752 | X |
+|Ollama | X | X | 0.903 | 1.250 |
 
 
-Single GPU A5000, throughput (token/s) for generation with batch size 32.
+<!-- Single GPU A5000, throughput (token/s) for generation with batch size 32.
 Higher throughput is preferable.
 
 |  | switch-large-128 | NLLB-MoE-54B | Mixtral-8x7b |
@@ -58,7 +58,7 @@ Higher throughput is preferable.
 
 > The Mixtral Offloading experiment was carried out with a batch size of 16, as utilizing a batch size of 32 would result in Out of Memory errors on the GPU.
 
-> Ollama does not support batching for generation, so the throughput is calculated with a batch size of 1.
+> Ollama does not support batching for generation, so the throughput is calculated with a batch size of 1. -->
 
 ## Installation
 
@@ -161,7 +161,7 @@ We plan to release two functions in the following months:
 If you use MoE-Inifity for your research, please cite our [paper](https://arxiv.org/abs/2401.14361):
 ```bibtex
 @inproceedings{moe-infinity2024,
-  title={MoE-Infinity: Activation-Aware Expert Offloading for Efficient MoE Serving},
+  title={MoE-Infinity: Offloading-Efficient MoE Model Serving},
   author={Leyang Xue, Yao Fu, Zhan Lu, Luo Mai, Mahesh Marina},
   booktitle={https://arxiv.org/abs/2401.14361},
   year={2024}

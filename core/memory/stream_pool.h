@@ -7,31 +7,29 @@
 
 #include <c10/cuda/CUDAStream.h>
 
+#include "base/noncopyable.h"
 #include "utils/cuda_utils.h"
-#include "utils/noncopyable.h"
 
-class TorchStreamPool : public noncopyable {
-public:
-    std::vector<c10::cuda::CUDAStream>& operator()(const int device_id)
-    {
-        return cuda_streams_[device_id];
+class TorchStreamPool : public base::noncopyable {
+  public:
+  std::vector<c10::cuda::CUDAStream>& operator()(const int device_id)
+  {
+    return cuda_streams_[device_id];
+  }
+
+  TorchStreamPool()
+  {
+    int num_devices = GetDeviceCount();
+    for (int i = 0; i < num_devices; ++i) {
+      std::vector<c10::cuda::CUDAStream> streams;
+      for (int j = 0; j < 3; ++j) { streams.push_back(c10::cuda::getStreamFromPool(false, i)); }
+      cuda_streams_.push_back(std::move(streams));
     }
+  }
+  virtual ~TorchStreamPool() = default;
 
-    TorchStreamPool()
-    {
-        int num_devices = GetDeviceCount();
-        for (int i = 0; i < num_devices; ++i) {
-            std::vector<c10::cuda::CUDAStream> streams;
-            for (int j = 0; j < 3; ++j) {
-                streams.push_back(c10::cuda::getStreamFromPool(false, i));
-            }
-            cuda_streams_.push_back(std::move(streams));
-        }
-    }
-    virtual ~TorchStreamPool() = default;
-
-private:
-    std::vector<std::vector<c10::cuda::CUDAStream>> cuda_streams_;
+  private:
+  std::vector<std::vector<c10::cuda::CUDAStream>> cuda_streams_;
 };
 
 extern std::unique_ptr<TorchStreamPool> kTorchStreamPool;
