@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "host_caching_allocator.h"
+#include "device_caching_allocator.h"
 #include "utils/logger.h"
 
 std::size_t GetTotalSystemMemory();
@@ -66,15 +67,15 @@ class DeviceMemoryPool : public base::noncopyable {
   DeviceMemoryPool();
   virtual ~DeviceMemoryPool()
   {
-    auto allocator = c10::cuda::CUDACachingAllocator::get();
-    for (auto& allocated_id : allocated_id_) {
-      for (auto& [key, data_ptr] : allocated_id) {
-        if (data_ptr != nullptr) { allocator->raw_deallocate(data_ptr); }
-      }
-    }
-    allocated_id_.clear();
-    free_memory_.clear();
-    memory_capacity_.clear();
+    // auto allocator = c10::cuda::CUDACachingAllocator::get();
+    // for (auto& allocated_id : allocated_id_) {
+    //   for (auto& [key, data_ptr] : allocated_id) {
+    //     if (data_ptr != nullptr) { allocator->raw_deallocate(data_ptr); }
+    //   }
+    // }
+    // allocated_id_.clear();
+    // free_memory_.clear();
+    // memory_capacity_.clear();
   }
 
   private:

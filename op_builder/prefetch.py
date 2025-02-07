@@ -40,6 +40,7 @@ class PrefetchBuilder(OpBuilder):
             "core/memory/memory_pool.cpp",
             "core/memory/stream_pool.cpp",
             "core/memory/host_caching_allocator.cpp",
+            "core/memory/device_caching_allocator.cpp",
             "core/python/py_archer_prefetch.cpp",
             "core/parallel/expert_dispatcher.cpp",
             "core/parallel/expert_module.cpp",

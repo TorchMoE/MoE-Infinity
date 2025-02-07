@@ -99,8 +99,10 @@ void* DeviceMemoryPool::AllocateMemory(const std::size_t key,
     return allocated_id_[device_id][key];
   }
   cudaSetDevice(device_id);
-  at::Allocator* allocator = c10::cuda::CUDACachingAllocator::get();
-  auto data_ptr = allocator->raw_allocate(size);
+  // at::Allocator* allocator = c10::cuda::CUDACachingAllocator::get();
+  // auto data_ptr = allocator->raw_allocate(size);
+  auto allocator = c10::DeviceCachingAllocator::get(device_id);
+  auto data_ptr = allocator->allocate(size);
   free_memory_[device_id] -= size;
   allocated_id_[device_id].insert(std::make_pair(key, data_ptr));
   return data_ptr;
@@ -118,9 +120,12 @@ int DeviceMemoryPool::FreeMemory(const std::size_t key,
     return -1;
   }
   allocated_id_[device_id].erase(key);
+  cudaSetDevice(device_id);
   if (data != nullptr) {
-    at::Allocator* allocator = c10::cuda::CUDACachingAllocator::get();
-    allocator->raw_deallocate(data);
+    // at::Allocator* allocator = c10::cuda::CUDACachingAllocator::get();
+    // allocator->raw_deallocate(data);
+    auto allocator = c10::DeviceCachingAllocator::get(device_id);
+    allocator->free(data);
   }
   free_memory_[device_id] += size;
   return 0;
