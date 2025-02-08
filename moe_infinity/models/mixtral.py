@@ -68,18 +68,19 @@ class SyncMixtralSparseMoeBlock(nn.Module):
         expert_index = selected_experts.reshape(
             batch_size, sequence_length, self.top_k
         )
-        for i in range(batch_size):
-            seq_id = self.seq_id_list[i]
-            # start_time = time.time()
-            expert_matrix = self.expert_predictor.predict(
-                seq_id, expert_index[i], self.layer_id
-            )
-            # print("predict", time.time() - start_time)
-            # start_time = time.time()
-            self.expert_prefetcher.prefetch_experts(
-                self.layer_id, expert_matrix
-            )
-            # print("prefetch", time.time() - start_time)
+        self.expert_prefetcher.fetch_experts_lock_cache(self.layer_id, expert_index)
+        # for i in range(batch_size):
+        #     seq_id = self.seq_id_list[i]
+        #     # start_time = time.time()
+        #     expert_matrix = self.expert_predictor.predict(
+        #         seq_id, expert_index[i], self.layer_id
+        #     )
+        #     # print("predict", time.time() - start_time)
+        #     # start_time = time.time()
+        #     self.expert_prefetcher.prefetch_experts(
+        #         self.layer_id, expert_matrix
+        #     )
+        #     # print("prefetch", time.time() - start_time)
 
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim),
