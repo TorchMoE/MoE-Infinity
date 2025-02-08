@@ -18,7 +18,7 @@ std::size_t GetFreeDeviceMemory(int device_id);
 
 int CudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind);
 int CudaMemcpyAsync(void* dst,
-                               const void* src,
-                               size_t count,
-                               cudaMemcpyKind kind,
-                               cudaStream_t stream = 0);
+                    const void* src,
+                    size_t count,
+                    cudaMemcpyKind kind,
+                    cudaStream_t stream = 0);

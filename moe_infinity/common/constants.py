@@ -1,13 +1,19 @@
 from transformers import (
-    SwitchTransformersForConditionalGeneration,
-    NllbMoeForConditionalGeneration,
     MixtralForCausalLM,
+    NllbMoeForConditionalGeneration,
     OPTForCausalLM,
     PretrainedConfig,
+    SwitchTransformersForConditionalGeneration,
 )
 
-from ..models.modeling_grok.modeling_grok1 import Grok1ModelForCausalLM # TODO: Replace this with huggingface transformers
-from ..models.modeling_arctic import ArcticForCausalLM # TODO: Replace this with huggingface transformers
+from ..models.modeling_arctic import (
+    ArcticForCausalLM,
+)  # TODO: Replace this with huggingface transformers
+from ..models.modeling_deepseek import DeepseekV2ForCausalLM
+from ..models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+from ..models.modeling_grok.modeling_grok1 import (
+    Grok1ModelForCausalLM,
+)  # TODO: Replace this with huggingface transformers
 
 MODEL_MAPPING_NAMES = {
     "switch": SwitchTransformersForConditionalGeneration,
@@ -16,6 +22,8 @@ MODEL_MAPPING_NAMES = {
     "opt": OPTForCausalLM,
     "grok": Grok1ModelForCausalLM,
     "arctic": ArcticForCausalLM,
+    "deepseek": DeepseekV2ForCausalLM,
+    "deepseek_v3": DeepseekV3ForCausalLM,
 }
 
 MODEL_MAPPING_TYPES = {
@@ -24,7 +32,10 @@ MODEL_MAPPING_TYPES = {
     "mixtral": 4,
     "grok": 4,
     "arctic": 4,
+    "deepseek": 5,
+    "deepseek_v3": 5,
 }
+
 
 def parse_expert_type(config: PretrainedConfig) -> int:
     architecture = config.architectures[0].lower()

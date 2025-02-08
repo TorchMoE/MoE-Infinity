@@ -3,8 +3,8 @@
 
 # TorchMoE Team
 
-from .expert_tracer import ExpertTracer
-from .expert_predictor import ExpertPredictor
 from .expert_cache import ExpertCache
-from .expert_priority_score import *
+from .expert_predictor import ExpertPredictor
 from .expert_prefetcher import ExpertPrefetcher
+from .expert_priority_score import *
+from .expert_tracer import ExpertTracer

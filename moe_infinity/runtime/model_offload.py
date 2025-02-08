@@ -3,58 +3,55 @@
 
 # TorchMoE Team
 
+import functools
 import gc
+import json
 import os
-import numpy as np
-import math
-import torch.distributed as dist
-from torch.distributed import rpc
+import re
+from typing import Callable, Dict, Type, Union
 
 import torch
-import functools
-import json
-
-from tqdm import tqdm
-
-from moe_infinity.ops.op_builder.prefetch import PrefetchBuilder
-from moe_infinity.models import (
-    SyncSwitchTransformersSparseMLP,
-    SyncNllbMoeSparseMLP,
-    SyncMixtralSparseMoeBlock,
-    SyncGrokMoeBlock,
-    SyncArcticMoeBlock,
-)
-from moe_infinity.utils import ArcherConfig
-from moe_infinity.utils.arguments import copy_args_to_device, copy_kwargs_to_device
-from moe_infinity.distributed import DistributedExpertExecutor
-
-from moe_infinity.memory import ExpertPrefetcher
-import moe_infinity
-from moe_infinity.utils import (
-    parse_moe_param,
-    parse_expert_id,
-    parse_expert_dtype,
-)
-from moe_infinity.common import parse_expert_type
-from moe_infinity.memory import ExpertTracer, ExpertPredictor, ExpertCache
-
-from typing import Dict, Type, Union
-from transformers import (
-    AutoConfig,
-)
-from transformers.modeling_utils import PreTrainedModel, PretrainedConfig
 import transformers
-from typing import Callable
 
+# import torch.distributed as dist
+# from torch.distributed import rpc
+from auto_gptq.nn_modules.qlinear.qlinear_cuda import QuantLinear
+from auto_gptq.nn_modules.qlinear.qlinear_cuda_old import (
+    QuantLinear as QuantLinearOld,
+)
 from safetensors import safe_open
+from tqdm import tqdm
+from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
 
-import re
+import moe_infinity
+from moe_infinity.common import parse_expert_type
+from moe_infinity.distributed import DistributedExpertExecutor
+from moe_infinity.memory import ExpertPredictor, ExpertPrefetcher, ExpertTracer
+from moe_infinity.models import (
+    DeepseekMoEBlock,
+    SyncArcticMoeBlock,
+    SyncGrokMoeBlock,
+    SyncMixtralSparseMoeBlock,
+    SyncNllbMoeSparseMLP,
+    SyncSwitchTransformersSparseMLP,
+)
+from moe_infinity.ops.op_builder.prefetch import PrefetchBuilder
+from moe_infinity.utils import (
+    ArcherConfig,
+    parse_expert_dtype,
+    parse_expert_id,
+    parse_moe_param,
+)
+from moe_infinity.utils.arguments import (
+    copy_args_to_device,
+    copy_kwargs_to_device,
+)
 
 use_jit = False
 try:
     import moe_infinity.ops.prefetch.prefetch_op as prefetch_op
 except ImportError:
-    print(f"Do not detect pre-installed ops, use JIT mode")
+    print("Do not detect pre-installed ops, use JIT mode")
     use_jit = True
 
 
@@ -69,7 +66,6 @@ class OffloadEngine(object):
     config = {}
 
     def __init__(self, capacity, config: PretrainedConfig):
-
         self.offload_exemption = set()
         self.expert_modules = []
 
@@ -89,9 +85,10 @@ class OffloadEngine(object):
     # def init_trace(self, trace_path: str):
 
     def init(
-        self, cls: Type[PreTrainedModel], ar_config: Union[str, Dict, ArcherConfig]
+        self,
+        cls: Type[PreTrainedModel],
+        ar_config: Union[str, Dict, ArcherConfig],
     ):
-
         self.cls = cls
         self.name_id_map = {}
         self.tensor_id_map = {}
@@ -155,7 +152,9 @@ class OffloadEngine(object):
         # ):
         #     os.remove(_archer_config.perfect_cache_file)
 
-        self.expert_executor = DistributedExpertExecutor(archer_config=_archer_config)
+        self.expert_executor = DistributedExpertExecutor(
+            archer_config=_archer_config
+        )
         # self.expert_prefetcher = ExpertPrefetcher(self.config)
         # self.device_map_manager = DeviceMapManager(archer_config=_archer_config)
 
@@ -166,9 +165,7 @@ class OffloadEngine(object):
         return self
 
     def __enter__(self):
-
         def do_nothing_decorator(orig_func: Callable) -> Callable:
-
             @functools.wraps(orig_func)
             def do_nothing(*args, **kwargs):
                 pass
@@ -184,31 +181,35 @@ class OffloadEngine(object):
             return archer_post_init
 
         def torch_index_select_decorator(orig_torch_index_select: Callable):
-
             @functools.wraps(orig_torch_index_select)
             def archer_torch_index_select(input, dim, index):
-                return orig_torch_index_select(input, dim, index.to(input.device)).to(
-                    "cuda:0"
-                )
+                return orig_torch_index_select(
+                    input, dim, index.to(input.device)
+                ).to("cuda:0")
 
             return archer_torch_index_select
 
         def apply_to_model_decorator(orig_apply_to_model: Callable) -> Callable:
-
             @functools.wraps(orig_apply_to_model)
             def archer_apply_to_model(cls, fn):
                 for name, param in cls.named_parameters(recurse=True):
                     if name not in self.name_id_map:
                         continue
                     param.data = torch.zeros(
-                        1, dtype=param.dtype, device=param.device, pin_memory=True
+                        1,
+                        dtype=param.dtype,
+                        device=param.device,
+                        pin_memory=True,
                     )
 
                 for name, buffer in cls.named_buffers(recurse=True):
                     if name not in self.name_id_map:
                         continue
                     buffer.data = torch.zeros(
-                        1, dtype=buffer.dtype, device=buffer.device, pin_memory=True
+                        1,
+                        dtype=buffer.dtype,
+                        device=buffer.device,
+                        pin_memory=True,
                     )
 
             return archer_apply_to_model
@@ -228,7 +229,6 @@ class OffloadEngine(object):
         #     return archer_load_pretrained_model
 
         def init_decorator(orig_init: Callable) -> Callable:
-
             @functools.wraps(orig_init)
             def archer_init(cls, config, *args, **kwargs):
                 # self.config = config
@@ -247,7 +247,6 @@ class OffloadEngine(object):
         #     return archer_config
 
         def param_init_decorator(orig_param_init: Callable) -> Callable:
-
             @functools.wraps(orig_param_init)
             def archer_param_init(cls, *args, **kwargs):
                 orig_param_init(cls, *args, **kwargs)
@@ -255,32 +254,47 @@ class OffloadEngine(object):
                 cls.param_real_shape = {}
                 for name, param in cls.named_parameters(recurse=False):
                     cls.param_real_shape[name] = param.shape
-                    param.data = torch.zeros(1, dtype=param.dtype, device=param.device)
+                    param.data = torch.zeros(
+                        1, dtype=param.dtype, device=param.device
+                    )
                     self.model_create_counter.update(1)
 
                 for name, buf in cls.named_buffers(recurse=False):
                     cls.param_real_shape[name] = buf.shape
-                    buf.data = torch.zeros(1, dtype=buf.dtype, device=buf.device)
+                    buf.data = torch.zeros(
+                        1, dtype=buf.dtype, device=buf.device
+                    )
                     self.model_create_counter.update(1)
 
             return archer_param_init
-        
-        def cast_classifier_decorator(orig_cast_classifier: Callable) -> Callable:
 
+        def cast_classifier_decorator(
+            orig_cast_classifier: Callable,
+        ) -> Callable:
             @functools.wraps(orig_cast_classifier)
             def archer_cast_classifier(cls, *args, **kwargs):
                 orig_data_ptr = cls.classifier.weight.data.data_ptr()
                 if orig_data_ptr in self.offload_set:
-                    self.offload_set.remove(cls.classifier.weight.data.data_ptr())
+                    self.offload_set.remove(
+                        cls.classifier.weight.data.data_ptr()
+                    )
                     orig_cast_classifier(cls, *args, **kwargs)
                     new_data_ptr = cls.classifier.weight.data.data_ptr()
                     self.offload_set.add(cls.classifier.weight.data.data_ptr())
-                    self.archer_engine.update_tensor_map(orig_data_ptr, new_data_ptr)
+                    self.archer_engine.update_tensor_map(
+                        orig_data_ptr, new_data_ptr
+                    )
                 else:
                     orig_cast_classifier(cls, *args, **kwargs)
                     self.offload_set.add(cls.classifier.weight.data.data_ptr())
 
             return archer_cast_classifier
+
+        # GPTQ Override
+        QuantLinear._old_init = QuantLinear.__init__
+        QuantLinear.__init__ = param_init_decorator(QuantLinear.__init__)
+        QuantLinearOld._old_init = QuantLinearOld.__init__
+        QuantLinearOld.__init__ = param_init_decorator(QuantLinearOld.__init__)
 
         self.cls._old_init = self.cls.__init__
         self.cls.__init__ = init_decorator(self.cls._old_init)
@@ -294,13 +308,17 @@ class OffloadEngine(object):
         # transformers.modeling_utils.old_load_state_dict = (
         #     transformers.modeling_utils.load_state_dict)
         # transformers.modeling_utils.load_state_dict = load_state_dict
-        torch.nn.modules.module.Module._old_apply = torch.nn.modules.module.Module.apply
+        torch.nn.modules.module.Module._old_apply = (
+            torch.nn.modules.module.Module.apply
+        )
         torch.nn.modules.module.Module.apply = apply_to_model_decorator(
             torch.nn.modules.module.Module._old_apply
         )
 
         torch._old_index_select = torch.index_select
-        torch.index_select = torch_index_select_decorator(torch._old_index_select)
+        torch.index_select = torch_index_select_decorator(
+            torch._old_index_select
+        )
         torch.Tensor._old_index_select = torch.Tensor.index_select
         torch.Tensor.index_select = torch_index_select_decorator(
             torch.Tensor._old_index_select
@@ -309,7 +327,9 @@ class OffloadEngine(object):
         self.cls._old_post_init = self.cls.post_init
         self.cls.post_init = post_init_decorator(self.cls._old_post_init)
         PreTrainedModel._old_post_init = PreTrainedModel.post_init
-        PreTrainedModel.post_init = post_init_decorator(PreTrainedModel._old_post_init)
+        PreTrainedModel.post_init = post_init_decorator(
+            PreTrainedModel._old_post_init
+        )
 
         # for all the modules in torch.nn, add post_init method
         # assert False, torch.nn.modules.__dict__
@@ -332,17 +352,17 @@ class OffloadEngine(object):
 
             if hasattr(module, "reset_parameters"):
                 module._old_reset_parameters = module.reset_parameters
-                module.reset_parameters = do_nothing_decorator(module.reset_parameters)
-    
-        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._old_cast_classifier =  transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier
-        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier =  cast_classifier_decorator(transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier)  
+                module.reset_parameters = do_nothing_decorator(
+                    module.reset_parameters
+                )
 
-        transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp = (
-            transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._old_cast_classifier = transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier = cast_classifier_decorator(
+            transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier
         )
-        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP = (
-            SyncSwitchTransformersSparseMLP
-        )
+
+        transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp = transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP = SyncSwitchTransformersSparseMLP
         transformers.models.nllb_moe.modeling_nllb_moe._old_sparse_mlp = (
             transformers.models.nllb_moe.modeling_nllb_moe.NllbMoeSparseMLP
         )
@@ -355,22 +375,42 @@ class OffloadEngine(object):
         transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock = (
             SyncMixtralSparseMoeBlock
         )
-        moe_infinity.models.modeling_grok.modeling_grok1._old_sparse_mlp = moe_infinity.models.modeling_grok.MoeBlock
-        moe_infinity.models.modeling_grok.modeling_grok1.MoeBlock = SyncGrokMoeBlock
-        
-        moe_infinity.models.modeling_arctic._old_sparse_mlp = moe_infinity.models.modeling_arctic.ArcticMoE
-        moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = SyncArcticMoeBlock
-        
 
-        def from_pretrained_decorator(orig_from_pretrained: Callable) -> Callable:
+        moe_infinity.models.modeling_grok.modeling_grok1._old_sparse_mlp = (
+            moe_infinity.models.modeling_grok.MoeBlock
+        )
+        moe_infinity.models.modeling_grok.modeling_grok1.MoeBlock = (
+            SyncGrokMoeBlock
+        )
 
+        moe_infinity.models.modeling_arctic._old_sparse_mlp = (
+            moe_infinity.models.modeling_arctic.ArcticMoE
+        )
+        moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = (
+            SyncArcticMoeBlock
+        )
+
+        moe_infinity.models.modeling_deepseek._old_sparse_mlp = (
+            moe_infinity.models.modeling_deepseek.DeepseekV2MoE
+        )
+        moe_infinity.models.modeling_deepseek_v3._old_sparse_mlp = (
+            moe_infinity.models.modeling_deepseek_v3.DeepseekV3MoE
+        )
+        moe_infinity.models.modeling_deepseek.modeling_deepseek.DeepseekV2MoE = DeepseekMoEBlock
+        moe_infinity.models.modeling_deepseek_v3.modeling_deepseek.DeepseekV3MoE = DeepseekMoEBlock
+
+        def from_pretrained_decorator(
+            orig_from_pretrained: Callable,
+        ) -> Callable:
             @functools.wraps(orig_from_pretrained)
             def archer_from_pretrained(cls, *args, **kwargs):
                 # print("Creating model from scratch ...")
 
-                name_id_map_file = os.path.join(self.checkpoint, "name_id_map.json")
+                name_id_map_file = os.path.join(
+                    self.checkpoint, "name_id_map.json"
+                )
 
-                model_name = args[0]
+                self.model_name = model_name = args[0]
                 # if "arctic" in model_name:
                 #     self.config = ArcticConfig.from_pretrained(*args, **kwargs)
                 # else:
@@ -378,9 +418,13 @@ class OffloadEngine(object):
                 self.num_layers, self.num_experts, self.num_encoder_layers = (
                     parse_moe_param(self.config)
                 )
-                self.dtype = parse_expert_dtype(self.config)
 
+                self.dtype = parse_expert_dtype(self.config)
                 self.dtype_cls = self.config.torch_dtype
+
+                if self.config.model_type == "deepseek_v3":
+                    self.dtype_cls = torch.float8_e4m3fn
+                    self.dtype = 3
 
                 if (
                     not self.archer_engine.is_tensor_index_initialized()
@@ -393,11 +437,15 @@ class OffloadEngine(object):
                     empty_state_dict = {}
                     self.name_id_map = {}
                     for ckpt in tqdm(
-                        self.ckpt_files, desc="Loading checkpoint files", smoothing=0
+                        self.ckpt_files,
+                        desc="Loading checkpoint files",
+                        smoothing=0,
                     ):
                         state_dict = {}
                         if "safetensors" in ckpt:
-                            with safe_open(ckpt, framework="pt", device="cpu") as f:
+                            with safe_open(
+                                ckpt, framework="pt", device="cpu"
+                            ) as f:
                                 for k in f.keys():
                                     state_dict[k] = f.get_tensor(k)
                         else:
@@ -432,18 +480,40 @@ class OffloadEngine(object):
                     total=max_tensor_id, desc="Model create"
                 )
 
-                is_flash_attn_available = kwargs.get("is_flash_attn_available", False)
+                is_flash_attn_available = kwargs.get(
+                    "is_flash_attn_available", False
+                )
                 # self.archer_prefetch.n_layer, self.archer_prefetch.n_expert, n_encoder_layers = parse_moe_param(self.config)
-                if self.dtype_cls is torch.bfloat16 or self.dtype_cls is torch.float16:
-                    model = cls._from_config(
-                        self.config,
-                        torch_dtype=self.dtype_cls,
-                        attn_implementation=(
-                            "flash_attention_2" if is_flash_attn_available else "eager"
-                        ),
-                    )
-                else:
-                    model = cls._from_config(self.config)
+                model = cls._from_config(
+                    self.config,
+                    torch_dtype=self.dtype_cls
+                    if self.config.model_type != "deepseek_v3"
+                    else torch.bfloat16,
+                    attn_implementation=(
+                        "flash_attention_2"
+                        if is_flash_attn_available
+                        else "eager"
+                    ),
+                )
+
+                if self.config.model_type == "deepseek_v3":
+                    model = model.to(torch.float8_e4m3fn)
+
+                # if (
+                #     self.dtype_cls is torch.bfloat16
+                #     or self.dtype_cls is torch.float16
+                # ):
+                #     model = cls._from_config(
+                #         self.config,
+                #         torch_dtype=self.dtype_cls,
+                #         attn_implementation=(
+                #             "flash_attention_2"
+                #             if is_flash_attn_available
+                #             else "eager"
+                #         ),
+                #     )
+                # else:
+                #     model = cls._from_config(self.config)
 
                 base_model_prefix = model.base_model_prefix
                 # model = model.to(self.dtype).to("cpu")
@@ -455,12 +525,15 @@ class OffloadEngine(object):
                 # print(self.config, flush=True)
 
                 if hasattr(self.config, "quantization_config"):
-                    self.quant_method = self.config.quantization_config["quant_method"]
+                    self.quant_method = self.config.quantization_config[
+                        "quant_method"
+                    ]
                     self.config.quantization_config["use_exllama"] = False
                     self.config.quantization_config["disable_exllama"] = True
                     # print("Quantizing model ...", self.quant_method, flush=True)
                     if self.quant_method == "gptq":
                         from optimum.gptq import GPTQQuantizer
+
                         # print("Quantizing model with GPTQ ...", self.config.quantization_config, flush=True)
                         optimum_quantizer = GPTQQuantizer.from_dict(
                             self.config.quantization_config
@@ -480,7 +553,9 @@ class OffloadEngine(object):
                 for name, param in model.named_parameters(recurse=True):
                     # remove base_model_prefix from self.name_id_map
                     if name.startswith(base_model_prefix):
-                        name_without_prefix = name[(len(base_model_prefix) + 1) :]
+                        name_without_prefix = name[
+                            (len(base_model_prefix) + 1) :
+                        ]
                         if name_without_prefix in self.name_id_map:
                             self.name_id_map[name] = self.name_id_map[
                                 name_without_prefix
@@ -489,8 +564,10 @@ class OffloadEngine(object):
                     param.ar_id = self.name_id_map.get(name, None)
 
                 # the case for NLLB MoE
-                if not "lm_head.weight" in self.name_id_map:
-                    print("lm_head.weight not in name_id_map, add it as embed_tokens")
+                if "lm_head.weight" not in self.name_id_map:
+                    print(
+                        "lm_head.weight not in name_id_map, add it as embed_tokens"
+                    )
                     self.name_id_map["lm_head.weight"] = 0
                     self.name_id_map["encoder.embed_tokens.weight"] = 0
                     self.name_id_map["decoder.embed_tokens.weight"] = 0
@@ -504,9 +581,18 @@ class OffloadEngine(object):
                     layer_id, expert_id = parse_expert_id(name, self.config)
                     if expert_id is not None:
                         self.expert_tensor_map[(layer_id, expert_id)] = id
+                # print("expert_tensor_map", self.expert_tensor_map, flush=True)
+                self.expert_prefetcher.expert_tensor_map = (
+                    self.expert_tensor_map
+                )
 
-                self.expert_prefetcher.expert_tensor_map = self.expert_tensor_map
-
+                # for deepseek, we need to set the expert_tensor_map for the model
+                first_k_dense_replace = 0
+                if "deepseek" in model_name:
+                    self.expert_prefetcher.first_k_dense_replace = (
+                        self.config.first_k_dense_replace
+                    )
+                    first_k_dense_replace = self.config.first_k_dense_replace
                 # extracted_experts = []
                 # for param_name, tensor_id in self.name_id_map.items():
                 #     # extract encoder, digits from "encoder.layers.7.ffn.experts.expert_78.fc1.weight"
@@ -539,12 +625,13 @@ class OffloadEngine(object):
                 # # make unique and sort
                 # layer_idx = sorted(list(set(layer_idx)))
 
-                self.expert_executor.set_expert_dispatcher(self.expert_dispatcher)
+                self.expert_executor.set_expert_dispatcher(
+                    self.expert_dispatcher
+                )
 
                 module_idx = 0
                 self.expert_layer_modules = []
                 for module in model.modules():
-
                     if (
                         isinstance(module, SyncNllbMoeSparseMLP)
                         or isinstance(module, SyncSwitchTransformersSparseMLP)
@@ -552,6 +639,7 @@ class OffloadEngine(object):
                         or isinstance(module, SyncMixtralSparseMoeBlock)
                         or isinstance(module, SyncGrokMoeBlock)
                         or isinstance(module, SyncArcticMoeBlock)
+                        or isinstance(module, DeepseekMoEBlock)
                     ):
                         # module.archer_prefetch = self.archer_prefetch
                         # module.archer_tracer = self.archer_tracer
@@ -585,7 +673,7 @@ class OffloadEngine(object):
                         # # self.archer_prefetch.extracted_experts[module_idx] = [
                         # #     x[1] for x in expert_tensor_ids
                         # # ]
-                        module.layer_id = module_idx
+                        module.layer_id = module_idx + first_k_dense_replace
 
                         module_idx += 1
 
@@ -604,12 +692,18 @@ class OffloadEngine(object):
 
     # clean up initialization hooks
     def __exit__(self, exc_type, exc_value, traceback):
+        # GPTQ Override
+        QuantLinear.__init__ = QuantLinear._old_init
+        QuantLinearOld.__init__ = QuantLinearOld._old_init
+
         self.cls.__init__ = self.cls._old_init
         self.cls.from_pretrained = self.cls._old_from_pretrained
-        torch.nn.modules.module.Module.apply = torch.nn.modules.module.Module._old_apply
+        torch.nn.modules.module.Module.apply = (
+            torch.nn.modules.module.Module._old_apply
+        )
         torch.index_select = torch._old_index_select
         torch.Tensor.index_select = torch.Tensor._old_index_select
-        
+
         self.cls.post_init = self.cls._old_post_init
         PreTrainedModel.post_init = PreTrainedModel._old_post_init
 
@@ -645,7 +739,7 @@ class OffloadEngine(object):
                 print("param not in self.name_id_map", name)
                 continue
             if match:
-                if "expert" in name:
+                if "expert" in name and "shared_experts" not in name:
                     match = re.match(r"(.*experts)", name)
                     assert match, "Not correct expert name!"
                     stored_name = match.group(1)
@@ -662,7 +756,9 @@ class OffloadEngine(object):
                                 self.name_id_map[name]
                             ]
                     else:
-                        ret_dict[stored_name] = {expert_name: [self.name_id_map[name]]}
+                        ret_dict[stored_name] = {
+                            expert_name: [self.name_id_map[name]]
+                        }
                         name_lst.append(stored_name)
 
                 else:
@@ -692,7 +788,7 @@ class OffloadEngine(object):
                 # print("buffer not in self.name_id_map", name)
                 continue
             if match:
-                if "expert" in name:
+                if "expert" in name and "shared_experts" not in name:
                     match = re.match(r"(.*experts)", name)
                     assert match, "Not correct expert name!"
                     stored_name = match.group(1)
@@ -709,12 +805,16 @@ class OffloadEngine(object):
                                 self.name_id_map[name]
                             ]
                     else:
-                        ret_dict[stored_name] = {expert_name: [self.name_id_map[name]]}
+                        ret_dict[stored_name] = {
+                            expert_name: [self.name_id_map[name]]
+                        }
                         name_lst.append(stored_name)
 
                 else:
                     matches = [match for match in re.finditer(r"\d", name)]
-                    last_number_position = matches[-1].start() if matches else -1
+                    last_number_position = (
+                        matches[-1].start() if matches else -1
+                    )
                     stored_name = name[: last_number_position + 1]
 
                     if stored_name in name_lst:
@@ -776,8 +876,9 @@ class OffloadEngine(object):
                 new_args = output.to(device)
             return new_args
 
-        def gen_args_hook(key, input_device_index, output_device_index, tensors):
-
+        def gen_args_hook(
+            key, input_device_index, output_device_index, tensors
+        ):
             keys = key.split(".")
             # print(keys)
             m = model
@@ -789,7 +890,9 @@ class OffloadEngine(object):
 
             m.register_forward_pre_hook(
                 functools.partial(
-                    _pre_forward_input_hook, device=input_device_index, tensors=tensors
+                    _pre_forward_input_hook,
+                    device=input_device_index,
+                    tensors=tensors,
                 ),
                 prepend=True,
                 with_kwargs=True,
@@ -803,6 +906,9 @@ class OffloadEngine(object):
                 )
 
         expert_layer_id = 0
+        if "deepseek" in self.model_name:
+            expert_layer_id = self.config.first_k_dense_replace
+
         output_device_index = None
         for key, tensors in topo:
             # print(key, tensors)
@@ -814,11 +920,17 @@ class OffloadEngine(object):
                 for expert_idx, expert_tensors in enumerate(tensors):
                     expert_key = (
                         f"{key}.expert_{expert_idx}"
-                        if self.config.model_type != "mixtral" and self.config.model_type != "grok-1" and self.config.model_type != "arctic"
+                        if self.config.model_type != "mixtral"
+                        and self.config.model_type != "grok-1"
+                        and self.config.model_type != "arctic"
+                        and self.config.model_type != "deepseek_v2"
+                        and self.config.model_type != "deepseek_v3"
                         else f"{key}.{expert_idx}"
                     )
-                    input_device_index = self.archer_engine.get_node_default_device(
-                        expert_tensors
+                    input_device_index = (
+                        self.archer_engine.get_node_default_device(
+                            expert_tensors
+                        )
                     )
                     gen_args_hook(
                         expert_key,
@@ -835,7 +947,9 @@ class OffloadEngine(object):
                 input_device_index = self.archer_engine.get_node_default_device(
                     tensors[0]
                 )
-                gen_args_hook(key, input_device_index, output_device_index, tensors[0])
+                gen_args_hook(
+                    key, input_device_index, output_device_index, tensors[0]
+                )
                 output_device_index = input_device_index
 
         # @torch.no_grad()
@@ -868,7 +982,9 @@ class OffloadEngine(object):
 
         for param_name in param_names:
             self.name_id_map[param_name] = self._generate_param_id()
-            if not self.archer_engine.is_tensor_offloaded(self.name_id_map[param_name]):
+            if not self.archer_engine.is_tensor_offloaded(
+                self.name_id_map[param_name]
+            ):
                 self.archer_engine.offload(
                     state_dict[param_name], self.name_id_map[param_name]
                 )
@@ -897,7 +1013,7 @@ class OffloadEngine(object):
             device_list = []
 
             for name, param in module.named_parameters(recurse=False):
-                if not param.data.data_ptr() in self.offload_set:
+                if param.data.data_ptr() not in self.offload_set:
                     num_devices = torch.cuda.device_count()
                     param.data = param.data.to(f"cuda:{num_devices-1}")
                     continue
@@ -909,8 +1025,7 @@ class OffloadEngine(object):
                 device_list.append(param.data.device)
 
             for name, buf in module.named_buffers(recurse=False):
-
-                if not buf.data.data_ptr() in self.offload_set:
+                if buf.data.data_ptr() not in self.offload_set:
                     buf.data = buf.data.to("cuda:0")
                     continue
 
@@ -928,8 +1043,7 @@ class OffloadEngine(object):
             device_list = []
             param_not_offload = set()
             for param in module.parameters(recurse=False):
-
-                if not param.data.data_ptr() in self.offload_set:
+                if param.data.data_ptr() not in self.offload_set:
                     param_not_offload.add(param.data.data_ptr())
                     continue
 
@@ -940,8 +1054,7 @@ class OffloadEngine(object):
                 device_list.append(param.data.device)
 
             for buf in module.buffers(recurse=False):
-
-                if not buf.data_ptr() in self.offload_set:
+                if buf.data_ptr() not in self.offload_set:
                     continue
 
                 self.offload_set.remove(buf.data_ptr())
@@ -958,7 +1071,9 @@ class OffloadEngine(object):
 
         # Pre forward hook
         self.forward_hooks.append(
-            module.register_forward_pre_hook(_pre_forward_module_hook, with_kwargs=True)
+            module.register_forward_pre_hook(
+                _pre_forward_module_hook, with_kwargs=True
+            )
         )
 
         # Post forward hook
@@ -969,18 +1084,16 @@ class OffloadEngine(object):
     # clean runtime hooks
     def clean_up(self):
         transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier = transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._old_cast_classifier
-        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP = (
-            transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp
-        )
-        
+        transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersSparseMLP = transformers.models.switch_transformers.modeling_switch_transformers._old_sparse_mlp
+
         transformers.models.nllb_moe.modeling_nllb_moe.NllbMoeSparseMLP = (
             transformers.models.nllb_moe.modeling_nllb_moe._old_sparse_mlp
         )
-        
+
         transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock = (
             transformers.models.mixtral.modeling_mixtral._old_sparse_mlp
         )
-        
+
         moe_infinity.models.modeling_grok.modeling_grok1.MoeBlock = (
             moe_infinity.modeling_grok.modeling_grok1._old_sparse_mlp
         )
@@ -988,5 +1101,6 @@ class OffloadEngine(object):
         moe_infinity.models.modeling_arctic.modeling_arctic.ArcticMoE = (
             moe_infinity.models.modeling_arctic._old_sparse_mlp
         )
-        
-        
+
+        moe_infinity.models.modeling_deepseek.modeling_deepseek.DeepseekV2MoE = moe_infinity.models.modeling_deepseek._old_sparse_mlp
+        moe_infinity.models.modeling_deepseek_v3.modeling_deepseek.DeepseekV3MoE = moe_infinity.models.modeling_deepseek_v3._old_sparse_mlp

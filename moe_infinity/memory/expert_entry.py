@@ -1,6 +1,7 @@
 from dataclasses import dataclass
+
 import numpy as np
-import hashlib
+
 
 @dataclass
 class ExpertTraceEntry:
@@ -11,7 +12,7 @@ class ExpertTraceEntry:
 
     def __hash__(self):
         return hash(self.seq_id)
-    
+
 
 @dataclass
 class ExpertCacheEntry:

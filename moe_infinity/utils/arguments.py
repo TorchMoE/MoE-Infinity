@@ -12,14 +12,14 @@ def copy_args_to_device(device, args):
         return args.to(device)
     for i in range(len(args)):
         if isinstance(args[i], torch.Tensor):
-            new_args += (args[i].to(device, non_blocking=True), )
+            new_args += (args[i].to(device, non_blocking=True),)
         elif isinstance(args[i], list) or isinstance(args[i], tuple):
             # move_args_to_device(device, *args[i])
-            new_args += (copy_args_to_device(device, args[i]), )
+            new_args += (copy_args_to_device(device, args[i]),)
         elif isinstance(args[i], dict):
-            new_args += (copy_kwargs_to_device(device, args[i]), )
+            new_args += (copy_kwargs_to_device(device, args[i]),)
         else:
-            new_args += (args[i], )
+            new_args += (args[i],)
     # print("new_args", device, new_args)
     return new_args
 

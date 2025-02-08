@@ -3,6 +3,6 @@
 
 # TorchMoE Team
 
-from .expert_prefetcher import DistributedExpertPrefetcher
-from .expert_executor import DistributedExpertExecutor
 from .devicemap_manager import DeviceMapManager
+from .expert_executor import DistributedExpertExecutor
+from .expert_prefetcher import DistributedExpertPrefetcher

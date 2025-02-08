@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023 Mistral AI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -17,13 +16,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch Arctic model."""
+"""PyTorch Arctic model."""
+
 import copy
 import inspect
-import time
 import math
-import warnings
 import re
+import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -31,9 +30,9 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.integrations.deepspeed import is_deepspeed_available
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
@@ -54,12 +53,12 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
+
 from .configuration_arctic import ArcticConfig
-from transformers.integrations.deepspeed import is_deepspeed_available
-from transformers.utils.versions import require_version
 
 if is_deepspeed_available():
-    from deepspeed.moe.layer import MoE 
+    from deepspeed.moe.layer import MoE
+
     # Note that below will crash if there is an available deepspeed that does not have ds_linear.
     try:
         import deepspeed.linear as ds_linear
@@ -70,9 +69,15 @@ else:
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+    from flash_attn.bert_padding import (  # noqa
+        index_first_axis,
+        pad_input,
+        unpad_input,
+    )
 
-    _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+    _flash_supports_window_size = "window_size" in list(
+        inspect.signature(flash_attn_func).parameters
+    )
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -80,7 +85,9 @@ if is_torch_fx_available():
     if not is_torch_greater_or_equal_than_1_13:
         import torch.fx
 
-    _prepare_4d_causal_attention_mask = torch.fx.wrap(_prepare_4d_causal_attention_mask)
+    _prepare_4d_causal_attention_mask = torch.fx.wrap(
+        _prepare_4d_causal_attention_mask
+    )
 
 
 logger = logging.get_logger(__name__)
@@ -100,11 +107,15 @@ QUANTIZATION_CONFIG = "ds_quantization_config"
 #         if raise_error:
 #             raise ValueError(f"DeepSpeed is required for this feature, {error_msg}")
 #     else:
-        
+
 #     return available_and_valid
 
+
 def load_balancing_loss_func(
-    gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=4, attention_mask: Optional[torch.Tensor] = None
+    gate_logits: torch.Tensor,
+    num_experts: torch.Tensor = None,
+    top_k=4,
+    attention_mask: Optional[torch.Tensor] = None,
 ) -> float:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
@@ -128,9 +139,13 @@ def load_balancing_loss_func(
 
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+        concatenated_gate_logits = torch.cat(
+            [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
+        )
 
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    routing_weights = torch.nn.functional.softmax(
+        concatenated_gate_logits, dim=-1
+    )
 
     _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
 
@@ -144,35 +159,43 @@ def load_balancing_loss_func(
         router_prob_per_expert = torch.mean(routing_weights, dim=0)
     else:
         batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (
+            batch_size * sequence_length
+        )
 
         # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
         expert_attention_mask = (
             attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, 2, num_experts))
+            .expand(
+                (num_hidden_layers, batch_size, sequence_length, 2, num_experts)
+            )
             .reshape(-1, 2, num_experts)
             .to(compute_device)
         )
 
         # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
+        tokens_per_expert = torch.sum(
+            expert_mask.float() * expert_attention_mask, dim=0
+        ) / torch.sum(expert_attention_mask, dim=0)
 
         # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
         router_per_expert_attention_mask = (
             attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .expand(
+                (num_hidden_layers, batch_size, sequence_length, num_experts)
+            )
             .reshape(-1, num_experts)
             .to(compute_device)
         )
 
         # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
+        router_prob_per_expert = torch.sum(
+            routing_weights * router_per_expert_attention_mask, dim=0
+        ) / torch.sum(router_per_expert_attention_mask, dim=0)
 
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    overall_loss = torch.sum(
+        tokens_per_expert * router_prob_per_expert.unsqueeze(0)
+    )
     return overall_loss * num_experts
 
 
@@ -181,7 +204,9 @@ def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
+    cu_seqlens = F.pad(
+        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
+    )
     return (
         indices,
         cu_seqlens,
@@ -203,40 +228,57 @@ class ArcticRMSNorm(nn.Module):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = hidden_states * torch.rsqrt(
+            variance + self.variance_epsilon
+        )
         return self.weight * hidden_states.to(input_dtype)
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Arctic
 class ArcticRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(
+        self, dim, max_position_embeddings=2048, base=10000, device=None
+    ):
         super().__init__()
 
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        inv_freq = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Build here to make `torch.jit.trace` work.
         self._set_cos_sin_cache(
-            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
 
         freqs = torch.outer(t, self.inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+        self.register_buffer(
+            "cos_cached", emb.cos().to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin().to(dtype), persistent=False
+        )
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
         if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+            self._set_cos_sin_cache(
+                seq_len=seq_len, device=x.device, dtype=x.dtype
+            )
 
         return (
             self.cos_cached[:seq_len].to(dtype=x.dtype),
@@ -289,8 +331,12 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(
+        batch, num_key_value_heads * n_rep, slen, head_dim
+    )
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralAttention with Mistral->Arctic
@@ -300,7 +346,9 @@ class ArcticAttention(nn.Module):
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: ArcticConfig, layer_idx: Optional[int] = None,  **kwargs):
+    def __init__(
+        self, config: ArcticConfig, layer_idx: Optional[int] = None, **kwargs
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -320,7 +368,9 @@ class ArcticAttention(nn.Module):
         self.rope_theta = config.rope_theta
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
-        self.use_deepspeed_implementation = USE_DEEPSPEED_MOE_ARG in kwargs and kwargs[USE_DEEPSPEED_MOE_ARG]
+        self.use_deepspeed_implementation = (
+            USE_DEEPSPEED_MOE_ARG in kwargs and kwargs[USE_DEEPSPEED_MOE_ARG]
+        )
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
@@ -331,31 +381,47 @@ class ArcticAttention(nn.Module):
         deepspeed_lora_config = kwargs.get(DEEPSPEED_LORA_CONFIG)
         quantization_config = kwargs.get(QUANTIZATION_CONFIG, None)
 
-        self.q_proj = get_arctic_linear(self.hidden_size, self.num_heads * self.head_dim, bias=False,
-                                     use_deepspeed_implementation=self.use_deepspeed_implementation,
-                                     ds_optimized_lora_config=deepspeed_lora_config, 
-                                     ds_optimized_quantization_config=quantization_config, 
-                                     ds_optimized_base_weight_sharding=True,
-                                     dtype=torch.bfloat16)
-        self.k_proj = get_arctic_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False,
-                                     use_deepspeed_implementation=self.use_deepspeed_implementation,                                     
-                                     ds_optimized_lora_config=deepspeed_lora_config, 
-                                     ds_optimized_quantization_config=quantization_config, 
-                                     ds_optimized_base_weight_sharding=True,
-                                     dtype=torch.bfloat16)
-        self.v_proj = get_arctic_linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False,
-                                     use_deepspeed_implementation=self.use_deepspeed_implementation,
-                                     ds_optimized_lora_config=deepspeed_lora_config, 
-                                     ds_optimized_quantization_config=quantization_config, 
-                                     ds_optimized_base_weight_sharding=True,
-                                     dtype=torch.bfloat16)
-        self.o_proj = get_arctic_linear(self.hidden_size, self.hidden_size, bias=False,
-                                     use_deepspeed_implementation=self.use_deepspeed_implementation,
-                                     ds_optimized_lora_config=deepspeed_lora_config, 
-                                     ds_optimized_quantization_config=quantization_config, 
-                                     ds_optimized_base_weight_sharding=True,
-                                     dtype=torch.bfloat16)
-        
+        self.q_proj = get_arctic_linear(
+            self.hidden_size,
+            self.num_heads * self.head_dim,
+            bias=False,
+            use_deepspeed_implementation=self.use_deepspeed_implementation,
+            ds_optimized_lora_config=deepspeed_lora_config,
+            ds_optimized_quantization_config=quantization_config,
+            ds_optimized_base_weight_sharding=True,
+            dtype=torch.bfloat16,
+        )
+        self.k_proj = get_arctic_linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+            use_deepspeed_implementation=self.use_deepspeed_implementation,
+            ds_optimized_lora_config=deepspeed_lora_config,
+            ds_optimized_quantization_config=quantization_config,
+            ds_optimized_base_weight_sharding=True,
+            dtype=torch.bfloat16,
+        )
+        self.v_proj = get_arctic_linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+            use_deepspeed_implementation=self.use_deepspeed_implementation,
+            ds_optimized_lora_config=deepspeed_lora_config,
+            ds_optimized_quantization_config=quantization_config,
+            ds_optimized_base_weight_sharding=True,
+            dtype=torch.bfloat16,
+        )
+        self.o_proj = get_arctic_linear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=False,
+            use_deepspeed_implementation=self.use_deepspeed_implementation,
+            ds_optimized_lora_config=deepspeed_lora_config,
+            ds_optimized_quantization_config=quantization_config,
+            ds_optimized_base_weight_sharding=True,
+            dtype=torch.bfloat16,
+        )
+
         self.rotary_emb = ArcticRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -363,7 +429,11 @@ class ArcticAttention(nn.Module):
         )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        return (
+            tensor.view(bsz, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
     def forward(
         self,
@@ -374,7 +444,9 @@ class ArcticAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]
+    ]:
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
@@ -385,9 +457,15 @@ class ArcticAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -397,19 +475,27 @@ class ArcticAttention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_usable_length(
+                kv_seq_len, self.layer_idx
+            )
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(2, 3)
+        ) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
@@ -426,8 +512,12 @@ class ArcticAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training
+        )
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -460,9 +550,11 @@ class ArcticFlashAttention2(ArcticAttention):
         super().__init__(*args, **kwargs)
 
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignment, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+        self._flash_attn_uses_top_left_mask = (
+            not is_flash_attn_greater_or_equal_2_10()
+        )
 
     def forward(
         self,
@@ -487,9 +579,15 @@ class ArcticFlashAttention2(ArcticAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -499,13 +597,17 @@ class ArcticFlashAttention2(ArcticAttention):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_usable_length(
+                kv_seq_len, self.layer_idx
+            )
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
         cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
 
         use_sliding_windows = (
             _flash_supports_window_size
@@ -521,7 +623,9 @@ class ArcticFlashAttention2(ArcticAttention):
 
         if past_key_value is not None:
             # Activate slicing cache only if the config has a value `sliding_windows` attribute
-            cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
+            cache_has_contents = (
+                past_key_value.get_seq_length(self.layer_idx) > 0
+            )
             if (
                 getattr(self.config, "sliding_window", None) is not None
                 and kv_seq_len > self.config.sliding_window
@@ -543,10 +647,18 @@ class ArcticFlashAttention2(ArcticAttention):
 
                 if attention_mask is not None:
                     attention_mask = attention_mask[:, slicing_tokens:]
-                    attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
+                    attention_mask = torch.cat(
+                        [
+                            attention_mask,
+                            torch.ones_like(attention_mask[:, -1:]),
+                        ],
+                        dim=-1,
+                    )
 
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -591,7 +703,9 @@ class ArcticFlashAttention2(ArcticAttention):
             use_sliding_windows=use_sliding_windows,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = attn_output.reshape(
+            bsz, q_len, self.hidden_size
+        ).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -639,8 +753,19 @@ class ArcticFlashAttention2(ArcticAttention):
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
             batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
+            (
+                query_states,
+                key_states,
+                value_states,
+                indices_q,
+                cu_seq_lens,
+                max_seq_lens,
+            ) = self._upad_input(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length,
             )
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
@@ -671,10 +796,15 @@ class ArcticFlashAttention2(ArcticAttention):
                     dropout_p=dropout,
                     softmax_scale=softmax_scale,
                     causal=causal,
-                    window_size=(self.config.sliding_window, self.config.sliding_window),
+                    window_size=(
+                        self.config.sliding_window,
+                        self.config.sliding_window,
+                    ),
                 )
 
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+            attn_output = pad_input(
+                attn_output_unpad, indices_q, batch_size, query_length
+            )
         else:
             if not use_sliding_windows:
                 attn_output = flash_attn_func(
@@ -693,28 +823,46 @@ class ArcticFlashAttention2(ArcticAttention):
                     dropout,
                     softmax_scale=softmax_scale,
                     causal=causal,
-                    window_size=(self.config.sliding_window, self.config.sliding_window),
+                    window_size=(
+                        self.config.sliding_window,
+                        self.config.sliding_window,
+                    ),
                 )
 
         return attn_output
 
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
+    def _upad_input(
+        self, query_layer, key_layer, value_layer, attention_mask, query_length
+    ):
         batch_size, kv_seq_len, num_heads, head_dim = key_layer.shape
 
         # On the first iteration we need to properly re-create the padding mask
         # by slicing it on the proper place
         if kv_seq_len != attention_mask.shape[-1]:
             attention_mask_num_tokens = attention_mask.shape[-1]
-            attention_mask = attention_mask[:, attention_mask_num_tokens - kv_seq_len :]
+            attention_mask = attention_mask[
+                :, attention_mask_num_tokens - kv_seq_len :
+            ]
 
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(
+            attention_mask
+        )
 
-        key_layer = index_first_axis(key_layer.reshape(batch_size * kv_seq_len, num_heads, head_dim), indices_k)
-        value_layer = index_first_axis(value_layer.reshape(batch_size * kv_seq_len, num_heads, head_dim), indices_k)
+        key_layer = index_first_axis(
+            key_layer.reshape(batch_size * kv_seq_len, num_heads, head_dim),
+            indices_k,
+        )
+        value_layer = index_first_axis(
+            value_layer.reshape(batch_size * kv_seq_len, num_heads, head_dim),
+            indices_k,
+        )
 
         if query_length == kv_seq_len:
             query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, num_heads, head_dim), indices_k
+                query_layer.reshape(
+                    batch_size * kv_seq_len, num_heads, head_dim
+                ),
+                indices_k,
             )
             cu_seqlens_q = cu_seqlens_k
             max_seqlen_in_batch_q = max_seqlen_in_batch_k
@@ -729,7 +877,9 @@ class ArcticFlashAttention2(ArcticAttention):
         else:
             # The -q_len: slice assumes left padding.
             attention_mask = attention_mask[:, -query_length:]
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(query_layer, attention_mask)
+            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = (
+                unpad_input(query_layer, attention_mask)
+            )
 
         return (
             query_layer,
@@ -740,14 +890,17 @@ class ArcticFlashAttention2(ArcticAttention):
             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
         )
 
-def get_arctic_linear(input_dim, 
-                   output_dim, 
-                   bias=False,
-                   use_deepspeed_implementation=False,
-                   ds_optimized_lora_config=None, 
-                   ds_optimized_quantization_config=None, 
-                   ds_optimized_base_weight_sharding=False,
-                   dtype=torch.bfloat16):
+
+def get_arctic_linear(
+    input_dim,
+    output_dim,
+    bias=False,
+    use_deepspeed_implementation=False,
+    ds_optimized_lora_config=None,
+    ds_optimized_quantization_config=None,
+    ds_optimized_base_weight_sharding=False,
+    dtype=torch.bfloat16,
+):
     """Can return deepspeed optimized linear if available.
     Args:
         input_dim, output_dim, bias, dtype: self explanatory (same as from nn.Linear)
@@ -758,9 +911,22 @@ def get_arctic_linear(input_dim,
     """
     if is_deepspeed_available():
         if ds_optimized_lora_config is not None:
-            ds_optimized_lora_config: ds_linear.LoRAConfig = copy.deepcopy(ds_optimized_lora_config)
-            ds_optimized_lora_config.base_weight_sharding = torch.distributed.get_world_size() if ds_optimized_base_weight_sharding else 1
-        return ds_linear.OptimizedLinear(input_dim, output_dim, bias, ds_optimized_lora_config, ds_optimized_quantization_config, dtype=dtype)
+            ds_optimized_lora_config: ds_linear.LoRAConfig = copy.deepcopy(
+                ds_optimized_lora_config
+            )
+            ds_optimized_lora_config.base_weight_sharding = (
+                torch.distributed.get_world_size()
+                if ds_optimized_base_weight_sharding
+                else 1
+            )
+        return ds_linear.OptimizedLinear(
+            input_dim,
+            output_dim,
+            bias,
+            ds_optimized_lora_config,
+            ds_optimized_quantization_config,
+            dtype=dtype,
+        )
     return nn.Linear(input_dim, output_dim, bias=bias, dtype=dtype)
 
 
@@ -781,7 +947,9 @@ class ArcticSdpaAttention(ArcticAttention):
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]
+    ]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -803,20 +971,32 @@ class ArcticSdpaAttention(ArcticAttention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_usable_length(
+                kv_seq_len, self.layer_idx
+            )
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -860,44 +1040,63 @@ MIXTRAL_ATTENTION_CLASSES = {
 
 
 class ArcticMLP(nn.Module):
-    def __init__(self, config: ArcticConfig, 
-                 use_deepspeed_implementation=False,
-                 ds_optimized_lora_config=None,
-                 ds_optimized_quantization_config=None,
-                 shard_base_weights_if_doing_lora=False, 
-                 is_residual_mlp=False):
+    def __init__(
+        self,
+        config: ArcticConfig,
+        use_deepspeed_implementation=False,
+        ds_optimized_lora_config=None,
+        ds_optimized_quantization_config=None,
+        shard_base_weights_if_doing_lora=False,
+        is_residual_mlp=False,
+    ):
         """MLP class for Arctic supporting vanilla linear layers as well as some deepspeed optimizations.
         ds_optimized_lora_config: config of type ds_linear.LoRAConfig that contains lora specific parameter if we want to add lora to this layer.
         ds_optimized_quantization_config: config of type ds_linear.QuantizationConfig.
         ds_optimized_base_weight_sharding: bool. If true, the base weight for lora (provided ds_optimized_lora_config is not None) will be sharded across all available gpus
         in a tensor parallel way.
         is_residual_mlp: bool. If true, this is MLP inside arctic residual layer which has ffn_dim the same as full intermediate_size.
-        """        
+        """
         super(ArcticMLP, self).__init__()
         self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size if not is_residual_mlp else self.hidden_dim  
-        self.w1 = get_arctic_linear(self.hidden_dim, self.ffn_dim, False,
-                                 use_deepspeed_implementation=use_deepspeed_implementation,
-                                 ds_optimized_lora_config=ds_optimized_lora_config, 
-                                 ds_optimized_quantization_config=ds_optimized_quantization_config, 
-                                 ds_optimized_base_weight_sharding=shard_base_weights_if_doing_lora,
-                                 dtype=torch.bfloat16)
-        self.w2 = get_arctic_linear(self.ffn_dim, self.hidden_dim, False,
-                                 use_deepspeed_implementation=use_deepspeed_implementation,                                 
-                                 ds_optimized_lora_config=ds_optimized_lora_config, 
-                                 ds_optimized_quantization_config=ds_optimized_quantization_config, 
-                                 ds_optimized_base_weight_sharding=shard_base_weights_if_doing_lora,
-                                 dtype=torch.bfloat16)
-        self.w3 = get_arctic_linear(self.hidden_dim, self.ffn_dim, False,
-                                 use_deepspeed_implementation=use_deepspeed_implementation,                                 
-                                 ds_optimized_lora_config=ds_optimized_lora_config, 
-                                 ds_optimized_quantization_config=ds_optimized_quantization_config, 
-                                 ds_optimized_base_weight_sharding=shard_base_weights_if_doing_lora,
-                                 dtype=torch.bfloat16)
+        self.ffn_dim = (
+            config.intermediate_size if not is_residual_mlp else self.hidden_dim
+        )
+        self.w1 = get_arctic_linear(
+            self.hidden_dim,
+            self.ffn_dim,
+            False,
+            use_deepspeed_implementation=use_deepspeed_implementation,
+            ds_optimized_lora_config=ds_optimized_lora_config,
+            ds_optimized_quantization_config=ds_optimized_quantization_config,
+            ds_optimized_base_weight_sharding=shard_base_weights_if_doing_lora,
+            dtype=torch.bfloat16,
+        )
+        self.w2 = get_arctic_linear(
+            self.ffn_dim,
+            self.hidden_dim,
+            False,
+            use_deepspeed_implementation=use_deepspeed_implementation,
+            ds_optimized_lora_config=ds_optimized_lora_config,
+            ds_optimized_quantization_config=ds_optimized_quantization_config,
+            ds_optimized_base_weight_sharding=shard_base_weights_if_doing_lora,
+            dtype=torch.bfloat16,
+        )
+        self.w3 = get_arctic_linear(
+            self.hidden_dim,
+            self.ffn_dim,
+            False,
+            use_deepspeed_implementation=use_deepspeed_implementation,
+            ds_optimized_lora_config=ds_optimized_lora_config,
+            ds_optimized_quantization_config=ds_optimized_quantization_config,
+            ds_optimized_base_weight_sharding=shard_base_weights_if_doing_lora,
+            dtype=torch.bfloat16,
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states):
-        current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
+        current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(
+            hidden_states
+        )
         current_hidden_states = self.w2(current_hidden_states)
         return current_hidden_states
 
@@ -908,53 +1107,70 @@ class ArcticMoE(nn.Module):
 
         self.hidden_dim = config.hidden_size
         self.num_experts = config.num_local_experts
-        self.layer_id = layer_id  
+        self.layer_id = layer_id
         self.top_k = config.num_experts_per_tok
-        self.is_moe_layer = (layer_id+1) % config.moe_layer_frequency == 0
+        self.is_moe_layer = (layer_id + 1) % config.moe_layer_frequency == 0
 
-        self.use_deepspeed_implementation = USE_DEEPSPEED_MOE_ARG in kwargs and kwargs[USE_DEEPSPEED_MOE_ARG]
+        self.use_deepspeed_implementation = (
+            USE_DEEPSPEED_MOE_ARG in kwargs and kwargs[USE_DEEPSPEED_MOE_ARG]
+        )
         if self.use_deepspeed_implementation and MoE is None:
             raise ValueError("Deepspeed is not installed")
         quantization_config = kwargs.get(QUANTIZATION_CONFIG, None)
         deepspeed_lora = kwargs.get(DEEPSPEED_LORA_CONFIG)
-        if not self.is_moe_layer: # dense, not MoE
-            self.mlp = ArcticMLP(config,
-                              use_deepspeed_implementation=self.use_deepspeed_implementation,
-                              ds_optimized_quantization_config=quantization_config,
-                              ds_optimized_lora_config=deepspeed_lora,
-                              shard_base_weights_if_doing_lora=True)
+        if not self.is_moe_layer:  # dense, not MoE
+            self.mlp = ArcticMLP(
+                config,
+                use_deepspeed_implementation=self.use_deepspeed_implementation,
+                ds_optimized_quantization_config=quantization_config,
+                ds_optimized_lora_config=deepspeed_lora,
+                shard_base_weights_if_doing_lora=True,
+            )
         else:
-            if self.use_deepspeed_implementation: # DeepSpeed's MoE         
-                moe_expert_parallel_size = kwargs.get(MOE_EXPERT_PARALLEL_SIZE_ARG, 1)
-                self.mlp = MoE(self.hidden_dim,
-                                # base weight sharding false for all deepspeed moe calls because it is already sharded
-                                ArcticMLP(config, 
-                                       use_deepspeed_implementation=True,
-                                       ds_optimized_quantization_config=quantization_config,
-                                       ds_optimized_lora_config=deepspeed_lora,
-                                       shard_base_weights_if_doing_lora=False),
-                                num_experts=config.num_local_experts,
-                                ep_size=moe_expert_parallel_size,
-                                k=config.num_experts_per_tok,
-                                use_residual=False,
-                                capacity_factor=config.moe_train_capacity_factor,
-                                eval_capacity_factor=config.moe_eval_capacity_factor,
-                                enable_expert_tensor_parallelism=config.enable_expert_tensor_parallelism,
-                                min_capacity=config.moe_min_capacity,
-                                drop_tokens=config.moe_token_dropping
-                                )
+            if self.use_deepspeed_implementation:  # DeepSpeed's MoE
+                moe_expert_parallel_size = kwargs.get(
+                    MOE_EXPERT_PARALLEL_SIZE_ARG, 1
+                )
+                self.mlp = MoE(
+                    self.hidden_dim,
+                    # base weight sharding false for all deepspeed moe calls because it is already sharded
+                    ArcticMLP(
+                        config,
+                        use_deepspeed_implementation=True,
+                        ds_optimized_quantization_config=quantization_config,
+                        ds_optimized_lora_config=deepspeed_lora,
+                        shard_base_weights_if_doing_lora=False,
+                    ),
+                    num_experts=config.num_local_experts,
+                    ep_size=moe_expert_parallel_size,
+                    k=config.num_experts_per_tok,
+                    use_residual=False,
+                    capacity_factor=config.moe_train_capacity_factor,
+                    eval_capacity_factor=config.moe_eval_capacity_factor,
+                    enable_expert_tensor_parallelism=config.enable_expert_tensor_parallelism,
+                    min_capacity=config.moe_min_capacity,
+                    drop_tokens=config.moe_token_dropping,
+                )
             else:
                 # "local" MoE implementation
-                self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-                self.experts = nn.ModuleList([ArcticMLP(config,
-                                                     use_deepspeed_implementation=self.use_deepspeed_implementation,                                       
-                                                     ds_optimized_quantization_config=quantization_config,
-                                                     ds_optimized_lora_config=deepspeed_lora,
-                                                     shard_base_weights_if_doing_lora=True) for i in range(self.num_experts)])
+                self.gate = nn.Linear(
+                    self.hidden_dim, self.num_experts, bias=False
+                )
+                self.experts = nn.ModuleList(
+                    [
+                        ArcticMLP(
+                            config,
+                            use_deepspeed_implementation=self.use_deepspeed_implementation,
+                            ds_optimized_quantization_config=quantization_config,
+                            ds_optimized_lora_config=deepspeed_lora,
+                            shard_base_weights_if_doing_lora=True,
+                        )
+                        for i in range(self.num_experts)
+                    ]
+                )
 
         # if torch.distributed.get_rank() == 0:
         #     deepspeed.runtime.utils.see_memory_usage("", force=True)
-
 
     # Similar in behavior to transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock.forward but more efficient.
     def _moe_foreward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -964,26 +1180,33 @@ class ArcticMoE(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, self.top_k, dim=-1
+        )
         if self.top_k > 1:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
 
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
 
         # Matching between experts, tokens, and their top-k rank. For every i,
         # expert_idx[i] is the rank topk_idx[i] expert for token_idx[i].
         expert_idx, token_idx, topk_idx = torch.where(
-            selected_experts == torch.arange(
+            selected_experts
+            == torch.arange(
                 self.num_experts,
                 device=selected_experts.device,
             ).view((self.num_experts, 1, 1))
         )
 
         # Split into one chunk per expert.
-        bincount = torch.bincount(expert_idx, minlength=self.num_experts).tolist()
+        bincount = torch.bincount(
+            expert_idx, minlength=self.num_experts
+        ).tolist()
         token_idx = token_idx.split(bincount)
         topk_idx = topk_idx.split(bincount)
 
@@ -999,15 +1222,26 @@ class ArcticMoE(nn.Module):
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
+            current_state = hidden_states[None, top_x_list].reshape(
+                -1, hidden_dim
+            )
+            current_hidden_states = (
+                expert_layer(current_state)
+                * routing_weights[top_x_list, idx_list, None]
+            )
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+            final_hidden_states.index_add_(
+                0, top_x, current_hidden_states.to(hidden_states.dtype)
+            )
             # torch.distributed.barrier()
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, load_balancing_loss_func((router_logits, ), self.num_experts, self.top_k) # ZY: let's directly output the loss to align what we have in ds
+        final_hidden_states = final_hidden_states.reshape(
+            batch_size, sequence_length, hidden_dim
+        )
+        return final_hidden_states, load_balancing_loss_func(
+            (router_logits,), self.num_experts, self.top_k
+        )  # ZY: let's directly output the loss to align what we have in ds
 
     def forward(self, hidden_states: torch.Tensor):
         if self.is_moe_layer:
@@ -1018,7 +1252,9 @@ class ArcticMoE(nn.Module):
             else:
                 return self._moe_foreward(hidden_states)
         else:
-            return self.mlp(hidden_states), torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+            return self.mlp(hidden_states), torch.tensor(
+                0.0, device=hidden_states.device, dtype=hidden_states.dtype
+            )
 
 
 class ArcticDecoderLayer(nn.Module):
@@ -1026,23 +1262,37 @@ class ArcticDecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.self_attn = MIXTRAL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx, **kwargs)
+        self.self_attn = MIXTRAL_ATTENTION_CLASSES[config._attn_implementation](
+            config, layer_idx, **kwargs
+        )
         self.block_sparse_moe = ArcticMoE(config, layer_id=layer_idx, **kwargs)
-        self.input_layernorm = ArcticRMSNorm(config.hidden_size, eps=config.rms_norm_eps) 
-        self.post_attention_layernorm = ArcticRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.use_deepspeed_implementation = USE_DEEPSPEED_MOE_ARG in kwargs and kwargs[USE_DEEPSPEED_MOE_ARG]
+        self.input_layernorm = ArcticRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = ArcticRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.use_deepspeed_implementation = (
+            USE_DEEPSPEED_MOE_ARG in kwargs and kwargs[USE_DEEPSPEED_MOE_ARG]
+        )
 
-        self.parallel_attn_mlp_res = config.parallel_attn_mlp_res and self.block_sparse_moe.is_moe_layer # add residual only when it is moe layer
+        self.parallel_attn_mlp_res = (
+            config.parallel_attn_mlp_res and self.block_sparse_moe.is_moe_layer
+        )  # add residual only when it is moe layer
         deepspeed_quantization = kwargs.get(DEEPSPEED_QUANTIZATION_CONFIG)
         deepspeed_lora = kwargs.get(DEEPSPEED_LORA_CONFIG)
         if self.parallel_attn_mlp_res:
-            self.residual_layernorm = ArcticRMSNorm(config.hidden_size, eps=config.rms_norm_eps) 
-            self.residual_mlp =  ArcticMLP(config,
-                                        use_deepspeed_implementation=self.use_deepspeed_implementation,
-                                        is_residual_mlp=True,
-                                        ds_optimized_quantization_config=deepspeed_quantization,
-                                        ds_optimized_lora_config=deepspeed_lora,
-                                        shard_base_weights_if_doing_lora=True) # for the residual layer. always shard the base weight if doing deepspeed lora.
+            self.residual_layernorm = ArcticRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.residual_mlp = ArcticMLP(
+                config,
+                use_deepspeed_implementation=self.use_deepspeed_implementation,
+                is_residual_mlp=True,
+                ds_optimized_quantization_config=deepspeed_quantization,
+                ds_optimized_lora_config=deepspeed_lora,
+                shard_base_weights_if_doing_lora=True,
+            )  # for the residual layer. always shard the base weight if doing deepspeed lora.
 
     def forward(
         self,
@@ -1053,7 +1303,9 @@ class ArcticDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ) -> Tuple[
+        torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
+    ]:
         if "padding_mask" in kwargs:
             warnings.warn(
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
@@ -1088,7 +1340,7 @@ class ArcticDecoderLayer(nn.Module):
         hidden_states = residual_input + hidden_states
 
         residual_attn = hidden_states
-        
+
         if self.parallel_attn_mlp_res:
             # Note the architecture here is that the MOE layers reads the **pre-attention** input while there is a "normal" transformer residual part.
             # This is to achieve better parallelization.
@@ -1099,7 +1351,9 @@ class ArcticDecoderLayer(nn.Module):
             hidden_states = self.residual_mlp(hidden_states)
             residual_residual = residual_attn + hidden_states
             # parallel mlp moe part
-            hidden_states = self.post_attention_layernorm(residual_input) # parallel attn mlp has the same input
+            hidden_states = self.post_attention_layernorm(
+                residual_input
+            )  # parallel attn mlp has the same input
             hidden_states, gate_loss = self.block_sparse_moe(hidden_states)
             hidden_states = residual_residual + hidden_states
         else:
@@ -1173,6 +1427,7 @@ class ArcticPreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
+
 MIXTRAL_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
@@ -1243,9 +1498,14 @@ class ArcticModel(ArcticPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
+        )
         self.layers = nn.ModuleList(
-            [ArcticDecoderLayer(config, layer_idx, **kwargs) for layer_idx in range(config.num_hidden_layers)]
+            [
+                ArcticDecoderLayer(config, layer_idx, **kwargs)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
         self._attn_implementation = config._attn_implementation
         self.norm = ArcticRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1274,23 +1534,39 @@ class ArcticModel(ArcticPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        use_cache = (
+            use_cache if use_cache is not None else self.config.use_cache
+        )
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
+        )
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+            )
         elif input_ids is not None:
             batch_size, seq_length = input_ids.shape
         elif inputs_embeds is not None:
             batch_size, seq_length, _ = inputs_embeds.shape
         else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+            raise ValueError(
+                "You have to specify either decoder_input_ids or decoder_inputs_embeds"
+            )
 
         past_key_values_length = 0
 
@@ -1304,13 +1580,24 @@ class ArcticModel(ArcticPreTrainedModel):
         if use_cache:
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            past_key_values_length = past_key_values.get_usable_length(seq_length)
+                past_key_values = DynamicCache.from_legacy_cache(
+                    past_key_values
+                )
+            past_key_values_length = past_key_values.get_usable_length(
+                seq_length
+            )
 
         if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            device = (
+                input_ids.device
+                if input_ids is not None
+                else inputs_embeds.device
+            )
             position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+                past_key_values_length,
+                seq_length + past_key_values_length,
+                dtype=torch.long,
+                device=device,
             )
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
@@ -1319,7 +1606,11 @@ class ArcticModel(ArcticPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
+        if (
+            attention_mask is not None
+            and self._attn_implementation == "flash_attention_2"
+            and use_cache
+        ):
             is_padding_right = attention_mask[:, -1].sum().item() != batch_size
             if is_padding_right:
                 raise ValueError(
@@ -1330,7 +1621,11 @@ class ArcticModel(ArcticPreTrainedModel):
 
         if self._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
+            attention_mask = (
+                attention_mask
+                if (attention_mask is not None and 0 in attention_mask)
+                else None
+            )
         elif self._attn_implementation == "sdpa" and not output_attentions:
             # output_attentions=True can not be supported when using SDPA, and we fall back on
             # the manual implementation that requires a 4D causal mask in all cases.
@@ -1385,13 +1680,22 @@ class ArcticModel(ArcticPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                if hasattr(layer_outputs[2 if output_attentions else 1], 'to_legacy_cache'):
-                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                if hasattr(
+                    layer_outputs[2 if output_attentions else 1],
+                    "to_legacy_cache",
+                ):
+                    next_decoder_cache = layer_outputs[
+                        2 if output_attentions else 1
+                    ]
                 else:
                     if next_decoder_cache is None:
-                        next_decoder_cache = [layer_outputs[2 if output_attentions else 1]]
+                        next_decoder_cache = [
+                            layer_outputs[2 if output_attentions else 1]
+                        ]
                     else:
-                        next_decoder_cache.append(layer_outputs[2 if output_attentions else 1])
+                        next_decoder_cache.append(
+                            layer_outputs[2 if output_attentions else 1]
+                        )
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1405,13 +1709,24 @@ class ArcticModel(ArcticPreTrainedModel):
 
         next_cache = None
         if use_cache:
-            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache and hasattr(next_decoder_cache, 'to_legacy_cache') else next_decoder_cache
-        torch.cuda.empty_cache()        
+            next_cache = (
+                next_decoder_cache.to_legacy_cache()
+                if use_legacy_cache
+                and hasattr(next_decoder_cache, "to_legacy_cache")
+                else next_decoder_cache
+            )
+        torch.cuda.empty_cache()
 
         if not return_dict:
             return tuple(
                 v
-                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_losses]
+                for v in [
+                    hidden_states,
+                    next_cache,
+                    all_hidden_states,
+                    all_self_attns,
+                    all_router_losses,
+                ]
                 if v is not None
             )
         return MoeModelOutputWithPast(
@@ -1422,24 +1737,33 @@ class ArcticModel(ArcticPreTrainedModel):
             router_logits=all_router_losses,
         )
 
+
 class ArcticForCausalLM(ArcticPreTrainedModel):
     # TODO(jeffra): update _keys_to_ignore_on_load_unexpected with expert keys not relevant for this rank
-    _keys_to_ignore_on_load_unexpected = [r"model\.layers\.\d+\.block_sparse_moe\.experts\.\d+\.w\d+\.weight"
-                                          r"model\.layers\.\d+\.block_sparse_moe\.gate\.weight"]
-    _keys_to_ignore_on_load_missing = [r"model\.layers\.\d+\.block_sparse_moe\.mlp\.deepspeed_moe\.experts\.deepspeed_experts\.\d+\.w\d+\.weight",
-                                       r"model\.layers\.\d+\.block_sparse_moe\.mlp\.deepspeed_moe\.gate\.wg\.weight"]
-    _tied_weights_keys = []#["lm_head.weight"]
+    _keys_to_ignore_on_load_unexpected = [
+        r"model\.layers\.\d+\.block_sparse_moe\.experts\.\d+\.w\d+\.weight"
+        r"model\.layers\.\d+\.block_sparse_moe\.gate\.weight"
+    ]
+    _keys_to_ignore_on_load_missing = [
+        r"model\.layers\.\d+\.block_sparse_moe\.mlp\.deepspeed_moe\.experts\.deepspeed_experts\.\d+\.w\d+\.weight",
+        r"model\.layers\.\d+\.block_sparse_moe\.mlp\.deepspeed_moe\.gate\.wg\.weight",
+    ]
+    _tied_weights_keys = []  # ["lm_head.weight"]
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = ArcticModel(config, **kwargs)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False
+        )
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.num_experts = config.num_local_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.use_deepspeed_moe = kwargs.get(USE_DEEPSPEED_MOE_ARG, False)
-        self.moe_expert_parallel_size = kwargs.get(MOE_EXPERT_PARALLEL_SIZE_ARG, 1)
+        self.moe_expert_parallel_size = kwargs.get(
+            MOE_EXPERT_PARALLEL_SIZE_ARG, 1
+        )
         self.is_deepspeed_lora = kwargs.get(DEEPSPEED_LORA_CONFIG) is not None
         self.gradient_checkpointing = True
         # self.shard_base_weights_if_doing_lora = kwargs.get("shard_base_weights_if_doing_lora", False)
@@ -1464,10 +1788,9 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-
     def _expert_number_from_param_name(self, param_name):
         # example param_name: model.layers.1.block_sparse_moe.experts.10.w1.weight
-        pattern = r'experts\.(\d+)\.'
+        pattern = r"experts\.(\d+)\."
         m = re.search(pattern, param_name)
         if m:
             return int(m[1])
@@ -1481,79 +1804,145 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
             return state_dict
 
         # when trying to construct the deepspeed checkpoint we don't want to gather everything
-        if not getattr(self, '_gather_expert_params', False):
+        if not getattr(self, "_gather_expert_params", False):
             return state_dict
 
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
 
         # non-lora experts
         pattern = r"model\.layers\.\d+\.block_sparse_moe\.mlp\.deepspeed_moe\.experts\.deepspeed_experts\.\d+\.w\d+\.weight"
         expert_params = [s for s in state_dict.keys() if re.search(pattern, s)]
 
         for param_name in expert_params:
-            param_tensor = state_dict[param_name].to('cuda')
+            param_tensor = state_dict[param_name].to("cuda")
             output = [torch.zeros_like(param_tensor) for _ in range(world_size)]
-            torch.distributed.gather(param_tensor, gather_list=output if rank == 0 else None, dst=0, group=None)
+            torch.distributed.gather(
+                param_tensor,
+                gather_list=output if rank == 0 else None,
+                dst=0,
+                group=None,
+            )
             # rename from local rank to global rank
             for gather_rank, gather_param in enumerate(output):
-                experts_per_rank = self.num_experts // self.moe_expert_parallel_size
-                new_expert_number = gather_rank * experts_per_rank + self._expert_number_from_param_name(param_name)
-                new_param_name = re.sub(r'(experts\.)(\d+)(\.)', rf'\g<1>{new_expert_number}\3', param_name)
+                experts_per_rank = (
+                    self.num_experts // self.moe_expert_parallel_size
+                )
+                new_expert_number = (
+                    gather_rank * experts_per_rank
+                    + self._expert_number_from_param_name(param_name)
+                )
+                new_param_name = re.sub(
+                    r"(experts\.)(\d+)(\.)",
+                    rf"\g<1>{new_expert_number}\3",
+                    param_name,
+                )
                 state_dict[new_param_name] = gather_param
                 if rank == 0:
-                    print(f"adding to state_dict and renaming: {param_name} -> {new_param_name}")
-    
-        # Handle custom LoRA implementation  
+                    print(
+                        f"adding to state_dict and renaming: {param_name} -> {new_param_name}"
+                    )
+
+        # Handle custom LoRA implementation
         # TODO(rajhans): the part below is untested and shows up when doing lora training. Should not affect inference.
         if self.is_deepspeed_lora:
-            for param_name in list(state_dict.keys()):  # Use list to avoid RuntimeError due to changing size during iteration  
-                if param_name.endswith("base_weight"):  
-                    base_weight = state_dict[param_name].to('cuda')
-                    
-                    # If the base weight is sharded, gather weights from multiple ranks and concatenate 
-                    # except if the weights are from deespeed_moe which is not sharded (due to EP). 
-                    if self.shard_base_weights_if_doing_lora and 'deepspeed_moe.experts.deepspeed_experts' not in param_name:
-                        gathered_weights = [torch.zeros_like(base_weight, 
-                                                             device=base_weight.device, dtype=base_weight.dtype) for _ in range(world_size)]
-                        torch.distributed.gather(base_weight, gather_list=gathered_weights if rank == 0 else None, dst=0, group=None)  
+            for param_name in list(
+                state_dict.keys()
+            ):  # Use list to avoid RuntimeError due to changing size during iteration
+                if param_name.endswith("base_weight"):
+                    base_weight = state_dict[param_name].to("cuda")
+
+                    # If the base weight is sharded, gather weights from multiple ranks and concatenate
+                    # except if the weights are from deespeed_moe which is not sharded (due to EP).
+                    if (
+                        self.shard_base_weights_if_doing_lora
+                        and "deepspeed_moe.experts.deepspeed_experts"
+                        not in param_name
+                    ):
+                        gathered_weights = [
+                            torch.zeros_like(
+                                base_weight,
+                                device=base_weight.device,
+                                dtype=base_weight.dtype,
+                            )
+                            for _ in range(world_size)
+                        ]
+                        torch.distributed.gather(
+                            base_weight,
+                            gather_list=gathered_weights if rank == 0 else None,
+                            dst=0,
+                            group=None,
+                        )
                         base_weight = torch.cat(gathered_weights, dim=1)
 
-
-                    ## The part below is useful if we want to output HF transformer path weights, but commenting it for now 
-                    # Merge the LoRA weights into the base weights  
-                    # lora_weight_1 = state_dict.get(param_name.replace("base_weight", "lora_weight_1.weight"))  
-                    # lora_weight_2 = state_dict.get(param_name.replace("base_weight", "lora_weight_2.weight"))  
+                    ## The part below is useful if we want to output HF transformer path weights, but commenting it for now
+                    # Merge the LoRA weights into the base weights
+                    # lora_weight_1 = state_dict.get(param_name.replace("base_weight", "lora_weight_1.weight"))
+                    # lora_weight_2 = state_dict.get(param_name.replace("base_weight", "lora_weight_2.weight"))
                     # if lora_weight_1 is not None and lora_weight_2 is not None:
                     #     lora_weights = torch.matmul(lora_weight_2, lora_weight_1)
                     #     base_weight += lora_weights
                     # else:
-                    #     raise ValueError                  
+                    #     raise ValueError
 
-                    # # Rename the base weight to weight  
-                    # new_param_name = param_name.replace("base_weight", "weight")  
-                    # state_dict[new_param_name] = base_weight  
-                    
-                    # Remove the base weight from the state dict  
-                    # del state_dict[param_name]    
-        return state_dict      
+                    # # Rename the base weight to weight
+                    # new_param_name = param_name.replace("base_weight", "weight")
+                    # state_dict[new_param_name] = base_weight
 
+                    # Remove the base weight from the state dict
+                    # del state_dict[param_name]
+        return state_dict
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
         if not self.use_deepspeed_moe:
             return super()._load_from_state_dict(
-                state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
             )
 
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        #TODO(jeffra): currently assumes fine-tuning only on one node, fix for world_size != ep size
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        # TODO(jeffra): currently assumes fine-tuning only on one node, fix for world_size != ep size
         if self.moe_expert_parallel_size > 1:
-            assert self.moe_expert_parallel_size == world_size, \
-                    f"currently only support expert parallel size equal to world size but {self.moe_expert_parallel_size=} and {world_size=}"
+            assert (
+                self.moe_expert_parallel_size == world_size
+            ), f"currently only support expert parallel size equal to world size but {self.moe_expert_parallel_size=} and {world_size=}"
 
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        )
         num_local_experts = self.num_experts // self.moe_expert_parallel_size
-        local_expert_range = range(num_local_experts * rank, num_local_experts * rank + num_local_experts)
+        local_expert_range = range(
+            num_local_experts * rank,
+            num_local_experts * rank + num_local_experts,
+        )
 
         # no deepspeed
         #   model.layers.1.block_sparse_moe.experts.10.w1.weight
@@ -1562,7 +1951,7 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
         #   model.layers.1.block_sparse_moe.mlp.deepspeed_moe.gate.wg.weight
         #   model.layers.1.block_sparse_moe.mlp.deepspeed_moe.experts.deepspeed_experts.10.w1.weight
 
-        gate_pattern = r'model\.layers\.\d+\.block_sparse_moe\.gate\.weight'
+        gate_pattern = r"model\.layers\.\d+\.block_sparse_moe\.gate\.weight"
 
         expert_params_to_keep = []
         expert_params_to_remove = []
@@ -1579,30 +1968,45 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
 
         # drop all experts in the state_dict that we don't need locally
         for param_name in expert_params_to_remove:
-            print(f'{rank=} dropping {param_name}')
+            print(f"{rank=} dropping {param_name}")
             del state_dict[param_name]
 
         # rename remaining experts to align with the local config
         for param_name in expert_params_to_keep:
             # adjust expert number wrt expert parallelism
-            new_expert_number = self._expert_number_from_param_name(param_name) % num_local_experts
-            new_param_name = re.sub(r'(experts\.)(\d+)(\.)', rf'\g<1>{new_expert_number}\3', param_name)
+            new_expert_number = (
+                self._expert_number_from_param_name(param_name)
+                % num_local_experts
+            )
+            new_param_name = re.sub(
+                r"(experts\.)(\d+)(\.)",
+                rf"\g<1>{new_expert_number}\3",
+                param_name,
+            )
 
             # use deepspeed moe param path
-            split_param_name = new_param_name.split('.')
-            idx = split_param_name.index('experts')
-            ds_moe_path = "mlp.deepspeed_moe.experts.deepspeed_experts".split('.')
-            new_param_name = split_param_name[0:idx] + ds_moe_path + split_param_name[idx+1:]
+            split_param_name = new_param_name.split(".")
+            idx = split_param_name.index("experts")
+            ds_moe_path = "mlp.deepspeed_moe.experts.deepspeed_experts".split(
+                "."
+            )
+            new_param_name = (
+                split_param_name[0:idx]
+                + ds_moe_path
+                + split_param_name[idx + 1 :]
+            )
             new_param_name = ".".join(new_param_name)
 
-            print(f'Deepspeed {rank=}, renaming {param_name} -> {new_param_name}')
+            print(
+                f"Deepspeed {rank=}, renaming {param_name} -> {new_param_name}"
+            )
             state_dict[new_param_name] = state_dict.pop(param_name)
 
         # rename gate params
-        ds_suffix = "mlp.deepspeed_moe.gate.wg.weight".split('.')
+        ds_suffix = "mlp.deepspeed_moe.gate.wg.weight".split(".")
         for param_name in gate_params:
-            new_param_name = '.'.join(param_name.split('.')[:4] + ds_suffix)
-            print(f'Gating: {rank=}, renaming {param_name} -> {new_param_name}')
+            new_param_name = ".".join(param_name.split(".")[:4] + ds_suffix)
+            print(f"Gating: {rank=}, renaming {param_name} -> {new_param_name}")
             state_dict[new_param_name] = state_dict.pop(param_name)
 
         # If deepspeed lora is enabled, then we need to rename weight to base_weight.
@@ -1613,7 +2017,9 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
                 if not param_name.endswith("base_weight"):
                     continue
 
-                incoming_param_name = param_name.replace("base_weight", "weight")
+                incoming_param_name = param_name.replace(
+                    "base_weight", "weight"
+                )
                 if incoming_param_name not in state_dict:
                     continue
 
@@ -1621,21 +2027,37 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
 
                 shape_local = local_state_dict[param_name].shape
                 shape_incoming = incoming_param.shape
-                if 'deepspeed_moe' in incoming_param_name:
-                    assert shape_local == shape_incoming, "deepspeed moe weights are never sharded"
+                if "deepspeed_moe" in incoming_param_name:
+                    assert (
+                        shape_local == shape_incoming
+                    ), "deepspeed moe weights are never sharded"
                 else:
-                    assert shape_incoming[1] == shape_local[1] * world_size, "weights should be sharded equally across world size"
-                    incoming_param = incoming_param[:, rank*shape_local[1]: (rank+1)*shape_local[1]]
-                print(f'Deepspeed lora: {rank=}, renaming {incoming_param_name} -> {param_name}')
+                    assert (
+                        shape_incoming[1] == shape_local[1] * world_size
+                    ), "weights should be sharded equally across world size"
+                    incoming_param = incoming_param[
+                        :, rank * shape_local[1] : (rank + 1) * shape_local[1]
+                    ]
+                print(
+                    f"Deepspeed lora: {rank=}, renaming {incoming_param_name} -> {param_name}"
+                )
                 state_dict[param_name] = incoming_param
                 del state_dict[incoming_param_name]
 
         return super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
 
     @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(
+        output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
+    )
     # Ignore copy
     def forward(
         self,
@@ -1670,12 +2092,22 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
 
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
+        )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1691,7 +2123,7 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
         )
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        # logits = logits.float()
 
         loss = None
         if labels is not None:
@@ -1726,7 +2158,12 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs,
     ):
         # Omit tokens covered by past_key_values
         if past_key_values is not None:
@@ -1742,8 +2179,13 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
             # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
             # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
             # input)
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            if (
+                attention_mask is not None
+                and attention_mask.shape[1] > input_ids.shape[1]
+            ):
+                input_ids = input_ids[
+                    :, -(attention_mask.shape[1] - past_length) :
+                ]
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
             elif past_length < input_ids.shape[1]:
@@ -1787,7 +2229,10 @@ class ArcticForCausalLM(ArcticPreTrainedModel):
         reordered_past = ()
         for layer_past in past_key_values:
             reordered_past += (
-                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+                tuple(
+                    past_state.index_select(0, beam_idx.to(past_state.device))
+                    for past_state in layer_past
+                ),
             )
         return reordered_past
 
@@ -1842,7 +2287,11 @@ class ArcticForSequenceClassification(ArcticPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
+        )
 
         transformer_outputs = self.model(
             input_ids,
@@ -1864,19 +2313,28 @@ class ArcticForSequenceClassification(ArcticPreTrainedModel):
             batch_size = inputs_embeds.shape[0]
 
         if self.config.pad_token_id is None and batch_size != 1:
-            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+            raise ValueError(
+                "Cannot handle batch sizes > 1 if no padding token is defined."
+            )
         if self.config.pad_token_id is None:
             sequence_lengths = -1
         else:
             if input_ids is not None:
                 # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
-                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                sequence_lengths = (
+                    torch.eq(input_ids, self.config.pad_token_id)
+                    .int()
+                    .argmax(-1)
+                    - 1
+                )
                 sequence_lengths = sequence_lengths % input_ids.shape[-1]
                 sequence_lengths = sequence_lengths.to(logits.device)
             else:
                 sequence_lengths = -1
 
-        pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+        pooled_logits = logits[
+            torch.arange(batch_size, device=logits.device), sequence_lengths
+        ]
 
         loss = None
         if labels is not None:
@@ -1884,7 +2342,9 @@ class ArcticForSequenceClassification(ArcticPreTrainedModel):
             if self.config.problem_type is None:
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
-                elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+                elif self.num_labels > 1 and (
+                    labels.dtype == torch.long or labels.dtype == torch.int
+                ):
                     self.config.problem_type = "single_label_classification"
                 else:
                     self.config.problem_type = "multi_label_classification"
@@ -1897,7 +2357,9 @@ class ArcticForSequenceClassification(ArcticPreTrainedModel):
                     loss = loss_fct(pooled_logits, labels)
             elif self.config.problem_type == "single_label_classification":
                 loss_fct = CrossEntropyLoss()
-                loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+                loss = loss_fct(
+                    pooled_logits.view(-1, self.num_labels), labels.view(-1)
+                )
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)

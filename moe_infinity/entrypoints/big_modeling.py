@@ -1,19 +1,18 @@
-from typing import Any, Union, Dict
 import os
-import torch
-import torch.nn as nn
-import transformers
-from transformers import AutoConfig
-from huggingface_hub import snapshot_download
-from accelerate import init_empty_weights
+from typing import Any, Dict, Union
 
+import torch
+import transformers
 from accelerate.utils.versions import is_torch_version
-from moe_infinity.common.constants import MODEL_MAPPING_NAMES
-from moe_infinity.runtime import OffloadEngine
-from moe_infinity.utils import get_checkpoint_paths, ArcherConfig
-from moe_infinity.models import apply_rotary_pos_emb
+from huggingface_hub import snapshot_download
+from transformers import AutoConfig
+
 import moe_infinity
+from moe_infinity.common.constants import MODEL_MAPPING_NAMES
+from moe_infinity.models import apply_rotary_pos_emb, apply_rotary_pos_emb_deepseek
 from moe_infinity.models.modeling_arctic import ArcticConfig
+from moe_infinity.runtime import OffloadEngine
+from moe_infinity.utils import ArcherConfig, get_checkpoint_paths
 
 
 class MoE:
@@ -58,7 +57,9 @@ class MoE:
             )
 
         if config is None:
-            default_config_path = os.path.join(os.path.dirname(__file__), "config.json")
+            default_config_path = os.path.join(
+                os.path.dirname(__file__), "config.json"
+            )
             if not os.path.exists(default_config_path):
                 raise RuntimeError(
                     "The `load_checkpoint_and_dispatch` function requires a configuration file. "
@@ -66,9 +67,13 @@ class MoE:
                 )
             config = default_config_path
         if "arctic" in model_name_or_path:
-            model_config = ArcticConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+            model_config = ArcticConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=True
+            )
         else:
-            model_config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+            model_config = AutoConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=True
+            )
         architecture = model_config.architectures[0].lower()
 
         arch = None
@@ -119,11 +124,13 @@ class MoE:
 
             if arch == "switch":
                 is_flash_attn_available = False
+            if arch == "deepseek" or arch == "deepseek_v3":
+                is_flash_attn_available = False
         except ImportError:
             print(
                 "[WARNING] FlashAttention is not available in the current environment. Using default attention."
             )
-            pass
+
         with self.engine.init(cls=model_cls, ar_config=config):
             self.model = model_cls.from_pretrained(
                 model_name_or_path,
@@ -133,22 +140,20 @@ class MoE:
                 is_flash_attn_available=is_flash_attn_available,
                 trust_remote_code=True,
             )
-    
+
     def _configure_hook(self, input_ids: torch.LongTensor):
         if self.arch == "mixtral":
-            transformers.models.mixtral.modeling_mixtral.apply_rotary_pos_emb = (
-                apply_rotary_pos_emb
-            )
+            transformers.models.mixtral.modeling_mixtral.apply_rotary_pos_emb = apply_rotary_pos_emb
 
         if self.arch == "grok":
-            moe_infinity.models.modeling_grok.modeling_grok1.apply_rotary_pos_emb = (
-                apply_rotary_pos_emb
-            )
+            moe_infinity.models.modeling_grok.modeling_grok1.apply_rotary_pos_emb = apply_rotary_pos_emb
 
         if self.arch == "arctic":
-            moe_infinity.models.modeling_arctic.modeling_arctic.apply_rotary_pos_emb = (
-                apply_rotary_pos_emb
-            )
+            moe_infinity.models.modeling_arctic.modeling_arctic.apply_rotary_pos_emb = apply_rotary_pos_emb
+
+        if self.arch == "deepseek" or self.arch == "deepseek_v3":
+            moe_infinity.models.modeling_deepseek.modeling_deepseek.apply_rotary_pos_emb = apply_rotary_pos_emb_deepseek
+            # apply_rotary_pos_emb is defined in deepseek and differs from this version.
 
         batch_size = input_ids.shape[0]
         self.seq_id_list = [
@@ -179,6 +184,7 @@ class MoE:
         self.model.eval()
         with torch.no_grad():
             return self.model.generate(input_ids, **kwargs)
+        self.engine.expert_dispatcher.clear_expert_cache_counts()
 
     def forward(self, input_ids: torch.LongTensor, *args, **kwargs) -> Any:
         """
@@ -191,9 +197,9 @@ class MoE:
         Returns:
             Any: The output of the model.
         """
-        
+
         self._configure_hook(input_ids)
-        
+
         return self.model(input_ids, *args, **kwargs)
 
     def __call__(self, *args, **kwargs) -> Any:

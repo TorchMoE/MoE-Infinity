@@ -7,7 +7,7 @@
 
 #include <torch/extension.h>
 #include "aio/archer_prio_aio_handle.h"
-#include "utils/noncopyable.h"
+#include "base/noncopyable.h"
 
 #define CPU_DEVICE torch::Device(torch::kCPU)
 #define CUDA_DEVICE(index) torch::Device(torch::kCUDA, index)
@@ -20,14 +20,14 @@
 
 inline std::vector<uint32_t> list_to_vector(py::list list)
 {
-    std::vector<uint32_t> vec;
-    for (auto item : list) { vec.push_back(item.cast<uint32_t>()); }
-    return vec;
+  std::vector<uint32_t> vec;
+  for (auto item : list) { vec.push_back(item.cast<uint32_t>()); }
+  return vec;
 }
 
 inline py::list vector_to_list(std::vector<uint32_t>& vec)
 {
-    py::list list;
-    for (auto item : vec) { list.append(item); }
-    return list;
+  py::list list;
+  for (auto item : vec) { list.append(item); }
+  return list;
 }
