@@ -22,7 +22,7 @@ jobs:
         VERSION_HASH=$(date +"%Y%m%d%H%M%S")
         echo "Generated version hash: $VERSION_HASH"
         echo $VERSION_HASH > version.txt
-    
+
     - name: Upload version number as artifact
       uses: actions/upload-artifact@v2
       with:
@@ -84,7 +84,7 @@ jobs:
           asset_name=${wheel_name//"linux"/"manylinux1"}
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
           echo "asset_name=${asset_name}" >> $GITHUB_ENV
-      
+
 
       # only build source when the python version is 3.8
       - name: Build Source

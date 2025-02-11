@@ -2,7 +2,7 @@
 # Refer to the following link for the explanation of each params:
 #   http://releases.llvm.org/8.0.0/tools/clang/docs/ClangFormatStyleOptions.html
 Language: Cpp
-# BasedOnStyle: Google
+BasedOnStyle: Google
 AccessModifierOffset: -4
 AlignAfterOpenBracket: Align
 AlignConsecutiveAssignments: false
@@ -54,8 +54,8 @@ CommentPragmas: '^ IWYU pragma:'
 CompactNamespaces: false
 ConstructorInitializerAllOnOneLineOrOnePerLine: true
 # Kept the below 2 to be the same as `IndentWidth` to keep everything uniform
-ConstructorInitializerIndentWidth: 4
-ContinuationIndentWidth: 4
+ConstructorInitializerIndentWidth: 2
+ContinuationIndentWidth: 2
 Cpp11BracedListStyle: true
 DerivePointerAlignment: false
 DisableFormat: false
@@ -78,7 +78,7 @@ IncludeCategories:
 IncludeIsMainRegex: '([-_](test|unittest))?$'
 IndentCaseLabels: true
 IndentPPDirectives: None
-IndentWidth:     4
+IndentWidth:     2
 IndentWrappedFunctionNames: false
 JavaScriptQuotes: Leave
 JavaScriptWrapImports: true
@@ -151,5 +151,5 @@ StatementMacros:
   - Q_UNUSED
   - QT_REQUIRE_VERSION
 # Be consistent with indent-width, even for people who use tab for indentation!
-TabWidth: 4
+TabWidth: 2
 UseTab: Never

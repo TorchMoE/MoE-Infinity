@@ -4,11 +4,13 @@
 # TorchMoE Team
 
 # The global device manager shared among all nodes, using grpc server to communicate with each other.
-from typing import Tuple, List
-import numpy as np
 import random
-from moe_infinity.utils import ArcherConfig
+from typing import List, Tuple
+
 import torch.distributed as dist
+
+from moe_infinity.utils import ArcherConfig
+
 
 class DeviceMapManager:
     def __init__(self, archer_config: ArcherConfig) -> None:
@@ -33,7 +35,9 @@ class DeviceMapManager:
     def set_archer_engine(self, archer_engine):
         self.archer_engine = archer_engine
 
-    def get_target_device(self, expert_list: List[int]) -> List[Tuple[int, int, int]]:
+    def get_target_device(
+        self, expert_list: List[int]
+    ) -> List[Tuple[int, int, int]]:
         num_experts = len(expert_list)
         num_device = self.total_device
 
@@ -67,5 +71,3 @@ class DeviceMapManager:
                     k += 1
 
         return device_list
-
-

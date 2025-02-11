@@ -1,17 +1,15 @@
 import copy
 import os
-import time
-from typing import Union
-import numpy as np
 import uuid
 from collections import Counter
-from scipy.spatial.distance import cosine
+from typing import Union
+
+import numpy as np
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
 # from sklearn.metrics.pairwise import cosine_similarity
-
 from moe_infinity.memory.expert_entry import ExpertTraceEntry
 from moe_infinity.utils import parse_moe_param
 
@@ -23,30 +21,35 @@ class ExpertTracer:
         if cls._instance is None:
             cls._instance = super(ExpertTracer, cls).__new__(cls)
         return cls._instance
-    
-    def __init__(self, capacity: int, config:PretrainedConfig):
-        self.num_layers, self.num_experts, self.num_encoder_layers = parse_moe_param(config)
+
+    def __init__(self, capacity: int, config: PretrainedConfig):
+        self.num_layers, self.num_experts, self.num_encoder_layers = (
+            parse_moe_param(config)
+        )
         self.capacity = capacity
 
         self.trace = {}
 
-        self.trace_collection = torch.zeros((capacity, self.num_layers, self.num_experts), device="cuda:0")
+        self.trace_collection = torch.zeros(
+            (capacity, self.num_layers, self.num_experts), device="cuda:0"
+        )
         self.collection_access = np.zeros((capacity,))
 
         self.cos = nn.CosineSimilarity(dim=2, eps=1e-6)
 
     def load_trace(self, trace: Union[os.PathLike, np.ndarray]):
         if isinstance(trace, os.PathLike):
-            self.trace_collection = torch.from_numpy(np.load(trace, allow_pickle=False))
+            self.trace_collection = torch.from_numpy(
+                np.load(trace, allow_pickle=False)
+            )
         elif isinstance(trace, np.ndarray):
             self.trace_collection = trace
-        
+
         self.persistent_capacity = self.trace_collection.shape[0]
         assert self.persistent_capacity <= self.capacity, (
             f"loaded trace capacity {self.persistent_capacity} must be "
             f"less than or equal to capacity in config {self.capacity}"
         )
-
 
     def create_entry(self):
         seq_id = uuid.uuid4().hex
@@ -94,7 +97,9 @@ class ExpertTracer:
         trace_collection_copy[:, : (layer_idx + 1), :] = 1e-9
         # print("trace_collection copy", time.time() - start_time)
 
-        trace_collection_copy /= torch.sum(trace_collection_copy, dim=2, keepdims=True)
+        trace_collection_copy /= torch.sum(
+            trace_collection_copy, dim=2, keepdims=True
+        )
 
         matrix_copy = torch.from_numpy(matrix.copy()).to("cuda:0")
         matrix_copy /= torch.sum(matrix_copy, dim=1, keepdims=True)
@@ -118,4 +123,3 @@ class ExpertTracer:
 
         entry = self.trace_collection[min_idx].to("cpu").numpy()
         return entry
-
