@@ -33,7 +33,7 @@ jobs:
           bash -x .github/workflows/scripts/free-disk-space.sh
 
       - name: Cache Python packages
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
