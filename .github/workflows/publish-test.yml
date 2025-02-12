@@ -24,7 +24,7 @@ jobs:
         echo $VERSION_HASH > version.txt
 
     - name: Upload version number as artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: version
         path: version.txt
@@ -52,7 +52,7 @@ jobs:
 
     # https://github.com/orgs/community/discussions/26313
       - name: Download version value artifact
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
             name: version
             path: artifact
