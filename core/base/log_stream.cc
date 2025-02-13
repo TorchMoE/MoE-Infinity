@@ -13,9 +13,9 @@ using namespace base;
 using namespace base::detail;
 
 #if defined(__clang__)
-#pragma clang diagnostic ignored "-Wtautological-compare"
+  #pragma clang diagnostic ignored "-Wtautological-compare"
 #else
-#pragma GCC diagnostic ignored "-Wtype-limits"
+  #pragma GCC diagnostic ignored "-Wtype-limits"
 #endif
 
 namespace base {

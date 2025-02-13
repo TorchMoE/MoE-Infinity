@@ -7,7 +7,7 @@
 #include "model/model_topology.h"
 
 #ifndef EXPERT_TYPE
-#define EXPERT_TYPE 0
+  #define EXPERT_TYPE 0
 #endif
 
 #define SWITCH_TRANSFORMERS_DENSE_ACT_DENSE 0
@@ -28,7 +28,8 @@ struct ModuleUtils {
                                   const torch::Device& device) = 0;
 };
 
-struct SwitchTransformersDenseActDense : public torch::nn::Module, public ModuleUtils {
+struct SwitchTransformersDenseActDense : public torch::nn::Module,
+                                         public ModuleUtils {
   SwitchTransformersDenseActDense(int dtype);
   torch::Tensor forward(torch::Tensor hidden_states);
   torch::Tensor wi, wo;
@@ -38,7 +39,8 @@ struct SwitchTransformersDenseActDense : public torch::nn::Module, public Module
                           const torch::Device& device) override;
 };
 
-struct SwitchTransformersDenseGatedActDense : public torch::nn::Module, public ModuleUtils {
+struct SwitchTransformersDenseGatedActDense : public torch::nn::Module,
+                                              public ModuleUtils {
   SwitchTransformersDenseGatedActDense(int dtype);
   torch::Tensor forward(torch::Tensor hidden_states);
   torch::Tensor wi_0, wi_1, wo;
@@ -101,28 +103,44 @@ struct ExpertNode {
 
 typedef std::shared_ptr<ExpertNode> ExpertNodePtr;
 
-inline torch::ScalarType dtype_to_torch(int dtype)
-{
+inline torch::ScalarType dtype_to_torch(int dtype) {
   auto tensor_dtype = torch::kFloat32;
   switch (dtype) {
-    case DTYPE_BFLOAT16: tensor_dtype = torch::kBFloat16; break;
-    case DTYPE_FLOAT16: tensor_dtype = torch::kHalf; break;
-    case DTYPE_FLOAT32: tensor_dtype = torch::kFloat32; break;
-    case DTYPE_FP8_E4M3FN: tensor_dtype = torch::kFloat8_e4m3fn; break;
-    default: assert(false);
+    case DTYPE_BFLOAT16:
+      tensor_dtype = torch::kBFloat16;
+      break;
+    case DTYPE_FLOAT16:
+      tensor_dtype = torch::kHalf;
+      break;
+    case DTYPE_FLOAT32:
+      tensor_dtype = torch::kFloat32;
+      break;
+    case DTYPE_FP8_E4M3FN:
+      tensor_dtype = torch::kFloat8_e4m3fn;
+      break;
+    default:
+      assert(false);
   }
   return tensor_dtype;
 }
 
-inline int torch_dtype_to_int(torch::ScalarType dtype)
-{
+inline int torch_dtype_to_int(torch::ScalarType dtype) {
   auto tensor_dtype = DTYPE_FLOAT32;
   switch (dtype) {
-    case torch::kBFloat16: tensor_dtype = DTYPE_BFLOAT16; break;
-    case torch::kHalf: tensor_dtype = DTYPE_FLOAT16; break;
-    case torch::kFloat32: tensor_dtype = DTYPE_FLOAT32; break;
-    case torch::kFloat8_e4m3fn: tensor_dtype = DTYPE_FP8_E4M3FN; break;
-    default: assert(false);
+    case torch::kBFloat16:
+      tensor_dtype = DTYPE_BFLOAT16;
+      break;
+    case torch::kHalf:
+      tensor_dtype = DTYPE_FLOAT16;
+      break;
+    case torch::kFloat32:
+      tensor_dtype = DTYPE_FLOAT32;
+      break;
+    case torch::kFloat8_e4m3fn:
+      tensor_dtype = DTYPE_FP8_E4M3FN;
+      break;
+    default:
+      assert(false);
   }
   return tensor_dtype;
 }

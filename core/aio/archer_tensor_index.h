@@ -39,16 +39,17 @@ std::istream& operator>>(std::istream& is, TensorStorageMeta& obj);
 void write_options(std::ostream& os, const torch::TensorOptions& obj);
 void read_options(std::istream& is, torch::TensorOptions& obj);
 
-class ArcherTensorIndex : public std::unordered_map<uint32_t, TensorStorageMeta>,
-                          public base::noncopyable {
-  public:
+class ArcherTensorIndex
+    : public std::unordered_map<uint32_t, TensorStorageMeta>,
+      public base::noncopyable {
+ public:
   void Serialize(const char* path);
   void Deserialize(const char* path);
 
   ArcherTensorIndex() = default;
   ~ArcherTensorIndex() = default;
 
-  private:
+ private:
 };
 
 extern std::unique_ptr<ArcherTensorIndex> kTensorIndex;

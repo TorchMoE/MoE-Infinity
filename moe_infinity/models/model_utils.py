@@ -20,7 +20,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def apply_rotary_pos_emb_deepseek(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+def apply_rotary_pos_emb_deepseek(
+    q, k, cos, sin, position_ids, unsqueeze_dim=1
+):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:

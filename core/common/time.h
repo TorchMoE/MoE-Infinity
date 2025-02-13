@@ -18,4 +18,5 @@ typedef std::chrono::high_resolution_clock::time_point TimePoint;
   std::chrono::duration_cast<MCIROSECONDS>(TIME_NOW.time_since_epoch()).count()
 #define MILLISECONDS_SINCE_EPOCH \
   std::chrono::duration_cast<MILLISECONDS>(TIME_NOW.time_since_epoch()).count()
-#define SECONDS_SINCE_EPOCH std::chrono::duration_cast<SECONDS>(TIME_NOW.time_since_epoch()).count()
+#define SECONDS_SINCE_EPOCH \
+  std::chrono::duration_cast<SECONDS>(TIME_NOW.time_since_epoch()).count()

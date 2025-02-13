@@ -6,15 +6,13 @@
 #ifndef MUDUO_BASE_EXCEPTION_H
 #define MUDUO_BASE_EXCEPTION_H
 
-#include "types.h"
 #include <exception>
 #include <string>
+#include "types.h"
 
-namespace base
-{
+namespace base {
 
-class Exception : public std::exception
-{
+class Exception : public std::exception {
  public:
   explicit Exception(const char* what);
   explicit Exception(const std::string& what);
@@ -26,9 +24,9 @@ class Exception : public std::exception
   void fillStackTrace();
 
   std::string message_;
-  std:: string stack_;
+  std::string stack_;
 };
 
-}
+}  // namespace base
 
 #endif  // MUDUO_BASE_EXCEPTION_H

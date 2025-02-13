@@ -14,29 +14,28 @@
 
 std::atomic_uint32_t kGPUCounter{0};
 
-void SetThreadScheduling(std::thread& th, int policy, int priority)
-{
+void SetThreadScheduling(std::thread& th, int policy, int priority) {
   sched_param sch_params;
   sch_params.sched_priority = priority;
   if (pthread_setschedparam(th.native_handle(), policy, &sch_params)) {
-    std::cerr << "Failed to set Thread scheduling : " << std::strerror(errno) << std::endl;
+    std::cerr << "Failed to set Thread scheduling : " << std::strerror(errno)
+              << std::endl;
     assert(false);
   }
 }
 
-void SetThreadAffinity(std::thread& th, int cpu_id)
-{
+void SetThreadAffinity(std::thread& th, int cpu_id) {
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
   CPU_SET(cpu_id, &cpuset);
   if (pthread_setaffinity_np(th.native_handle(), sizeof(cpu_set_t), &cpuset)) {
-    std::cerr << "Failed to set Thread affinity : " << std::strerror(errno) << std::endl;
+    std::cerr << "Failed to set Thread affinity : " << std::strerror(errno)
+              << std::endl;
     assert(false);
   }
 }
 
-void SetThreadAffinity(std::thread& th)
-{
+void SetThreadAffinity(std::thread& th) {
   // get number of cpus
   int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
   kCPUCounter++;
@@ -46,7 +45,8 @@ void SetThreadAffinity(std::thread& th)
   CPU_SET(cpu_id, &cpuset);
 
   if (pthread_setaffinity_np(th.native_handle(), sizeof(cpu_set_t), &cpuset)) {
-    std::cerr << "Failed to set Thread affinity : " << std::strerror(errno) << std::endl;
+    std::cerr << "Failed to set Thread affinity : " << std::strerror(errno)
+              << std::endl;
     assert(false);
   }
 }

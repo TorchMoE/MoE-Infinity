@@ -14,19 +14,19 @@
 namespace base {
 
 class CountDownLatch : noncopyable {
-public:
-    explicit CountDownLatch(int count);
+ public:
+  explicit CountDownLatch(int count);
 
-    void wait();
+  void wait();
 
-    void countDown();
+  void countDown();
 
-    int getCount() const;
+  int getCount() const;
 
-private:
-    mutable std::mutex mutex_;
-    std::condition_variable condition_;
-    int count_;
+ private:
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  int count_;
 };
 
 }  // namespace base

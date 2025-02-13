@@ -9,7 +9,10 @@ from transformers import AutoConfig
 
 import moe_infinity
 from moe_infinity.common.constants import MODEL_MAPPING_NAMES
-from moe_infinity.models import apply_rotary_pos_emb, apply_rotary_pos_emb_deepseek
+from moe_infinity.models import (
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_deepseek,
+)
 from moe_infinity.models.modeling_arctic import ArcticConfig
 from moe_infinity.runtime import OffloadEngine
 from moe_infinity.utils import ArcherConfig, get_checkpoint_paths

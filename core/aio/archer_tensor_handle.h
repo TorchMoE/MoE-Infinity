@@ -15,16 +15,18 @@ extern const char* ARCHER_PARAM_NAME;
 extern const char* ARCHER_IHDEX_NAME;
 
 class ArcherTensorHandle : public base::noncopyable {
-  public:
+ public:
   explicit ArcherTensorHandle(const std::string& prefix);
   ~ArcherTensorHandle() = default;
 
   void StoreTensor(const std::uint32_t tensor_id, torch::Tensor& buffer);
   void RegisterTensor(std::uint32_t tensor_id, torch::Tensor& buffer);
   void SetTensor(std::uint32_t tensor_id, torch::Tensor& buffer);
-  void SetTensor(std::uint32_t tensor_id, torch::Tensor& buffer, const torch::Device& device);
+  void SetTensor(std::uint32_t tensor_id, torch::Tensor& buffer,
+                 const torch::Device& device);
 
-  void ReadTensor(const std::uint32_t tensor_id, void* memory_ptr, bool on_demand = false);
+  void ReadTensor(const std::uint32_t tensor_id, void* memory_ptr,
+                  bool on_demand = false);
 
   void MoveTensor(const std::uint32_t tensor_id,
                   const torch::Device& src_device,
@@ -38,13 +40,13 @@ class ArcherTensorHandle : public base::noncopyable {
   int64_t GetTensorSizeAligned(const std::uint32_t tensor_id) const;
   torch::TensorOptions GetTensorOptions(const std::uint32_t tensor_id) const;
 
-  private:
+ private:
   // bool ValidateTensorMove(const std::uint32_t tensor_id,
   //                         const torch::Device& src_device,
   //                         const torch::Device& dst_device);
   std::string GetIndexFileName(const std::uint32_t file_id) const;
 
-  private:
+ private:
   std::string prefix_;
   ArcherPrioAioHandle prio_aio_handle_;
   std::uint32_t file_id_;

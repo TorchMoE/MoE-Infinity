@@ -35,25 +35,24 @@ struct Task {
 
   bool remove_layer = false;
 
-  std::string DebugString()
-  {
+  std::string DebugString() {
     std::stringstream ss;
     ss << "Task: node: " << node->str() << ", on_demand: " << on_demand
-       << ", priority: " << priority << "[" << src_device.str() << "->" << dst_device.str() << "]";
+       << ", priority: " << priority << "[" << src_device.str() << "->"
+       << dst_device.str() << "]";
     return ss.str();
   }
 };
 typedef std::shared_ptr<Task> TaskPtr;
 
 class ArcherTaskPool : public base::noncopyable {
-  public:
+ public:
   void StartExec(const std::uint64_t& request_id, const NodePtr& node);
   void FetchExec(const std::uint64_t& request_id, const NodePtr& node);
   void StopExec(const std::uint64_t& request_id, const NodePtr& node);
   void EnqueueTask(const TaskPtr& task);
 
-  void ClearQueue()
-  {
+  void ClearQueue() {
     std::lock_guard<std::mutex> lock(unified_mutex_);
     for (std::uint32_t priority = 1; priority < NUM_PRIORITY; priority++) {
       unified_queue_[priority].clear();
@@ -64,13 +63,14 @@ class ArcherTaskPool : public base::noncopyable {
   bool RemoveCachedDenseNode(const NodePtr& node);
   // void RemoveCachedNode(const NodePtr& node);
 
-  void ReplaceCacheCandidates(const NodePtrList& candidates)
-  {
+  void ReplaceCacheCandidates(const NodePtrList& candidates) {
     std::lock_guard<std::mutex> lock(unified_mutex_);
     {
       std::lock_guard<std::mutex> lock(this->candidates_mutex_);
       candidates_.clear();
-      for (auto& node : candidates) { candidates_.insert(node); }
+      for (auto& node : candidates) {
+        candidates_.insert(node);
+      }
     }
 
     for (std::uint32_t priority = 1; priority < NUM_PRIORITY; priority++) {
@@ -82,24 +82,25 @@ class ArcherTaskPool : public base::noncopyable {
   STATIC_GET_INSTANCE(ArcherTaskPool);
 
   ArcherTaskPool();
-  ~ArcherTaskPool()
-  {
+  ~ArcherTaskPool() {
     std::cout << "ArcherTaskPool destructor" << std::endl;
     main_thread_stop_flag_.store(true);
     // wait for all threads to stop
     for (auto& thread_list : exec_threads_) {
-      for (auto& thread : thread_list) { thread.join(); }
+      for (auto& thread : thread_list) {
+        thread.join();
+      }
     }
   }
 
-  private:
+ private:
   void GPUThreadFunc(int gpu_id, int thread_id);
 
   void SetNodeDevice(const TaskPtr& task);
 
   std::string DebugString(const std::vector<std::deque<TaskPtr>>& queue);
 
-  private:
+ private:
   std::vector<std::deque<TaskPtr>> unified_queue_;  // For ordered prefetch
   std::vector<std::vector<std::uint32_t>> gpu_min_priority_;
   std::unordered_map<std::uint64_t, TaskPtr> exec_queue_;

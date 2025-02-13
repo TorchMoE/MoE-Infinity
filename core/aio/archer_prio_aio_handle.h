@@ -26,21 +26,19 @@ struct AioRequest {
 };
 
 class ArcherPrioAioContext {
-  public:
+ public:
   explicit ArcherPrioAioContext(const int block_size);
   ~ArcherPrioAioContext();
 
   void AcceptRequest(std::shared_ptr<AioRequest>& io_request, bool high_prio);
 
   void Schedule();
-  std::vector<AioCallback> PrepIocbs(const bool read_op,
-                                     void* buffer,
-                                     const int fd,
-                                     const int block_size,
+  std::vector<AioCallback> PrepIocbs(const bool read_op, void* buffer,
+                                     const int fd, const int block_size,
                                      const std::int64_t offset,
                                      const std::int64_t total_size);
 
-  private:
+ private:
   std::int64_t block_size_;
 
   std::mutex io_queue_high_mutex_;
@@ -53,25 +51,21 @@ class ArcherPrioAioContext {
 };
 
 class ArcherPrioAioHandle {
-  public:
+ public:
   explicit ArcherPrioAioHandle(const std::string& prefix);
   ~ArcherPrioAioHandle();
 
-  std::int64_t Read(const std::string& filename,
-                    void* buffer,
-                    const bool high_prio,
-                    const std::int64_t num_bytes,
+  std::int64_t Read(const std::string& filename, void* buffer,
+                    const bool high_prio, const std::int64_t num_bytes,
                     const std::int64_t offset);
-  std::int64_t Write(const std::string& filename,
-                     const void* buffer,
-                     const bool high_prio,
-                     const std::int64_t num_bytes,
+  std::int64_t Write(const std::string& filename, const void* buffer,
+                     const bool high_prio, const std::int64_t num_bytes,
                      const std::int64_t offset);
 
-  private:
+ private:
   void Run();  // io submit thread function
 
-  private:
+ private:
   bool time_to_exit_;
   std::thread thread_;
   std::mutex file_set_mutex_;

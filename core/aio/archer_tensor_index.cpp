@@ -8,8 +8,7 @@
 
 using namespace std;
 
-void write_options(std::ostream& os, const torch::TensorOptions& obj)
-{
+void write_options(std::ostream& os, const torch::TensorOptions& obj) {
   bool pinned_memory = obj.pinned_memory();
   bool requires_grad = obj.requires_grad();
   std::int8_t dtype = static_cast<std::int8_t>(obj.dtype().toScalarType());
@@ -25,8 +24,7 @@ void write_options(std::ostream& os, const torch::TensorOptions& obj)
   os.write(reinterpret_cast<char*>(&layout), sizeof(layout));
 }
 
-void read_options(std::istream& is, torch::TensorOptions& obj)
-{
+void read_options(std::istream& is, torch::TensorOptions& obj) {
   bool pinned_memory = obj.pinned_memory();
   bool requires_grad = obj.requires_grad();
   std::int8_t dtype = static_cast<std::int8_t>(obj.dtype().toScalarType());
@@ -41,7 +39,8 @@ void read_options(std::istream& is, torch::TensorOptions& obj)
   is.read(reinterpret_cast<char*>(&device_type), sizeof(device_type));
   is.read(reinterpret_cast<char*>(&layout), sizeof(layout));
 
-  obj = obj.dtype(static_cast<c10::ScalarType>(dtype))
+  obj =
+      obj.dtype(static_cast<c10::ScalarType>(dtype))
           .device(torch::Device(static_cast<torch::DeviceType>(device_type),
                                 static_cast<torch::DeviceIndex>(device_index)))
           .layout(static_cast<c10::Layout>(layout))
@@ -49,8 +48,7 @@ void read_options(std::istream& is, torch::TensorOptions& obj)
           .pinned_memory(pinned_memory);
 }
 
-std::ostream& operator<<(std::ostream& os, const TensorStorageMeta& obj)
-{
+std::ostream& operator<<(std::ostream& os, const TensorStorageMeta& obj) {
   os.write(reinterpret_cast<const char*>(&obj.file_id), sizeof(obj.file_id));
   os.write(reinterpret_cast<const char*>(&obj.offset), sizeof(obj.offset));
   os.write(reinterpret_cast<const char*>(&obj.size), sizeof(obj.size));
@@ -58,7 +56,9 @@ std::ostream& operator<<(std::ostream& os, const TensorStorageMeta& obj)
   // Write shape
   std::int64_t shape_size = obj.shape.size();
   os.write(reinterpret_cast<const char*>(&shape_size), sizeof(shape_size));
-  for (const auto& dim : obj.shape) { os.write(reinterpret_cast<const char*>(&dim), sizeof(dim)); }
+  for (const auto& dim : obj.shape) {
+    os.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
+  }
 
   // Write options
   write_options(os, obj.options);
@@ -66,8 +66,7 @@ std::ostream& operator<<(std::ostream& os, const TensorStorageMeta& obj)
   return os;
 }
 
-std::istream& operator>>(std::istream& is, TensorStorageMeta& obj)
-{
+std::istream& operator>>(std::istream& is, TensorStorageMeta& obj) {
   is.read(reinterpret_cast<char*>(&obj.file_id), sizeof(obj.file_id));
   is.read(reinterpret_cast<char*>(&obj.offset), sizeof(obj.offset));
   is.read(reinterpret_cast<char*>(&obj.size), sizeof(obj.size));
@@ -76,7 +75,9 @@ std::istream& operator>>(std::istream& is, TensorStorageMeta& obj)
   std::int64_t shape_size;
   is.read(reinterpret_cast<char*>(&shape_size), sizeof(shape_size));
   obj.shape.resize(shape_size);
-  for (auto& dim : obj.shape) { is.read(reinterpret_cast<char*>(&dim), sizeof(dim)); }
+  for (auto& dim : obj.shape) {
+    is.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+  }
 
   // Read options
   read_options(is, obj.options);
@@ -84,19 +85,20 @@ std::istream& operator>>(std::istream& is, TensorStorageMeta& obj)
   return is;
 }
 
-std::string TensorStorageMeta::DebugString() const
-{
+std::string TensorStorageMeta::DebugString() const {
   std::stringstream ss;
-  ss << "file_id: " << file_id << ", offset: " << offset << ", size: " << size << ", shape: [";
-  for (auto& dim : shape) { ss << dim << ", "; }
+  ss << "file_id: " << file_id << ", offset: " << offset << ", size: " << size
+     << ", shape: [";
+  for (auto& dim : shape) {
+    ss << dim << ", ";
+  }
   ss << "], id: " << id;
   return ss.str();
 }
 
 std::unique_ptr<ArcherTensorIndex> kTensorIndex(nullptr);
 
-void ArcherTensorIndex::Serialize(const char* path)
-{
+void ArcherTensorIndex::Serialize(const char* path) {
   std::uint32_t size = this->size();
   std::ofstream ofs(path, std::ios::binary | std::ios::out | std::ios::trunc);
   ofs.write(reinterpret_cast<char*>(&size), sizeof(size));
@@ -106,8 +108,7 @@ void ArcherTensorIndex::Serialize(const char* path)
   }
 }
 
-void ArcherTensorIndex::Deserialize(const char* path)
-{
+void ArcherTensorIndex::Deserialize(const char* path) {
   this->clear();
 
   std::ifstream ifs(path, std::ios::binary | std::ios::out);

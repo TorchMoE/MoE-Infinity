@@ -1,8 +1,8 @@
 //===- c10/mobile/CPUCachingAllocator.cpp ----------------===//
 //
 // Part of the Pytorch Project, under the BSD 3-Clause License.
-// See https://github.com/pytorch/pytorch/blob/main/LICENSE for license information.
-// SPDX-License-Identifier: BSD 3-Clause
+// See https://github.com/pytorch/pytorch/blob/main/LICENSE for license
+// information. SPDX-License-Identifier: BSD 3-Clause
 
 // MoE-Infinity: modified from c10::CPUCachingAllocator.
 // replaced c10::alloc_cpu with cudaDeviceAlloc
@@ -18,15 +18,14 @@ namespace DeviceCachingAllocator {
 std::mutex DeviceCachingAllocator::mutex_;
 ska::flat_hash_map<void*, size_t> DeviceCachingAllocator::allocation_map_;
 
-inline void* DeviceCachingAllocator::allocate_and_cache(const size_t bytes)
-{
+inline void* DeviceCachingAllocator::allocate_and_cache(const size_t bytes) {
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   void* ptr;
   auto cuda_err = cudaMalloc(&ptr, bytes);
   if (cuda_err != cudaSuccess) {
     free_cached();
     cuda_err = cudaMalloc(&ptr, bytes);
-    if (cuda_err != cudaSuccess) { 
+    if (cuda_err != cudaSuccess) {
       DLOG_ERROR("cudaMalloc failed", bytes, cuda_err);
       throw std::runtime_error("cudaMalloc failed");
     }
@@ -36,16 +35,16 @@ inline void* DeviceCachingAllocator::allocate_and_cache(const size_t bytes)
   return ptr;
 }
 
-void* DeviceCachingAllocator::allocate(const size_t bytes)
-{
+void* DeviceCachingAllocator::allocate(const size_t bytes) {
   std::lock_guard<std::mutex> guard(mutex_);
   const auto& it = available_map_.find(bytes);
-  if (it == available_map_.end() || it->second.empty()) { return allocate_and_cache(bytes); }
+  if (it == available_map_.end() || it->second.empty()) {
+    return allocate_and_cache(bytes);
+  }
   return it->second.pop_back_val();
 }
 
-void DeviceCachingAllocator::free(void* ptr)
-{
+void DeviceCachingAllocator::free(void* ptr) {
   // NB: since we are not really freeing the memory
   // the cases such as quantization code freeing original weights
   // on mobile, will not quite work, as we likely will hold
@@ -66,8 +65,7 @@ void DeviceCachingAllocator::free(void* ptr)
   available_map_[alloc_size].push_back(ptr);
 }
 
-void DeviceCachingAllocator::record_free(void* ptr)
-{
+void DeviceCachingAllocator::record_free(void* ptr) {
   // This function captures the case when the allocated memory
   // is being freed outside the scope of this allocator.
   // At the moment only way to capture this is to have the allocator,
@@ -79,11 +77,12 @@ void DeviceCachingAllocator::record_free(void* ptr)
   // the case without caching allocator as well.
   std::lock_guard<std::mutex> guard(mutex_);
   const auto& it = allocation_map_.find(ptr);
-  if (it != allocation_map_.end()) { allocation_map_.erase(it); }
+  if (it != allocation_map_.end()) {
+    allocation_map_.erase(it);
+  }
 }
 
-void DeviceCachingAllocator::free_cached()
-{
+void DeviceCachingAllocator::free_cached() {
   for (const auto& it : available_map_) {
     for (const auto ptr : it.second) {
       //   c10::free_cpu(ptr);
@@ -100,8 +99,7 @@ DeviceCachingAllocator::~DeviceCachingAllocator() { free_cached(); }
 
 std::array<DeviceCachingAllocator*, 8> caching_allocators;
 
-DeviceCachingAllocator* get(int device_id)
-{
+DeviceCachingAllocator* get(int device_id) {
   if (device_id < 0 || device_id >= 8) {
     throw std::runtime_error("Invalid device_id");
   }

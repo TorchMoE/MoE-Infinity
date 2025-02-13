@@ -36,7 +36,8 @@ struct Node {
   std::size_t corr_id;
 
   torch::Device device = DISK_DEVICE;
-  torch::Device default_device = DEFAULT_CUDA_DEVICE;  // FIXME: should be set by scheduler
+  torch::Device default_device =
+      DEFAULT_CUDA_DEVICE;  // FIXME: should be set by scheduler
   torch::Device default_host = CPU_DEVICE;
   torch::Device initial_host = DISK_DEVICE;
 
@@ -57,11 +58,10 @@ struct Node {
   void* host_memory_ptr = nullptr;
   void* device_memory_ptr = nullptr;
 
-  public:
+ public:
   explicit Node();
   const std::string str() noexcept;
-  void SetDevice(const torch::Device& target_device,
-                 bool ondemand = false,
+  void SetDevice(const torch::Device& target_device, bool ondemand = false,
                  cudaStream_t stream = nullptr) noexcept;
 };
 
@@ -90,11 +90,13 @@ struct NodeBody {
   std::deque<std::size_t> visit_time;
   explicit NodeBody(NodePtr node) : node(node), visit_cnt(0) {}
 
-  std::string str() const noexcept
-  {
+  std::string str() const noexcept {
     std::stringstream ss;
-    ss << "NodeBody: " << node->str() << " visit_cnt " << visit_cnt << ", child visit [";
-    for (auto& visit : children_visit_cnt) { ss << visit << ","; }
+    ss << "NodeBody: " << node->str() << " visit_cnt " << visit_cnt
+       << ", child visit [";
+    for (auto& visit : children_visit_cnt) {
+      ss << visit << ",";
+    }
     ss << "]";
     return ss.str();
   }
@@ -110,8 +112,7 @@ struct Stage {
   Stage() : is_sparse(false), visit_cnt(0), byte_size(0) {}
   Stage(bool is_sparse) : is_sparse(is_sparse), visit_cnt(0), byte_size(0) {}
 
-  std::string str() const noexcept
-  {
+  std::string str() const noexcept {
     char buffer[1024];
     memset(buffer, 0, 1024);
     sprintf(buffer, "Stage[%ld,%ld,%d]", nodes.size(), visit_cnt, is_sparse);
@@ -124,17 +125,17 @@ struct Pipeline {
   std::vector<StagePtr> stages;
   std::size_t visit_cnt = 0;
 
-  std::string str() const noexcept
-  {
+  std::string str() const noexcept {
     std::stringstream ss;
-    ss << "Pipeline: " << stages.size() << " stages; visit_cnt " << visit_cnt << std::endl;
+    ss << "Pipeline: " << stages.size() << " stages; visit_cnt " << visit_cnt
+       << std::endl;
     return ss.str();
   }
 };
 typedef std::shared_ptr<Pipeline> PipelinePtr;
 
 class ArcherTopologyHandle : public base::noncopyable {
-  public:
+ public:
   DELETE_COPY_AND_ASSIGN(ArcherTopologyHandle);
 
   ArcherTopologyHandle();
@@ -153,7 +154,9 @@ class ArcherTopologyHandle : public base::noncopyable {
   std::uint64_t GetLastActivateStage(const HashID& hash_id);
 
   void InitializeTopology(
-    const std::vector<std::tuple<std::string, std::vector<std::vector<TensorID>>>>& topology);
+      const std::vector<
+          std::tuple<std::string, std::vector<std::vector<TensorID>>>>&
+          topology);
 
   void EnableTrace() noexcept { trace_enabled_ = true; }
   void DisableTrace() noexcept { trace_enabled_ = false; }
@@ -170,9 +173,11 @@ class ArcherTopologyHandle : public base::noncopyable {
 
   std::int64_t GetSparseCacheLimit(const torch::Device& device);
 
-  std::size_t GetNumberOfStages() const noexcept { return pipeline_.stages.size(); }
+  std::size_t GetNumberOfStages() const noexcept {
+    return pipeline_.stages.size();
+  }
 
-  private:
+ private:
   Pipeline pipeline_;
   std::unordered_set<HashID> visited_;
   std::unordered_map<HashID, std::uint64_t> last_active_stage_;
@@ -196,10 +201,8 @@ extern std::unique_ptr<ArcherTopologyHandle> kTopologyHandle;
 extern std::mutex kReadMutex;
 
 void SetModuleDisk(std::vector<TensorID>& tensor_ids);
-void SetModuleMemoryFromDisk(std::vector<TensorID>& tensor_ids,
-                             void* host_ptr,
+void SetModuleMemoryFromDisk(std::vector<TensorID>& tensor_ids, void* host_ptr,
                              bool on_demand = false);
 void SetModuleCudaMemoryFromCPU(std::vector<TensorID>& tensor_ids,
-                                void* device_ptr,
-                                const torch::Device& device);
+                                void* device_ptr, const torch::Device& device);
 void SetModuleMemoryFromCuda(std::vector<TensorID>& tensor_ids, void* host_ptr);
