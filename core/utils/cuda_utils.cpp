@@ -44,3 +44,10 @@ int CudaMemcpyAsync(void* dst, const void* src, size_t count,
                     cudaMemcpyKind kind, cudaStream_t stream) {
   return cudaMemcpyAsync(dst, src, count, kind, stream);
 }
+
+void BlockingCudaCopy(int device, void* dst, const void* src, size_t size,
+                      cudaMemcpyKind kind, cudaStream_t stream) {
+  CUDA_CHECK(cudaSetDevice(device));
+  CUDA_CHECK(cudaMemcpyAsync(dst, src, size, kind, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+}

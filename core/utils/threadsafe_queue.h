@@ -16,20 +16,18 @@ class ThreadSafeQueue : public base::noncopyable {
   ThreadSafeQueue& operator=(const ThreadSafeQueue&) = delete;
 
   // Pushes an item into the queue (thread-safe).
-  void Push(T item) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    queue_.push(std::move(item));
+  void Push(T& item) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      queue_.push(std::move(item));
+    }
     cond_.notify_one();
   }
 
   // Pops an item from the queue (blocking).
   bool Pop(T& item) {
     std::unique_lock<std::mutex> lock(mutex_);
-    cond_.wait(lock, [this] { return !queue_.empty() || stop_flag_; });
-
-    if (stop_flag_ && queue_.empty()) {
-      return false;  // Stop requested and queue is empty.
-    }
+    cond_.wait(lock, [this] { return !queue_.empty(); });
 
     item = std::move(queue_.front());
     queue_.pop();
@@ -53,16 +51,26 @@ class ThreadSafeQueue : public base::noncopyable {
     return queue_.empty();
   }
 
-  // Stops the queue (for graceful shutdown).
-  void Stop() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    stop_flag_ = true;
-    cond_.notify_all();
-  }
-
- private:
+ protected:
   std::queue<T> queue_;
   mutable std::mutex mutex_;
   std::condition_variable cond_;
-  bool stop_flag_ = false;
+};
+
+// recycling queue implementation, poped item is pushed back to the queue
+template <typename T>
+class ThreadSafeRecyclingQueue : public ThreadSafeQueue<T> {
+ public:
+  ThreadSafeRecyclingQueue() = default;
+
+  void Pop(T& item) override {
+    ThreadSafeQueue<T>::Pop(item);
+    Push(item);
+  }
+
+  bool TryPop(T& item) override {
+    bool success = ThreadSafeQueue<T>::TryPop(item);
+    Push(item);
+    return success;
+  }
 };
