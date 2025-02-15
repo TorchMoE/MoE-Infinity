@@ -22,6 +22,12 @@ int GetDeviceCount() {
   return device_count;
 }
 
+int GetDevice() {
+  int device_id;
+  cudaGetDevice(&device_id);
+  return device_id;
+}
+
 std::size_t GetTotalDeviceMemory(int device_id) {
   size_t free_memory, total_memory;
   cudaSetDevice(device_id);

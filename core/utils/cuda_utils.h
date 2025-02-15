@@ -7,6 +7,8 @@
 
 #include <cuda_runtime_api.h>
 #include <cstdint>
+#include <memory>
+#include <sstream>
 
 inline void throwOnCudaError(cudaError_t error, const char* file, int line,
                              const char* function, const char* call) {
@@ -22,6 +24,7 @@ inline void throwOnCudaError(cudaError_t error, const char* file, int line,
 #define CUDA_CHECK(call) \
   throwOnCudaError(call, __FILE__, __LINE__, __FUNCTION__, #call)
 
+int GetDevice();
 bool IsDevicePointer(const void* ptr);
 int GetDeviceCount();
 std::size_t GetTotalDeviceMemory(int device_id);
@@ -35,3 +38,27 @@ int CudaMemcpyAsync(void* dst, const void* src, size_t count,
                     cudaMemcpyKind kind, cudaStream_t stream = 0);
 void BlockingCudaCopy(int device, void* dst, const void* src, size_t size,
                       cudaMemcpyKind kind, cudaStream_t stream);
+
+struct CUDADeviceAllocator {
+  void* operator()(std::size_t size) {
+    void* ptr;
+    CUDA_CHECK(cudaMalloc(&ptr, size));
+    return ptr;
+  }
+};
+
+struct CUDADeviceDeleter {
+  void operator()(void* ptr) { CUDA_CHECK(cudaFree(ptr)); }
+};
+
+struct CUDAHostAllocator {
+  void* operator()(std::size_t size) {
+    void* ptr;
+    CUDA_CHECK(cudaHostAlloc(&ptr, size, cudaHostAllocDefault));
+    return ptr;
+  }
+};
+
+struct CUDAHostDeleter {
+  void operator()(void* ptr) { CUDA_CHECK(cudaFreeHost(ptr)); }
+};

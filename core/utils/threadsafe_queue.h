@@ -57,7 +57,7 @@ class ThreadSafeQueue : public base::noncopyable {
   std::condition_variable cond_;
 };
 
-// recycling queue implementation, poped item is pushed back to the queue
+// recycling queue implementation, popped item is pushed back to the queue
 template <typename T>
 class ThreadSafeRecyclingQueue : public ThreadSafeQueue<T> {
  public:
