@@ -289,8 +289,7 @@ class OffloadEngine(object):
                     self.offload_set.add(cls.classifier.weight.data.data_ptr())
 
             return archer_cast_classifier
-        
-        
+
         # GPTQ Override
         QuantLinear._old_init = QuantLinear.__init__
         QuantLinear.__init__ = param_init_decorator(QuantLinear.__init__)

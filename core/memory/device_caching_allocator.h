@@ -1,8 +1,8 @@
 // c10/mobile/CPUCachingAllocator.h
 //
 // Part of the Pytorch Project, under the BSD-3-Clause License.
-// See https://github.com/pytorch/pytorch/blob/main/LICENSE for license information.
-// SPDX-License-Identifier: BSD-3-Clause
+// See https://github.com/pytorch/pytorch/blob/main/LICENSE for license
+// information. SPDX-License-Identifier: BSD-3-Clause
 
 // MoE-Infinity: modified from c10::CPUCachingAllocator.
 // replaced CPUCachingAllocator with DeviceCachingAllocator
@@ -58,11 +58,11 @@ class DeviceCachingAllocator {
    * What it does not do:
    * No speculative allocation for any future allocations.
    */
-  private:
+ private:
   inline void* allocate_and_cache(const size_t bytes);
   void free_cached();
 
-  protected:
+ protected:
   // Invariants.
   // 1. If memory is ever allocated via this allocator then
   //    the pointer will exist in allocation_map_, unless the allocator
@@ -85,7 +85,7 @@ class DeviceCachingAllocator {
   // all public APIs we need a global mutex.
   static std::mutex mutex_;
 
-  public:
+ public:
   static void record_free(void* ptr);
   virtual ~DeviceCachingAllocator();
   // Checks the cache to see if allocation of size bytes can be found.

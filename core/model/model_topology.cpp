@@ -25,44 +25,36 @@
 // cudaStream_t kCudaStreamH2D = NULL;
 std::unique_ptr<ArcherTopologyHandle> kTopologyHandle = nullptr;
 
-const std::string Node::str() noexcept
-{
+const std::string Node::str() noexcept {
   // write same string using c style sprintf
   std::stringstream ss;
-  for (auto& tensor_id : tensor_ids) { ss << tensor_id << ","; }
+  for (auto& tensor_id : tensor_ids) {
+    ss << tensor_id << ",";
+  }
 
   char buffer[1024];
   memset(buffer, 0, 1024);
-  sprintf(buffer,
-          "ID[%ld,%lx] (%ldMB) STATE(%d) TENSOR[%s] DEVICE[%s;%s;%s];",
-          id,
-          corr_id,
-          byte_size / MB,
-          state.load(),
-          ss.str().c_str(),
-          device.str().c_str(),
-          default_device.str().c_str(),
+  sprintf(buffer, "ID[%ld,%lx] (%ldMB) STATE(%d) TENSOR[%s] DEVICE[%s;%s;%s];",
+          id, corr_id, byte_size / MB, state.load(), ss.str().c_str(),
+          device.str().c_str(), default_device.str().c_str(),
           default_host.str().c_str());
 
   return std::string(buffer);
 }
 
 Node::Node()
-  : corr_id(0),
-    byte_size(0),
-    last_access_time(MCIROSECONDS_SINCE_EPOCH),
-    device(DISK_DEVICE),
-    default_device(DEFAULT_CUDA_DEVICE)
-{
-}
+    : corr_id(0),
+      byte_size(0),
+      last_access_time(MCIROSECONDS_SINCE_EPOCH),
+      device(DISK_DEVICE),
+      default_device(DEFAULT_CUDA_DEVICE) {}
 
-void Node::SetDevice(const torch::Device& target_device,
-                     bool on_demand,
-                     cudaStream_t stream) noexcept
-{
+void Node::SetDevice(const torch::Device& target_device, bool on_demand,
+                     cudaStream_t stream) noexcept {
   DLOG_DEBUG("SetDevice: " + str() + " to " + target_device.str());
   if (device == target_device) {
-    DLOG_DEBUG("SetDevice: " + str() + " to " + target_device.str() + " but device is the same");
+    DLOG_DEBUG("SetDevice: " + str() + " to " + target_device.str() +
+               " but device is the same");
     return;
   }
 
@@ -73,10 +65,10 @@ void Node::SetDevice(const torch::Device& target_device,
   }
 
   // if (kCudaStreamH2D == NULL) {
-  //     auto cudaError = cudaStreamCreateWithFlags(&kCudaStreamH2D, cudaStreamNonBlocking);
-  //     if (cudaError != cudaSuccess) {
-  //         DLOG_ERROR("cudaStreamCreate failed: {}", cudaGetErrorString(cudaError));
-  //         exit(-1);
+  //     auto cudaError = cudaStreamCreateWithFlags(&kCudaStreamH2D,
+  //     cudaStreamNonBlocking); if (cudaError != cudaSuccess) {
+  //         DLOG_ERROR("cudaStreamCreate failed: {}",
+  //         cudaGetErrorString(cudaError)); exit(-1);
   //     }
   // }
 
@@ -94,8 +86,10 @@ void Node::SetDevice(const torch::Device& target_device,
     // both are null, which means the node is not initialized
     if (host_memory_ptr == nullptr && device_memory_ptr == nullptr) {
       // int numa_id =
-      //     default_device.index() / 4;  // TODO: 8 gpus, 2 numa nodes, so 4 gpus per numa
-      host_memory_ptr = kHostMemoryPool->AllocateMemory(id, byte_size, CPU_DEVICE);
+      //     default_device.index() / 4;  // TODO: 8 gpus, 2 numa nodes, so 4
+      //     gpus per numa
+      host_memory_ptr =
+          kHostMemoryPool->AllocateMemory(id, byte_size, CPU_DEVICE);
       assert(host_memory_ptr != nullptr);
 
       auto start_time = MCIROSECONDS_SINCE_EPOCH;
@@ -106,22 +100,25 @@ void Node::SetDevice(const torch::Device& target_device,
 
     if (target_device.is_cuda()) {
       // DLOG_DEBUG("Allocate GPU Memory for node {}", this->id);
-      device_memory_ptr = kDeviceMemoryPool->AllocateMemory(id, byte_size, target_device);
+      device_memory_ptr =
+          kDeviceMemoryPool->AllocateMemory(id, byte_size, target_device);
       // DLOG_DEBUG("Allocate GPU Memory for node {} done", this->id);
       assert(device_memory_ptr != nullptr);
       assert(host_memory_ptr != nullptr);
 
       auto start_time = MCIROSECONDS_SINCE_EPOCH;
       if (stream == nullptr) {
-        CudaMemcpy(device_memory_ptr, host_memory_ptr, byte_size, cudaMemcpyHostToDevice);
+        CudaMemcpy(device_memory_ptr, host_memory_ptr, byte_size,
+                   cudaMemcpyHostToDevice);
       } else {
-        CudaMemcpyAsync(
-          device_memory_ptr, host_memory_ptr, byte_size, cudaMemcpyHostToDevice, stream);
+        CudaMemcpyAsync(device_memory_ptr, host_memory_ptr, byte_size,
+                        cudaMemcpyHostToDevice, stream);
         cudaStreamSynchronize(stream);
       }
       SetModuleCudaMemoryFromCPU(tensor_ids, device_memory_ptr, target_device);
       auto end_time = MCIROSECONDS_SINCE_EPOCH;
-      DLOG_DEBUG("SetModuleCudaMemoryFromCPU time: {} us", end_time - start_time);
+      DLOG_DEBUG("SetModuleCudaMemoryFromCPU time: {} us",
+                 end_time - start_time);
     }
 
     if (target_device.is_cpu() && device.is_cuda()) {
@@ -139,38 +136,45 @@ void Node::SetDevice(const torch::Device& target_device,
 
 ArcherTopologyHandle::ArcherTopologyHandle() {}
 
-NodePtrList ArcherTopologyHandle::GetLFUNodes(const torch::Device& device)
-{
+NodePtrList ArcherTopologyHandle::GetLFUNodes(const torch::Device& device) {
   NodePtrList nodes;
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto node_body : lfu_nodes_) {
     CONTINUE_IF_NULL(node_body);
-    if (node_body->node->device == device) { nodes.push_back(node_body->node); }
+    if (node_body->node->device == device) {
+      nodes.push_back(node_body->node);
+    }
   }
   return nodes;
 }
 
-NodePtrList ArcherTopologyHandle::GetDenseNodes()
-{
+NodePtrList ArcherTopologyHandle::GetDenseNodes() {
   NodePtrList nodes;
   for (auto stage : pipeline_.stages) {
-    if (stage->is_sparse) { continue; }
-    for (auto node_body : stage->nodes) { nodes.push_back(node_body->node); }
+    if (stage->is_sparse) {
+      continue;
+    }
+    for (auto node_body : stage->nodes) {
+      nodes.push_back(node_body->node);
+    }
   }
   return nodes;
 }
-NodePtrList ArcherTopologyHandle::GetSparseNodes()
-{
+NodePtrList ArcherTopologyHandle::GetSparseNodes() {
   NodePtrList nodes;
   for (auto stage : pipeline_.stages) {
-    if (!stage->is_sparse) { continue; }
-    for (auto node_body : stage->nodes) { nodes.push_back(node_body->node); }
+    if (!stage->is_sparse) {
+      continue;
+    }
+    for (auto node_body : stage->nodes) {
+      nodes.push_back(node_body->node);
+    }
   }
   return nodes;
 }
 
-NodePtrList ArcherTopologyHandle::GetDenseNodes(const NodePtr& node, const std::size_t& k)
-{
+NodePtrList ArcherTopologyHandle::GetDenseNodes(const NodePtr& node,
+                                                const std::size_t& k) {
   NodePtrList nodes;
 
   std::size_t low_corr_id = node->corr_id & 0xFFFFFFFF;  // stage id
@@ -188,7 +192,9 @@ NodePtrList ArcherTopologyHandle::GetDenseNodes(const NodePtr& node, const std::
     // Due to MoE design, we only process layer by layer
     auto stage = pipeline_.stages[low_corr_id];
     low_corr_id++;
-    if (stage->is_sparse) { continue; }
+    if (stage->is_sparse) {
+      continue;
+    }
 
     nodes.push_back(stage->nodes[0]->node);
     count++;
@@ -196,8 +202,8 @@ NodePtrList ArcherTopologyHandle::GetDenseNodes(const NodePtr& node, const std::
   return nodes;
 }
 
-NodePtrList ArcherTopologyHandle::GetSparseNodes(const NodePtr& node, const std::size_t& k)
-{
+NodePtrList ArcherTopologyHandle::GetSparseNodes(const NodePtr& node,
+                                                 const std::size_t& k) {
   NodePtrList nodes;
 
   std::size_t low_corr_id = node->corr_id & 0xFFFFFFFF;  // stage id
@@ -216,7 +222,9 @@ NodePtrList ArcherTopologyHandle::GetSparseNodes(const NodePtr& node, const std:
     auto stage = pipeline_.stages[low_corr_id];
 
     low_corr_id++;
-    if (!stage->is_sparse) { continue; }
+    if (!stage->is_sparse) {
+      continue;
+    }
 
     nodes.push_back(stage->nodes[0]->node);
     count++;
@@ -224,16 +232,18 @@ NodePtrList ArcherTopologyHandle::GetSparseNodes(const NodePtr& node, const std:
   return nodes;
 }
 
-std::uint64_t ArcherTopologyHandle::GetLastActivateStage(const HashID& hash_id)
-{
+std::uint64_t ArcherTopologyHandle::GetLastActivateStage(
+    const HashID& hash_id) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = last_active_stage_.find(hash_id);
-  if (it == last_active_stage_.end()) { return 0; }
+  if (it == last_active_stage_.end()) {
+    return 0;
+  }
   return it->second;
 }
 
-std::vector<std::vector<std::size_t>> ArcherTopologyHandle::GetNodeVisitCounts()
-{
+std::vector<std::vector<std::size_t>>
+ArcherTopologyHandle::GetNodeVisitCounts() {
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::vector<std::size_t>> node_visit_counts;
   for (auto& stage : pipeline_.stages) {
@@ -256,8 +266,7 @@ std::vector<std::vector<std::size_t>> ArcherTopologyHandle::GetNodeVisitCounts()
   return node_visit_counts;
 }
 
-std::vector<std::size_t> ArcherTopologyHandle::GetChildVisitCounts()
-{
+std::vector<std::size_t> ArcherTopologyHandle::GetChildVisitCounts() {
   std::lock_guard<std::mutex> lock(mutex_);
   int num_layers = 0;
   int num_experts = 0;
@@ -267,7 +276,8 @@ std::vector<std::size_t> ArcherTopologyHandle::GetChildVisitCounts()
       num_experts = stage->nodes.size();
     }
   }
-  std::vector<std::size_t> child_visit_counts((num_layers - 1) * num_experts * num_experts);
+  std::vector<std::size_t> child_visit_counts((num_layers - 1) * num_experts *
+                                              num_experts);
   int layer_idx = 0;
   int parent_idx = 0;
   int expert_idx = 0;
@@ -276,8 +286,8 @@ std::vector<std::size_t> ArcherTopologyHandle::GetChildVisitCounts()
       for (auto& node : stage->nodes) {
         if (node->children.size() > 0) {
           for (auto& count : node->children_visit_cnt) {
-            child_visit_counts[layer_idx * num_experts * num_experts + parent_idx * num_experts +
-                               expert_idx] = count;
+            child_visit_counts[layer_idx * num_experts * num_experts +
+                               parent_idx * num_experts + expert_idx] = count;
             expert_idx++;
           }
         }
@@ -292,8 +302,8 @@ std::vector<std::size_t> ArcherTopologyHandle::GetChildVisitCounts()
   return child_visit_counts;
 }
 
-void ArcherTopologyHandle::SetNodeVisitCounts(const std::vector<std::size_t>& visit_counts)
-{
+void ArcherTopologyHandle::SetNodeVisitCounts(
+    const std::vector<std::size_t>& visit_counts) {
   std::lock_guard<std::mutex> lock(mutex_);
   std::size_t num_nodes = 0;
   std::size_t num_experts = 0;
@@ -304,7 +314,8 @@ void ArcherTopologyHandle::SetNodeVisitCounts(const std::vector<std::size_t>& vi
     }
   }
   if (visit_counts.size() != num_nodes) {
-    DLOG_ERROR("visit_counts size {} not equal to num_nodes {}", visit_counts.size(), num_nodes);
+    DLOG_ERROR("visit_counts size {} not equal to num_nodes {}",
+               visit_counts.size(), num_nodes);
     return;
   }
 
@@ -323,8 +334,8 @@ void ArcherTopologyHandle::SetNodeVisitCounts(const std::vector<std::size_t>& vi
 
   DisableTrace();
 }
-void ArcherTopologyHandle::SetChildVisitCounts(const std::vector<std::size_t>& visit_counts)
-{
+void ArcherTopologyHandle::SetChildVisitCounts(
+    const std::vector<std::size_t>& visit_counts) {
   std::lock_guard<std::mutex> lock(mutex_);
   std::size_t num_layers = 0;
   std::size_t num_experts = 0;
@@ -335,7 +346,8 @@ void ArcherTopologyHandle::SetChildVisitCounts(const std::vector<std::size_t>& v
     }
   }
   if (visit_counts.size() != (num_layers - 1) * num_experts * num_experts) {
-    DLOG_ERROR("visit_counts size {} not equal to num_layers {}", visit_counts.size(), num_layers);
+    DLOG_ERROR("visit_counts size {} not equal to num_layers {}",
+               visit_counts.size(), num_layers);
     return;
   }
 
@@ -347,8 +359,8 @@ void ArcherTopologyHandle::SetChildVisitCounts(const std::vector<std::size_t>& v
       for (auto& node : stage->nodes) {
         if (node->children.size() > 0) {
           for (auto& count : node->children_visit_cnt) {
-            count = visit_counts[layer_idx * num_experts * num_experts + parent_idx * num_experts +
-                                 expert_idx];
+            count = visit_counts[layer_idx * num_experts * num_experts +
+                                 parent_idx * num_experts + expert_idx];
             expert_idx++;
           }
         }
@@ -363,30 +375,33 @@ void ArcherTopologyHandle::SetChildVisitCounts(const std::vector<std::size_t>& v
   DisableTrace();
 }
 
-bool ArcherTopologyHandle::IsLastNode(const NodePtr& node)
-{
+bool ArcherTopologyHandle::IsLastNode(const NodePtr& node) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto last_stage_ptr = pipeline_.stages.back();
   auto& nodes = last_stage_ptr->nodes;
   for (auto& n : nodes) {
-    if (n->node == node) { return true; }
+    if (n->node == node) {
+      return true;
+    }
   }
   return false;
 }
-bool ArcherTopologyHandle::IsFirstNode(const NodePtr& node)
-{
+bool ArcherTopologyHandle::IsFirstNode(const NodePtr& node) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto first_stage_ptr = pipeline_.stages.front();
   auto& nodes = first_stage_ptr->nodes;
   for (auto& n : nodes) {
-    if (n->node == node) { return true; }
+    if (n->node == node) {
+      return true;
+    }
   }
   return false;
 }
 
 void ArcherTopologyHandle::InitializeTopology(
-  const std::vector<std::tuple<std::string, std::vector<std::vector<TensorID>>>>& topology)
-{
+    const std::vector<
+        std::tuple<std::string, std::vector<std::vector<TensorID>>>>&
+        topology) {
   std::lock_guard<std::mutex> lock(mutex_);
   pipeline_.stages.clear();
   std::size_t node_id = 0;
@@ -410,7 +425,8 @@ void ArcherTopologyHandle::InitializeTopology(
       for (auto& tensor_id : tensor_ids) {
         auto it = kTensorIndex->find(tensor_id);
         if (it != kTensorIndex->end()) {
-          std::int64_t size_aligned = (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
+          std::int64_t size_aligned =
+              (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
           byte_size += size_aligned;
         } else {
           DLOG_ERROR("Tensor {} not found in tensor index", tensor_id);
@@ -418,7 +434,8 @@ void ArcherTopologyHandle::InitializeTopology(
       }
       node_ptr->byte_size = byte_size;
       node_ptr->id = node_id;
-      node_ptr->corr_id = (layer_id & 0xFFFFFFFF) | ((expert_id & 0xFFFFFFFF) << 32);
+      node_ptr->corr_id =
+          (layer_id & 0xFFFFFFFF) | ((expert_id & 0xFFFFFFFF) << 32);
       node_ptr->is_sparse = stage_ptr->is_sparse;
 
       all_nodes.push_back(node_ptr);
@@ -457,35 +474,40 @@ void ArcherTopologyHandle::InitializeTopology(
   // set last stage nodes corr_id higher 32 bits to be 0xFFFFFFFF
   auto last_stage_ptr = pipeline_.stages.back();
   for (auto& node_body : last_stage_ptr->nodes) {
-    node_body->node->corr_id = (node_body->node->corr_id & 0xFFFFFFFF) | (UINT64_MAX << 32);
+    node_body->node->corr_id =
+        (node_body->node->corr_id & 0xFFFFFFFF) | (UINT64_MAX << 32);
   }
 
   // output every tensor id in node
   for (auto& stage : pipeline_.stages) {
     for (auto& node : stage->nodes) {
       std::stringstream ss;
-      for (auto& tensor_id : node->node->tensor_ids) { ss << tensor_id << " "; }
+      for (auto& tensor_id : node->node->tensor_ids) {
+        ss << tensor_id << " ";
+      }
       // DLOG_DEBUG("Node {} tensor ids {}", node->node->id, ss.str());
       lfu_nodes_.push_back(node);
     }
   }
 
-  DLOG_DEBUG("InitializeTopology pipeline_.stages.size() {}", pipeline_.stages.size());
+  DLOG_DEBUG("InitializeTopology pipeline_.stages.size() {}",
+             pipeline_.stages.size());
 
   // Model placement
   auto num_gpu = GetDeviceCount();
   std::vector<std::int64_t> free_device_mem(num_gpu, 0);
   for (int i = 0; i < num_gpu; i++) {
-    free_device_mem[i] = kDeviceMemoryPool->GetMemoryCapacity(torch::Device(torch::kCUDA, i));
+    free_device_mem[i] =
+        kDeviceMemoryPool->GetMemoryCapacity(torch::Device(torch::kCUDA, i));
   }
 
   auto sparse_nodes = GetSparseNodes();
   auto dense_nodes = GetDenseNodes();
 
-  DLOG_DEBUG("InitializeTopology num_gpu {} sparse_nodes.size() {} dense_nodes.size() {}",
-             num_gpu,
-             sparse_nodes.size(),
-             dense_nodes.size());
+  DLOG_DEBUG(
+      "InitializeTopology num_gpu {} sparse_nodes.size() {} dense_nodes.size() "
+      "{}",
+      num_gpu, sparse_nodes.size(), dense_nodes.size());
 
   int target_device_id = 0;
   // int dense_gpu_idx = 0;
@@ -511,18 +533,18 @@ void ArcherTopologyHandle::InitializeTopology(
     target_device_id = (target_device_id + 1) % num_gpu;
   }
 
-  DLOG_DEBUG("InitializeTopology pipeline_.stages.size() {}", pipeline_.stages.size());
+  DLOG_DEBUG("InitializeTopology pipeline_.stages.size() {}",
+             pipeline_.stages.size());
 
   for (auto& node_ptr : all_nodes) {
-    DLOG_DEBUG(
-      "Node {} {} device {}", node_ptr->id, node_ptr->is_sparse, node_ptr->default_device.str());
+    DLOG_DEBUG("Node {} {} device {}", node_ptr->id, node_ptr->is_sparse,
+               node_ptr->default_device.str());
   }
 
   EnableTrace();
 }
 
-NodePtr ArcherTopologyHandle::GetNodeFromTensorID(const TensorID& tensor_id)
-{
+NodePtr ArcherTopologyHandle::GetNodeFromTensorID(const TensorID& tensor_id) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto it = tensor_id_to_node_.find(tensor_id);
@@ -545,12 +567,14 @@ NodePtr ArcherTopologyHandle::GetNodeFromTensorID(const TensorID& tensor_id)
   return nullptr;
 }
 
-NodeBodyPtr ArcherTopologyHandle::GetNodeBodyFromCorrID(const std::uint64_t& correlation_id)
-{
+NodeBodyPtr ArcherTopologyHandle::GetNodeBodyFromCorrID(
+    const std::uint64_t& correlation_id) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  std::uint64_t high_corr_id = correlation_id >> 32;        // For children in the same level
-  std::uint64_t low_corr_id = correlation_id & 0xFFFFFFFF;  // For model inference pipeline
+  std::uint64_t high_corr_id =
+      correlation_id >> 32;  // For children in the same level
+  std::uint64_t low_corr_id =
+      correlation_id & 0xFFFFFFFF;  // For model inference pipeline
 
   bool is_last_node = (0xFFFFFFFF == high_corr_id);
   if (is_last_node) {
@@ -563,26 +587,29 @@ NodeBodyPtr ArcherTopologyHandle::GetNodeBodyFromCorrID(const std::uint64_t& cor
   return node_body;
 }
 
-std::int64_t ArcherTopologyHandle::GetSparseCacheLimit(const torch::Device& device)
-{
+std::int64_t ArcherTopologyHandle::GetSparseCacheLimit(
+    const torch::Device& device) {
   std::int64_t dense_cache_size = 0;
   for (auto& stage : pipeline_.stages) {
     for (auto& node_body : stage->nodes) {
       if (stage->is_sparse) continue;
-      if (node_body->node->device == device) { dense_cache_size += node_body->node->byte_size; }
+      if (node_body->node->device == device) {
+        dense_cache_size += node_body->node->byte_size;
+      }
     }
   }
 
-  std::int64_t device_size_limit = (device.is_cuda()) ? kDeviceMemoryPool->GetMemoryCapacity(device)
-                                                      : kHostMemoryPool->GetMemoryCapacity();
+  std::int64_t device_size_limit =
+      (device.is_cuda()) ? kDeviceMemoryPool->GetMemoryCapacity(device)
+                         : kHostMemoryPool->GetMemoryCapacity();
   assert(device_size_limit > dense_cache_size);
   std::int64_t sparse_cache_size = device_size_limit - dense_cache_size;
 
   return sparse_cache_size;
 }
 
-std::tuple<std::size_t, std::size_t> ArcherTopologyHandle::GetNumLayersAndExperts()
-{
+std::tuple<std::size_t, std::size_t>
+ArcherTopologyHandle::GetNumLayersAndExperts() {
   std::lock_guard<std::mutex> lock(mutex_);
   int num_layers = 0;
   int num_experts = 0;
@@ -597,8 +624,7 @@ std::tuple<std::size_t, std::size_t> ArcherTopologyHandle::GetNumLayersAndExpert
 
 // CPU, GPU -> DISK
 // Moves tensors from CPU/GPU to disk.
-void SetModuleDisk(std::vector<TensorID>& tensor_ids)
-{
+void SetModuleDisk(std::vector<TensorID>& tensor_ids) {
   // DLOG_DEBUG("SetModuleDisk {} tensors", tensor_ids.size());
   for (const auto& tensor_id : tensor_ids) {
     // void* old_ptr = kTensorIndex->find(tensor_id)->second.tensor.data_ptr();
@@ -615,70 +641,77 @@ void SetModuleDisk(std::vector<TensorID>& tensor_ids)
 std::mutex kReadMutex;
 
 // DISK -> CPU
-void SetModuleMemoryFromDisk(std::vector<TensorID>& tensor_ids, void* host_ptr, bool on_demand)
-{
+void SetModuleMemoryFromDisk(std::vector<TensorID>& tensor_ids, void* host_ptr,
+                             bool on_demand) {
   std::int64_t param_size = 0;
   for (const auto& tensor_id : tensor_ids) {
     // void* old_ptr = kTensorIndex->find(tensor_id)->second.tensor.data_ptr();
-    kArcherTensorHandle->ReadTensor(tensor_id, (void*)((char*)host_ptr + param_size), on_demand);
+    kArcherTensorHandle->ReadTensor(
+        tensor_id, (void*)((char*)host_ptr + param_size), on_demand);
     auto it = kTensorIndex->find(tensor_id);
     auto options = torch::TensorOptions()
-                     .dtype(it->second.options.dtype())
-                     .layout(it->second.options.layout())
-                     .device(torch::kCPU)
-                     .requires_grad(it->second.options.requires_grad())
-                     .pinned_memory(it->second.options.pinned_memory());
+                       .dtype(it->second.options.dtype())
+                       .layout(it->second.options.layout())
+                       .device(torch::kCPU)
+                       .requires_grad(it->second.options.requires_grad())
+                       .pinned_memory(it->second.options.pinned_memory());
 
     DLOG_DEBUG("SetModuleMemoryFromDisk tensor {}", it->second.DebugString());
-    auto tensor_tmp = torch::from_blob(
-      (void*)((char*)host_ptr + param_size), it->second.shape, DoNothingDeleter<void>{}, options);
-    if (!it->second.tensor.defined()) { it->second.tensor = torch::zeros({1}, options); }
+    auto tensor_tmp =
+        torch::from_blob((void*)((char*)host_ptr + param_size),
+                         it->second.shape, DoNothingDeleter<void>{}, options);
+    if (!it->second.tensor.defined()) {
+      it->second.tensor = torch::zeros({1}, options);
+    }
     it->second.tensor.set_data(tensor_tmp);
-    std::int64_t size_aligned = (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
+    std::int64_t size_aligned =
+        (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
     param_size += size_aligned;
   }
 }
 
 // CPU -> GPU
 void SetModuleCudaMemoryFromCPU(std::vector<TensorID>& tensor_ids,
-                                void* device_ptr,
-                                const torch::Device& device)
-{
+                                void* device_ptr, const torch::Device& device) {
   // DLOG_DEBUG("SetModuleCudaMemoryFromCPU {} tensors", tensor_ids.size());
   std::int64_t param_size = 0;
   for (const auto& tensor_id : tensor_ids) {
     auto it = kTensorIndex->find(tensor_id);
-    DLOG_DEBUG(
-      "SetModuleCudaMemoryFromCPU tensor {} -> {}", it->second.DebugString(), device.str());
+    DLOG_DEBUG("SetModuleCudaMemoryFromCPU tensor {} -> {}",
+               it->second.DebugString(), device.str());
     auto tensor_options = torch::TensorOptions()
-                            .dtype(it->second.options.dtype())
-                            .layout(it->second.options.layout())
-                            .device(device)
-                            .requires_grad(it->second.options.requires_grad())
-                            .pinned_memory(false);
-    it->second.tensor.set_data(torch::from_blob(
-      (char*)device_ptr + param_size, it->second.shape, DoNothingDeleter<void>{}, tensor_options));
-    std::int64_t size_aligned = (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
+                              .dtype(it->second.options.dtype())
+                              .layout(it->second.options.layout())
+                              .device(device)
+                              .requires_grad(it->second.options.requires_grad())
+                              .pinned_memory(false);
+    it->second.tensor.set_data(
+        torch::from_blob((char*)device_ptr + param_size, it->second.shape,
+                         DoNothingDeleter<void>{}, tensor_options));
+    std::int64_t size_aligned =
+        (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
     param_size += size_aligned;
   }
-  // DLOG_DEBUG("SetModuleCudaMemoryFromCPU {} tensors done", tensor_ids.size());
+  // DLOG_DEBUG("SetModuleCudaMemoryFromCPU {} tensors done",
+  // tensor_ids.size());
 }
 
 // GPU -> CPU
-void SetModuleMemoryFromCuda(std::vector<TensorID>& tensor_ids, void* host_ptr)
-{
+void SetModuleMemoryFromCuda(std::vector<TensorID>& tensor_ids,
+                             void* host_ptr) {
   std::int64_t param_size = 0;
   for (const auto& tensor_id : tensor_ids) {
     // void* old_ptr = kTensorIndex->find(tensor_id)->second.tensor.data_ptr();
 
     auto it = kTensorIndex->find(tensor_id);
     DLOG_DEBUG("SetModuleMemoryFromCuda tensor {}", it->second.DebugString());
-    it->second.tensor.set_data(torch::from_blob((char*)host_ptr + param_size,
-                                                it->second.shape,
-                                                DoNothingDeleter<void>{},
-                                                it->second.options));
-    // kArcherTensorHandle->UpdateTensorMap(old_ptr, it->second.tensor.data_ptr());
-    std::int64_t size_aligned = (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
+    it->second.tensor.set_data(
+        torch::from_blob((char*)host_ptr + param_size, it->second.shape,
+                         DoNothingDeleter<void>{}, it->second.options));
+    // kArcherTensorHandle->UpdateTensorMap(old_ptr,
+    // it->second.tensor.data_ptr());
+    std::int64_t size_aligned =
+        (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
     param_size += size_aligned;
   }
   // DLOG_DEBUG("SetModuleMemoryFromCuda {} tensors done", tensor_ids.size());

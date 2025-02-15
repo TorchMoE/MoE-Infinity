@@ -13,6 +13,7 @@
 # MoE-Infinity: replaced AsyncIOBuilder with PrefetchBuilder
 
 import glob
+import os
 
 from .builder import OpBuilder
 
@@ -28,8 +29,6 @@ class PrefetchBuilder(OpBuilder):
         return f"moe_infinity.ops.prefetch.{self.NAME}_op"
 
     def sources(self):
-        base_src = list(glob.glob("core/base/*.cc", recursive=False))
-
         return [
             "core/utils/logger.cpp",
             "core/utils/cuda_utils.cpp",
@@ -50,7 +49,19 @@ class PrefetchBuilder(OpBuilder):
             "core/aio/archer_aio_threadpool.cpp",
             "core/aio/archer_tensor_handle.cpp",
             "core/aio/archer_tensor_index.cpp",
-        ] + base_src
+            "core/base/thread.cc",
+            "core/base/exception.cc",
+            "core/base/date.cc",
+            "core/base/process_info.cc",
+            "core/base/logging.cc",
+            "core/base/log_file.cc",
+            "core/base/timestamp.cc",
+            "core/base/file_util.cc",
+            "core/base/countdown_latch.cc",
+            "core/base/timezone.cc",
+            "core/base/log_stream.cc",
+            "core/base/thread_pool.cc",
+        ]
 
     def include_paths(self):
         return ["core"]

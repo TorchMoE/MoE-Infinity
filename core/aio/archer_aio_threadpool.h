@@ -10,7 +10,7 @@
 #include "archer_aio_thread.h"
 
 class ArcherAioThreadPool {
-  public:
+ public:
   explicit ArcherAioThreadPool(int num_threads);
   ~ArcherAioThreadPool();
 
@@ -20,7 +20,7 @@ class ArcherAioThreadPool {
   void Enqueue(AioCallback& callback, int thread_id = -1);
   void Wait();
 
-  private:
+ private:
   int num_threads_;
   std::vector<std::unique_ptr<ArcherAioThread>> threads_;
 };

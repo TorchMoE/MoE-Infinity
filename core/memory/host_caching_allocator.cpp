@@ -1,8 +1,8 @@
 //===- c10/mobile/CPUCachingAllocator.cpp ----------------===//
 //
 // Part of the Pytorch Project, under the BSD 3-Clause License.
-// See https://github.com/pytorch/pytorch/blob/main/LICENSE for license information.
-// SPDX-License-Identifier: BSD 3-Clause
+// See https://github.com/pytorch/pytorch/blob/main/LICENSE for license
+// information. SPDX-License-Identifier: BSD 3-Clause
 
 // MoE-Infinity: modified from c10::CPUCachingAllocator.
 // replaced c10::alloc_cpu with cudaHostAlloc
@@ -17,31 +17,32 @@ namespace HostCachingAllocator {
 std::mutex HostCachingAllocator::mutex_;
 ska::flat_hash_map<void*, size_t> HostCachingAllocator::allocation_map_;
 
-inline void* HostCachingAllocator::allocate_and_cache(const size_t bytes)
-{
+inline void* HostCachingAllocator::allocate_and_cache(const size_t bytes) {
   // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
   void* ptr;
   auto cuda_err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
   if (cuda_err != cudaSuccess) {
     free_cached();
     cuda_err = cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault);
-    if (cuda_err != cudaSuccess) { throw std::runtime_error("cudaHostAlloc failed"); }
+    if (cuda_err != cudaSuccess) {
+      throw std::runtime_error("cudaHostAlloc failed");
+    }
   }
 
   allocation_map_[ptr] = bytes;
   return ptr;
 }
 
-void* HostCachingAllocator::allocate(const size_t bytes)
-{
+void* HostCachingAllocator::allocate(const size_t bytes) {
   std::lock_guard<std::mutex> guard(mutex_);
   const auto& it = available_map_.find(bytes);
-  if (it == available_map_.end() || it->second.empty()) { return allocate_and_cache(bytes); }
+  if (it == available_map_.end() || it->second.empty()) {
+    return allocate_and_cache(bytes);
+  }
   return it->second.pop_back_val();
 }
 
-void HostCachingAllocator::free(void* ptr)
-{
+void HostCachingAllocator::free(void* ptr) {
   // NB: since we are not really freeing the memory
   // the cases such as quantization code freeing original weights
   // on mobile, will not quite work, as we likely will hold
@@ -62,8 +63,7 @@ void HostCachingAllocator::free(void* ptr)
   available_map_[alloc_size].push_back(ptr);
 }
 
-void HostCachingAllocator::record_free(void* ptr)
-{
+void HostCachingAllocator::record_free(void* ptr) {
   // This function captures the case when the allocated memory
   // is being freed outside the scope of this allocator.
   // At the moment only way to capture this is to have the allocator,
@@ -75,11 +75,12 @@ void HostCachingAllocator::record_free(void* ptr)
   // the case without caching allocator as well.
   std::lock_guard<std::mutex> guard(mutex_);
   const auto& it = allocation_map_.find(ptr);
-  if (it != allocation_map_.end()) { allocation_map_.erase(it); }
+  if (it != allocation_map_.end()) {
+    allocation_map_.erase(it);
+  }
 }
 
-void HostCachingAllocator::free_cached()
-{
+void HostCachingAllocator::free_cached() {
   for (const auto& it : available_map_) {
     for (const auto ptr : it.second) {
       //   c10::free_cpu(ptr);
@@ -96,9 +97,10 @@ HostCachingAllocator::~HostCachingAllocator() { free_cached(); }
 
 HostCachingAllocator* caching_allocator = new HostCachingAllocator();
 
-HostCachingAllocator* get()
-{
-  if (caching_allocator == nullptr) { caching_allocator = new HostCachingAllocator(); }
+HostCachingAllocator* get() {
+  if (caching_allocator == nullptr) {
+    caching_allocator = new HostCachingAllocator();
+  }
   return caching_allocator;
 }
 

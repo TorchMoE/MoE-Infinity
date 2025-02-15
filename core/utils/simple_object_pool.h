@@ -7,7 +7,8 @@
 
 /** Pool for objects that cannot be used from different threads simultaneously.
  * Allows to create an object for each thread.
- * Pool has unbounded size and objects are not destroyed before destruction of pool.
+ * Pool has unbounded size and objects are not destroyed before destruction of
+ * pool.
  *
  * Use it in cases when thread local storage is not appropriate
  *  (when maximum number of simultaneously used objects is less
@@ -16,7 +17,7 @@
  */
 template <typename T>
 class SimpleObjectPool {
-  protected:
+ protected:
   /// Hold all available objects in stack.
   std::mutex mutex;
   std::stack<std::unique_ptr<T>> stack;
@@ -26,23 +27,22 @@ class SimpleObjectPool {
   struct Deleter {
     SimpleObjectPool<T>* parent;
 
-    Deleter(SimpleObjectPool<T>* parent_ = nullptr) : parent{parent_} {}  /// NOLINT
+    Deleter(SimpleObjectPool<T>* parent_ = nullptr)
+        : parent{parent_} {}  /// NOLINT
 
-    void operator()(T* owning_ptr) const
-    {
+    void operator()(T* owning_ptr) const {
       std::lock_guard<std::mutex> lock{parent->mutex};
       parent->stack.emplace(owning_ptr);
     }
   };
 
-  public:
+ public:
   using Pointer = std::unique_ptr<T, Deleter>;
 
   /// Extracts and returns a pointer from the stack if it's not empty,
   ///  creates a new one by calling provided f() otherwise.
   template <typename Factory>
-  Pointer get(Factory&& f)
-  {
+  Pointer get(Factory&& f) {
     std::unique_lock<std::mutex> lock(mutex);
 
     if (stack.empty()) {
@@ -59,8 +59,7 @@ class SimpleObjectPool {
   /// Return a vector of pointers from the stack if it's not empty,
   ///  creates a new one by calling provided f() otherwise.
   template <typename Factory>
-  std::vector<Pointer> getMany(size_t count, Factory&& f)
-  {
+  std::vector<Pointer> getMany(size_t count, Factory&& f) {
     std::unique_lock<std::mutex> lock(mutex);
 
     std::vector<Pointer> result;
@@ -86,14 +85,12 @@ class SimpleObjectPool {
   }
 
   /// Like get(), but creates object using default constructor.
-  Pointer getDefault()
-  {
+  Pointer getDefault() {
     return get([] { return new T; });
   }
 
   /// Like getMany(), but creates objects using default constructor.
-  std::vector<Pointer> getDefaultMany(size_t count)
-  {
+  std::vector<Pointer> getDefaultMany(size_t count) {
     return getMany(count, [] { return new T; });
   }
 };

@@ -17,8 +17,7 @@
 
 ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                                            const double device_memory_ratio)
-  : prefix_(prefix), last_layer_id_(0), has_cleaned_up_resources_(false)
-{
+    : prefix_(prefix), last_layer_id_(0), has_cleaned_up_resources_(false) {
   // InitLogger();
   kTensorIndex = std::make_unique<ArcherTensorIndex>();
   kArcherTensorHandle = std::make_unique<ArcherTensorHandle>(prefix);
@@ -27,9 +26,12 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
   kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
   kHostMemoryPool = std::make_unique<HostMemoryPool>();
   kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
-  DLOG_DEBUG("Free Device Memory ", kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
+  DLOG_DEBUG("Free Device Memory ",
+             kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
 
-  if (prefix_.back() != '/') { prefix_ += '/'; }
+  if (prefix_.back() != '/') {
+    prefix_ += '/';
+  }
 
   // enable peer access for kernels
   int device_count = 0;
@@ -61,14 +63,14 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
   DLOG_INFO("Enabled peer access for all devices");
 }
 
-ArcherPrefetchHandle::~ArcherPrefetchHandle()
-{
+ArcherPrefetchHandle::~ArcherPrefetchHandle() {
   // served as a global manager for order of destruction
-  if (!has_cleaned_up_resources_) { CleanUpResources(); }
+  if (!has_cleaned_up_resources_) {
+    CleanUpResources();
+  }
 }
 
-void ArcherPrefetchHandle::CleanUpResources()
-{
+void ArcherPrefetchHandle::CleanUpResources() {
   kTaskPool.reset();
   kArcherTensorHandle.reset();
   kTensorIndex.reset();
@@ -78,8 +80,8 @@ void ArcherPrefetchHandle::CleanUpResources()
   has_cleaned_up_resources_ = true;
 }
 
-void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tensor& buffer)
-{
+void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id,
+                                         torch::Tensor& buffer) {
   auto tensor_id = kArcherTensorHandle->GetTensorId((void*)buffer.data_ptr());
   void* old_ptr = (void*)buffer.data_ptr();
   DLOG_DEBUG("Acquire tensor ", tensor_id, old_ptr);
@@ -91,10 +93,14 @@ void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tenso
   if (node_id_to_tensor_ids_.find(node->id) == node_id_to_tensor_ids_.end() ||
       node_id_to_tensor_ids_[node->id].size() == 0) {
     node_id_to_tensor_ids_[node->id] = std::unordered_set<std::uint32_t>();
-    for (auto& tensor_id : node->tensor_ids) { node_id_to_tensor_ids_[node->id].insert(tensor_id); }
+    for (auto& tensor_id : node->tensor_ids) {
+      node_id_to_tensor_ids_[node->id].insert(tensor_id);
+    }
 
     auto node_body = kTopologyHandle->GetNodeBodyFromCorrID(node->corr_id);
-    if (node->device.is_cuda()) { node_body->gpu_hit_cnt++; }
+    if (node->device.is_cuda()) {
+      node_body->gpu_hit_cnt++;
+    }
 
     // always lock node, wait for previous prefetch task to finish
     node->mutex.lock();
@@ -113,8 +119,8 @@ void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id, torch::Tenso
   kArcherTensorHandle->SetTensor(tensor_id, buffer);
   kArcherTensorHandle->UpdateTensorMap(old_ptr, (void*)buffer.data_ptr());
 }
-void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id, torch::Tensor& buffer)
-{
+void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id,
+                                         torch::Tensor& buffer) {
   auto tensor_id = kArcherTensorHandle->GetTensorId((void*)buffer.data_ptr());
   void* old_ptr = (void*)buffer.data_ptr();
   DLOG_DEBUG("Release tensor ", tensor_id, old_ptr);
@@ -127,9 +133,9 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id, torch::Tenso
     return;
   }
 
-  /*  This needs to go after Release, default host can be changed in TraceRequest
-   *   Faulty case: node -> default_host = cpu, node -> default_host = cuda; tensor already
-   * released
+  /*  This needs to go after Release, default host can be changed in
+   * TraceRequest Faulty case: node -> default_host = cpu, node -> default_host
+   * = cuda; tensor already released
    */
   // if (node != last_node_) {
   //     // kTaskPool->Prefetch(request_id, node);
@@ -138,9 +144,11 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id, torch::Tenso
   // TraceRequest(request_id, tensor_id);
 
   auto current_layer_id = node->corr_id & 0xFFFFFFFF;
-  if (current_layer_id != last_layer_id_ && node_id_to_tensor_ids_[last_node_->id].size() != 0) {
+  if (current_layer_id != last_layer_id_ &&
+      node_id_to_tensor_ids_[last_node_->id].size() != 0) {
     node_id_to_tensor_ids_[last_node_->id].clear();
-    kTaskPool->StopExec(request_id, last_node_);  // evict last node to cpu or disk
+    kTaskPool->StopExec(request_id,
+                        last_node_);  // evict last node to cpu or disk
     last_node_->mutex.unlock();
   }
   last_layer_id_ = current_layer_id;
@@ -148,10 +156,12 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id, torch::Tenso
 
   node_id_to_tensor_ids_[node->id].erase(tensor_id);
   // DLOG_DEBUG(
-  //     "Node {} tensor_ids size {}", node->id, node_id_to_tensor_ids_[node->id].size());
+  //     "Node {} tensor_ids size {}", node->id,
+  //     node_id_to_tensor_ids_[node->id].size());
 
   if (node_id_to_tensor_ids_[node->id].size() == 0) {
-    kTaskPool->StopExec(request_id, node);  // FIXME: change api to add request id
+    kTaskPool->StopExec(request_id,
+                        node);  // FIXME: change api to add request id
     // always unlock node here since, exec queue do not unlock automatically
     node->mutex.unlock();
   }
@@ -169,20 +179,21 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id, torch::Tenso
   kArcherTensorHandle->UpdateTensorMap(old_ptr, (void*)buffer.data_ptr());
 }
 
-void ArcherPrefetchHandle::PrefetchTensors(std::uint64_t& request_id,
-                                           const std::vector<std::uint32_t>& buffer)
-{
+void ArcherPrefetchHandle::PrefetchTensors(
+    std::uint64_t& request_id, const std::vector<std::uint32_t>& buffer) {
   std::vector<NodePtr> candidates;
   for (std::uint32_t tensor_id : buffer) {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
     candidates.push_back(node);
   }
 
-  if (candidates.size() == 0) { return; }
+  if (candidates.size() == 0) {
+    return;
+  }
 }
 
-void ArcherPrefetchHandle::ReplaceCacheCandidates(const std::vector<std::uint32_t>& tensor_ids)
-{
+void ArcherPrefetchHandle::ReplaceCacheCandidates(
+    const std::vector<std::uint32_t>& tensor_ids) {
   std::vector<NodePtr> candidates;
   for (std::uint32_t tensor_id : tensor_ids) {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
@@ -191,8 +202,8 @@ void ArcherPrefetchHandle::ReplaceCacheCandidates(const std::vector<std::uint32_
 
   kTaskPool->ReplaceCacheCandidates(candidates);
 }
-void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id, int gpu_id)
-{
+void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id,
+                                           int gpu_id) {
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
 
   auto task = std::make_shared<Task>();
@@ -205,9 +216,8 @@ void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id, int gpu_id)
   kTaskPool->EnqueueTask(task);
 }
 
-void ArcherPrefetchHandle::FetchTensors(std::uint64_t& request_id,
-                                        const std::vector<std::uint32_t>& buffer)
-{
+void ArcherPrefetchHandle::FetchTensors(
+    std::uint64_t& request_id, const std::vector<std::uint32_t>& buffer) {
   // std::vector<NodePtr> candidates;
   for (std::uint32_t tensor_id : buffer) {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
@@ -215,8 +225,8 @@ void ArcherPrefetchHandle::FetchTensors(std::uint64_t& request_id,
   }
 }
 
-void ArcherPrefetchHandle::OffloadTensor(torch::Tensor& tensor, const std::uint32_t tensor_id)
-{
+void ArcherPrefetchHandle::OffloadTensor(torch::Tensor& tensor,
+                                         const std::uint32_t tensor_id) {
   kArcherTensorHandle->StoreTensor(tensor_id, tensor);
 
   auto ckpt_index_path = prefix_ + std::string(ARCHER_IHDEX_NAME);
@@ -225,79 +235,79 @@ void ArcherPrefetchHandle::OffloadTensor(torch::Tensor& tensor, const std::uint3
   kTensorIndex->Serialize(ckpt_index_path.c_str());
 }
 
-void ArcherPrefetchHandle::RegisterTensor(torch::Tensor& tensor, const std::uint32_t tensor_id)
-{
+void ArcherPrefetchHandle::RegisterTensor(torch::Tensor& tensor,
+                                          const std::uint32_t tensor_id) {
   kArcherTensorHandle->RegisterTensor(tensor_id, tensor);
 }
 
-void ArcherPrefetchHandle::RegisterModule(torch::nn::Module& module)
-{
-  for (auto it = module.parameters().begin(); it != module.parameters().end(); ++it) {
-    auto tensor_id = kArcherTensorHandle->GetTensorId((void*)(*it).unsafeGetTensorImpl());
+void ArcherPrefetchHandle::RegisterModule(torch::nn::Module& module) {
+  for (auto it = module.parameters().begin(); it != module.parameters().end();
+       ++it) {
+    auto tensor_id =
+        kArcherTensorHandle->GetTensorId((void*)(*it).unsafeGetTensorImpl());
     kArcherTensorHandle->RegisterTensor(tensor_id, *it);
   }
 
   for (auto it = module.buffers().begin(); it != module.buffers().end(); ++it) {
-    auto tensor_id = kArcherTensorHandle->GetTensorId((void*)(*it).unsafeGetTensorImpl());
+    auto tensor_id =
+        kArcherTensorHandle->GetTensorId((void*)(*it).unsafeGetTensorImpl());
     kArcherTensorHandle->RegisterTensor(tensor_id, *it);
   }
 }
 
-void ArcherPrefetchHandle::RegisterTensor(torch::Tensor* tensor)
-{
+void ArcherPrefetchHandle::RegisterTensor(torch::Tensor* tensor) {
   DLOG_DEBUG("Register tensor: is view ", (void*)tensor, tensor->is_view());
 }
 
-torch::Tensor ArcherPrefetchHandle::GetTrace()
-{
+torch::Tensor ArcherPrefetchHandle::GetTrace() {
   const auto& child_visit_cnts = kTopologyHandle->GetChildVisitCounts();
   const auto num_layers_and_experts = kTopologyHandle->GetNumLayersAndExperts();
   const auto num_layers = std::get<0>(num_layers_and_experts);
   const auto num_experts = std::get<1>(num_layers_and_experts);
 
-  std::vector<int64_t> trace_vec(child_visit_cnts.begin(), child_visit_cnts.end());
+  std::vector<int64_t> trace_vec(child_visit_cnts.begin(),
+                                 child_visit_cnts.end());
   torch::Tensor trace = torch::from_blob(trace_vec.data(),
                                          {static_cast<int64_t>(num_layers - 1),
                                           static_cast<int64_t>(num_experts),
                                           static_cast<int64_t>(num_experts)},
                                          torch::kInt64)
-                          .clone();
+                            .clone();
 
   return trace;
 }
 
-torch::Tensor ArcherPrefetchHandle::GetHitRate()
-{
+torch::Tensor ArcherPrefetchHandle::GetHitRate() {
   const auto& node_visit_cnts = kTopologyHandle->GetNodeVisitCounts();
 
   // flatten vector of vectors
   std::vector<int64_t> node_visit_cnts_vec;
   for (auto& node_visit_cnt : node_visit_cnts) {
-    node_visit_cnts_vec.insert(
-      node_visit_cnts_vec.end(), node_visit_cnt.begin(), node_visit_cnt.end());
+    node_visit_cnts_vec.insert(node_visit_cnts_vec.end(),
+                               node_visit_cnt.begin(), node_visit_cnt.end());
   }
 
-  torch::Tensor trace = torch::from_blob(node_visit_cnts_vec.data(),
-                                         {node_visit_cnts.size(), node_visit_cnts[0].size()},
-                                         torch::kInt64)
-                          .clone();
+  torch::Tensor trace =
+      torch::from_blob(node_visit_cnts_vec.data(),
+                       {node_visit_cnts.size(), node_visit_cnts[0].size()},
+                       torch::kInt64)
+          .clone();
   return trace;
 }
 
-void ArcherPrefetchHandle::SetTrace(const torch::Tensor& trace)
-{
+void ArcherPrefetchHandle::SetTrace(const torch::Tensor& trace) {
   if (trace.dim() != 3 || !trace.is_contiguous() || !trace.is_cpu()) {
     DLOG_ERROR("Trace should be a contiguous 3D tensor on CPU");
     return;
   }
 
-  std::vector<std::size_t> child_visit_cnts(trace.data_ptr<int64_t>(),
-                                            trace.data_ptr<int64_t>() + trace.numel());
+  std::vector<std::size_t> child_visit_cnts(
+      trace.data_ptr<int64_t>(), trace.data_ptr<int64_t>() + trace.numel());
   kTopologyHandle->SetChildVisitCounts(child_visit_cnts);
 }
 
-void ArcherPrefetchHandle::TraceRequest(const std::uint64_t request_id, const TensorID tensor_id)
-{
+void ArcherPrefetchHandle::TraceRequest(const std::uint64_t request_id,
+                                        const TensorID tensor_id) {
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
 
   auto it = request_id_to_nodes_.find(request_id);
@@ -315,23 +325,25 @@ void ArcherPrefetchHandle::TraceRequest(const std::uint64_t request_id, const Te
 }
 
 void ArcherPrefetchHandle::SetTopology(
-  const std::vector<std::tuple<std::string, std::vector<std::vector<TensorID>>>>& topology)
-{
+    const std::vector<
+        std::tuple<std::string, std::vector<std::vector<TensorID>>>>&
+        topology) {
   kTopologyHandle->InitializeTopology(topology);
 }
 
-bool ArcherPrefetchHandle::IsTensorOffloaded(const std::uint32_t tensor_id)
-{
+bool ArcherPrefetchHandle::IsTensorOffloaded(const std::uint32_t tensor_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto it = kTensorIndex->find(tensor_id);
   // DLOG_DEBUG("Check tensor {} {}", tensor_id, it == kTensorIndex->end());
   bool is_offloaded = it != kTensorIndex->end();
-  if (is_offloaded) { it->second.id = tensor_id; }
+  if (is_offloaded) {
+    it->second.id = tensor_id;
+  }
   return is_offloaded;
 }
 
-void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor, torch::Device device) const
-{
+void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor,
+                                           torch::Device device) const {
   void* device_ptr = nullptr;
   auto byte_size = tensor.element_size() * tensor.numel();
 
@@ -341,55 +353,52 @@ void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor, torch::Device 
   cudaSetDevice(device.index());
   cudaMalloc(&device_ptr, byte_size);
 
-  CudaMemcpy(device_ptr, tensor.data_ptr(), byte_size, cudaMemcpyDeviceToDevice);
+  CudaMemcpy(device_ptr, tensor.data_ptr(), byte_size,
+             cudaMemcpyDeviceToDevice);
 
   auto new_tensor = torch::from_blob(
-    device_ptr,
-    tensor.sizes(),
-    [](void* ptr) { cudaFree(ptr); },
-    tensor.options().device(device).pinned_memory(false));
+      device_ptr, tensor.sizes(), [](void* ptr) { cudaFree(ptr); },
+      tensor.options().device(device).pinned_memory(false));
   tensor.set_data(new_tensor);
 }
 
-bool ArcherPrefetchHandle::IsTensorIndexInitialized() const
-{
+bool ArcherPrefetchHandle::IsTensorIndexInitialized() const {
   return kArcherTensorHandle->IsTensorIndexInitialized();
 }
 
-bool ArcherPrefetchHandle::IsTensorOnDevice(const torch::Tensor& tensor) const
-{
+bool ArcherPrefetchHandle::IsTensorOnDevice(const torch::Tensor& tensor) const {
   auto tensor_id = kArcherTensorHandle->GetTensorId((void*)tensor.data_ptr());
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
   return node->device.is_cuda();
 }
 
-void ArcherPrefetchHandle::UpdateTensorMap(std::uint64_t old_data_ptr, std::uint64_t new_data_ptr)
-{
-  kArcherTensorHandle->UpdateTensorMap((void*)old_data_ptr, (void*)new_data_ptr);
+void ArcherPrefetchHandle::UpdateTensorMap(std::uint64_t old_data_ptr,
+                                           std::uint64_t new_data_ptr) {
+  kArcherTensorHandle->UpdateTensorMap((void*)old_data_ptr,
+                                       (void*)new_data_ptr);
 }
 
-bool ArcherPrefetchHandle::IsTensorOnDevice(const TensorID tensor_id) const
-{
+bool ArcherPrefetchHandle::IsTensorOnDevice(const TensorID tensor_id) const {
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
   return node->device.is_cuda();
 }
 
-int ArcherPrefetchHandle::GetNodeDefaultDevice(std::vector<std::uint32_t> tensor_ids) const
-{
+int ArcherPrefetchHandle::GetNodeDefaultDevice(
+    std::vector<std::uint32_t> tensor_ids) const {
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_ids[0]);
   // DLOG_DEBUG("Get node {} default device {}", node->str(),
   return node->default_device.index();
 }
 
-int ArcherPrefetchHandle::GetNodeDevice(std::vector<std::uint32_t> tensor_ids) const
-{
+int ArcherPrefetchHandle::GetNodeDevice(
+    std::vector<std::uint32_t> tensor_ids) const {
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_ids[0]);
   // DLOG_DEBUG("Get node {} device {}", node->str(), node->device.str());
   return node->device.index();
 }
 
-// void ArcherPrefetchHandle::SetNodeCachePriority(const std::uint32_t tensor_id, const float
-// priority) {
+// void ArcherPrefetchHandle::SetNodeCachePriority(const std::uint32_t
+// tensor_id, const float priority) {
 //     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
 //     node->cache_priority = priority;
 // }

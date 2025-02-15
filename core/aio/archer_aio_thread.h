@@ -14,7 +14,7 @@
 #include "archer_aio_utils.h"
 
 class ArcherAioThread {
-  public:
+ public:
   explicit ArcherAioThread(int thread_id);
   ~ArcherAioThread();
 
@@ -24,10 +24,10 @@ class ArcherAioThread {
   void Enqueue(AioCallback& callback);
   void Wait();
 
-  private:
+ private:
   void Run();
 
-  private:
+ private:
   int thread_id_;
   std::thread thread_;
   bool is_running_;

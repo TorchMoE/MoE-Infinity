@@ -20,8 +20,7 @@
 std::unique_ptr<HostMemoryPool> kHostMemoryPool(nullptr);
 std::unique_ptr<DeviceMemoryPool> kDeviceMemoryPool(nullptr);
 
-std::size_t GetTotalSystemMemory()
-{
+std::size_t GetTotalSystemMemory() {
   long pages = sysconf(_SC_PHYS_PAGES);
   long page_size = sysconf(_SC_PAGE_SIZE);
   return pages * page_size;
@@ -29,8 +28,7 @@ std::size_t GetTotalSystemMemory()
 
 void* HostMemoryPool::AllocateMemory(const std::size_t key,
                                      const std::int64_t size,
-                                     const torch::Device& device)
-{
+                                     const torch::Device& device) {
   assert(device.is_cpu());
   std::unique_lock<std::mutex> lock(mutex_);
   if (allocated_id_.find(key) != allocated_id_.end()) {
@@ -43,11 +41,9 @@ void* HostMemoryPool::AllocateMemory(const std::size_t key,
   return data_ptr;
 }
 
-int HostMemoryPool::FreeMemory(const std::size_t key,
-                               void* data,
+int HostMemoryPool::FreeMemory(const std::size_t key, void* data,
                                const std::int64_t size,
-                               const torch::Device& device)
-{
+                               const torch::Device& device) {
   assert(device.is_cpu());
   std::unique_lock<std::mutex> lock(mutex_);
   if (allocated_id_.find(key) == allocated_id_.end()) {
@@ -64,14 +60,13 @@ int HostMemoryPool::FreeMemory(const std::size_t key,
 }
 
 HostMemoryPool::HostMemoryPool()
-  : free_memory_(
+    : free_memory_(
 #ifdef TEST_LIMIT_MEMORY
-      10LL * 1024 * 1024 * 1024
+          10LL * 1024 * 1024 * 1024
 #else
-      GetTotalSystemMemory() * HOST_MEMORY_RATIO
+          GetTotalSystemMemory() * HOST_MEMORY_RATIO
 #endif
-    )
-{
+      ) {
   auto pinned_mr_ = c10::HostCachingAllocator::get();
   if (pinned_mr_ == nullptr) {
     DLOG_ERROR("GetHostAllocator failed");
@@ -80,8 +75,7 @@ HostMemoryPool::HostMemoryPool()
   memory_capacity_ = free_memory_;
 }
 
-std::int64_t HostMemoryPool::GetFreeMemory()
-{
+std::int64_t HostMemoryPool::GetFreeMemory() {
   std::lock_guard<std::mutex> lock(mutex_);
   return free_memory_;
 }
@@ -90,8 +84,7 @@ std::int64_t HostMemoryPool::GetMemoryCapacity() { return memory_capacity_; }
 
 void* DeviceMemoryPool::AllocateMemory(const std::size_t key,
                                        const std::int64_t size,
-                                       const torch::Device& device)
-{
+                                       const torch::Device& device) {
   int device_id = device.index();
   std::unique_lock<std::mutex> lock(mutex_);
   if (allocated_id_[device_id].find(key) != allocated_id_[device_id].end()) {
@@ -108,11 +101,9 @@ void* DeviceMemoryPool::AllocateMemory(const std::size_t key,
   return data_ptr;
 }
 
-int DeviceMemoryPool::FreeMemory(const std::size_t key,
-                                 void* data,
+int DeviceMemoryPool::FreeMemory(const std::size_t key, void* data,
                                  const std::int64_t size,
-                                 const torch::Device& device)
-{
+                                 const torch::Device& device) {
   int device_id = device.index();
   std::unique_lock<std::mutex> lock(mutex_);
   if (allocated_id_[device_id].find(key) == allocated_id_[device_id].end()) {
@@ -131,8 +122,7 @@ int DeviceMemoryPool::FreeMemory(const std::size_t key,
   return 0;
 }
 
-DeviceMemoryPool::DeviceMemoryPool()
-{
+DeviceMemoryPool::DeviceMemoryPool() {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
 
@@ -146,21 +136,18 @@ DeviceMemoryPool::DeviceMemoryPool()
   }
 }
 
-std::int64_t DeviceMemoryPool::GetFreeMemory(const torch::Device& device)
-{
+std::int64_t DeviceMemoryPool::GetFreeMemory(const torch::Device& device) {
   int device_id = device.index();
   std::lock_guard<std::mutex> lock(mutex_);
   return free_memory_[device_id];
 }
 
-std::int64_t DeviceMemoryPool::GetMemoryCapacity(const torch::Device& device)
-{
+std::int64_t DeviceMemoryPool::GetMemoryCapacity(const torch::Device& device) {
   int device_id = device.index();
   return memory_capacity_[device_id];
 }
 
-void DeviceMemoryPool::SetMemoryRatio(const double ratio)
-{
+void DeviceMemoryPool::SetMemoryRatio(const double ratio) {
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
 

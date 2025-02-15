@@ -18,9 +18,14 @@
 
 #include <future>
 
-ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, int expert_type)
-  : pending_(0), num_enqueued_(0), start_(false), expert_type_(expert_type), mutexes_(5), cvs_(5)
-{
+ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
+                                   int expert_type)
+    : pending_(0),
+      num_enqueued_(0),
+      start_(false),
+      expert_type_(expert_type),
+      mutexes_(5),
+      cvs_(5) {
   main_thread_stop_flag_.store(false);
 
   int num_gpu = GetDeviceCount();
@@ -73,7 +78,8 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
           experts_[i][j]->module = new SwitchTransformersDenseActDense(dtype);
           break;
         case SWITCH_TRANSFORMERS_DENSE_GATED_ACT_DENSE:
-          experts_[i][j]->module = new SwitchTransformersDenseGatedActDense(dtype);
+          experts_[i][j]->module =
+              new SwitchTransformersDenseGatedActDense(dtype);
           break;
         case NLLB_MOE_DENSE_ACT_DENSE:
           experts_[i][j]->module = new NllbMoeDenseActDense(dtype);
@@ -88,7 +94,8 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
           experts_[i][j]->module = new DeepSeekMoEDenseActDense(dtype);
           break;
         default:
-          DLOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type ", expert_type);
+          DLOG_FATAL("ExpertDispatcher::ExpertDispatcher: unknown expert type ",
+                     expert_type);
       }
       experts_[i][j]->module->eval();
       experts_[i][j]->layer_idx = j;
@@ -97,8 +104,8 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype, i
   }
 }
 
-void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id, bool remote)
-{
+void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id,
+                                     bool remote) {
   ExpertDispatcher::CallArgs args;
   args.layer_idx = layer_idx;
   args.expert_idx = expert_idx;
@@ -107,15 +114,15 @@ void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id, 
   Enqueue(args);
 }
 
-void ExpertDispatcher::Enqueue(const CallArgs& args)
-{
+void ExpertDispatcher::Enqueue(const CallArgs& args) {
   std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::INPUT_MUTEX]);
   int layer_idx = args.layer_idx;
   int expert_idx = args.expert_idx;
   auto expert_node = experts_[expert_idx][layer_idx];
 
   // if (!expert_node->node->mutex.try_lock()) {
-  //     DLOG_WARN("ExpertDispatcher::Enqueue: mutex try_lock failed (expert_idx ",
+  //     DLOG_WARN("ExpertDispatcher::Enqueue: mutex try_lock failed (expert_idx
+  //     ",
   //                     expert_idx,
   //                     " layer_idx ",
   //                     layer_idx,
@@ -131,27 +138,20 @@ void ExpertDispatcher::Enqueue(const CallArgs& args)
   num_enqueued_.fetch_add(1);
 
   auto& a = input_queue_.back();
-  if (expert_node->node->device.is_cuda()) { a.gpu_id = expert_node->node->device.index(); }
-  DLOG_DEBUG("ExpertDispatcher::Enqueue: num_enqueued_ ",
-             num_enqueued_.load(),
-             "input_queue_ ",
-             input_queue_.size(),
-             "gpu_id ",
-             a.gpu_id,
-             "layer_idx ",
-             a.layer_idx,
-             "expert_idx ",
-             a.expert_idx,
-             "remote ",
+  if (expert_node->node->device.is_cuda()) {
+    a.gpu_id = expert_node->node->device.index();
+  }
+  DLOG_DEBUG("ExpertDispatcher::Enqueue: num_enqueued_ ", num_enqueued_.load(),
+             "input_queue_ ", input_queue_.size(), "gpu_id ", a.gpu_id,
+             "layer_idx ", a.layer_idx, "expert_idx ", a.expert_idx, "remote ",
              a.remote);
   // lock.unlock();
   // cvs_[MUTEX_TYPE::INPUT_MUTEX].notify_all();
 }
 
-void ExpertDispatcher::RegisterExpert(int layer_idx,
-                                      int expert_idx,
-                                      const std::vector<std::uint32_t>& tensor_ids)
-{
+void ExpertDispatcher::RegisterExpert(
+    int layer_idx, int expert_idx,
+    const std::vector<std::uint32_t>& tensor_ids) {
   NodePtr cached_node = nullptr;
   for (auto tensor_id : tensor_ids) {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
@@ -164,27 +164,28 @@ void ExpertDispatcher::RegisterExpert(int layer_idx,
   }
 }
 
-void ExpertDispatcher::ClearExpertCacheCounts()
-{
+void ExpertDispatcher::ClearExpertCacheCounts() {
   for (auto& expert : experts_) {
     for (auto& expert_node : expert) {
-      if (expert_node->node == nullptr) { continue; }
+      if (expert_node->node == nullptr) {
+        continue;
+      }
       expert_node->node->incache_visit_count = 0;
     }
   }
 }
 
-void ExpertDispatcher::GPUThreadFunc(int gpu_id)
-{
-  while (!main_thread_stop_flag_.load()) {}
+void ExpertDispatcher::GPUThreadFunc(int gpu_id) {
+  while (!main_thread_stop_flag_.load()) {
+  }
 }
 
-void ExpertDispatcher::GPUFetchFunc(int gpu_id)
-{
+void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
   while (!main_thread_stop_flag_.load()) {
     std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::INPUT_MUTEX]);
     if (input_queue_.empty()) {
-      // cvs_[MUTEX_TYPE::INPUT_MUTEX].wait(lock, [&] { return !input_queue_.empty(); });
+      // cvs_[MUTEX_TYPE::INPUT_MUTEX].wait(lock, [&] { return
+      // !input_queue_.empty(); });
       lock.unlock();
       std::this_thread::sleep_for(std::chrono::microseconds(10));
       continue;
@@ -206,7 +207,9 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
 
     lock.unlock();
 
-    if (args_list.empty()) { continue; }
+    if (args_list.empty()) {
+      continue;
+    }
 
     for (auto& a : args_list) {
       int layer_idx = a.layer_idx;
@@ -219,11 +222,12 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
       }
     }
 
-    if (args.gpu_id == -1) { args = std::move(args_list[0]); }
+    if (args.gpu_id == -1) {
+      args = std::move(args_list[0]);
+    }
 
     //  put back the rest
-    args_list.erase(std::remove_if(args_list.begin(),
-                                   args_list.end(),
+    args_list.erase(std::remove_if(args_list.begin(), args_list.end(),
                                    [&](const CallArgs& a) {
                                      return (a.expert_idx == args.expert_idx) &&
                                             (a.layer_idx == args.layer_idx);
@@ -231,7 +235,9 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
                     args_list.end());
 
     lock.lock();
-    for (auto& a : args_list) { input_queue_.push_back(std::move(a)); }
+    for (auto& a : args_list) {
+      input_queue_.push_back(std::move(a));
+    }
     lock.unlock();
 
     auto device = CUDA_DEVICE(gpu_id);
@@ -251,7 +257,8 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
         wait_count++;
         // if (wait_count % 100000 == 0) {
         //     DLOG_WARN(
-        //         "ExpertDispatcher::EnqueueTask: gpu_overload_ gpu_id {} wait_count {}
+        //         "ExpertDispatcher::EnqueueTask: gpu_overload_ gpu_id {}
+        //         wait_count {}
         //         {}", gpu_id, wait_count, expert_node->node->str());
         // }
       }
@@ -277,21 +284,25 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
         std::this_thread::sleep_for(std::chrono::microseconds(10));
         wait_count++;
         if (wait_count % 100000 == 0) {
-          DLOG_WARN(
-            "ExpertDispatcher::EnqueueTask: wait_count ", wait_count, expert_node->node->str());
+          DLOG_WARN("ExpertDispatcher::EnqueueTask: wait_count ", wait_count,
+                    expert_node->node->str());
         }
       }
 
       // DLOG_DEBUG(
-      //     "ExpertDispatcher::GPUFetchFunc: move to device gpu_id {} layer_idx {} expert_idx
-      //     {} node {}", gpu_id, layer_idx, expert_idx, expert_node->node->device.str());
+      //     "ExpertDispatcher::GPUFetchFunc: move to device gpu_id {} layer_idx
+      //     {} expert_idx
+      //     {} node {}", gpu_id, layer_idx, expert_idx,
+      //     expert_node->node->device.str());
     }
     expert_node->SetTensorsFromBlob(device);
-    // auto& meta = kTensorIndex->find(expert_node->node->tensor_ids[0])->second;
+    // auto& meta =
+    // kTensorIndex->find(expert_node->node->tensor_ids[0])->second;
 
     int expert_type = expert_type_;
     torch::Tensor input;
-    auto token_indices = router_mask_.index({"...", expert_idx}).to(torch::kBool);
+    auto token_indices =
+        router_mask_.index({"...", expert_idx}).to(torch::kBool);
     switch (expert_type) {
       case SWITCH_TRANSFORMERS_DENSE_ACT_DENSE:
       case SWITCH_TRANSFORMERS_DENSE_GATED_ACT_DENSE:
@@ -299,21 +310,17 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
       case FSGPT_MOE_DENSE_ACT_DENSE:
       case MIXTRAL_MOE_DENSE_ACT_DENSE:
       case DEEPSEEK_MOE_DENSE_ACT_DENSE:
-        input = hidden_states_.index({token_indices}).to(expert_node->node->device);
+        input =
+            hidden_states_.index({token_indices}).to(expert_node->node->device);
         break;
-      default: DLOG_FATAL("ExpertDispatcher::expert_type: unknown expert type ", expert_type);
+      default:
+        DLOG_FATAL("ExpertDispatcher::expert_type: unknown expert type ",
+                   expert_type);
     }
 
-    DLOG_DEBUG("ExpertDispatcher::GPUFetchFunc gpu_id ",
-               gpu_id,
-               "layer_idx ",
-               layer_idx,
-               "expert_idx ",
-               expert_idx,
-               "input ",
-               input.device().str(),
-               "node ",
-               expert_node->node->device.str());
+    DLOG_DEBUG("ExpertDispatcher::GPUFetchFunc gpu_id ", gpu_id, "layer_idx ",
+               layer_idx, "expert_idx ", expert_idx, "input ",
+               input.device().str(), "node ", expert_node->node->device.str());
     {
       ExecArgs exec_args;
       exec_args.hidden_states = std::move(input);
@@ -329,13 +336,13 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id)
   }
 }
 
-void ExpertDispatcher::GPUExecFunc(int gpu_id)
-{
+void ExpertDispatcher::GPUExecFunc(int gpu_id) {
   cudaSetDevice(gpu_id);
   while (!main_thread_stop_flag_.load()) {
     std::unique_lock<std::mutex> lock(mutexes_[MUTEX_TYPE::EXEC_MUTEX]);
     if (exec_queue_.empty()) {
-      // cvs_[MUTEX_TYPE::EXEC_MUTEX].wait(lock, [&] { return !exec_queue_.empty(); });
+      // cvs_[MUTEX_TYPE::EXEC_MUTEX].wait(lock, [&] { return
+      // !exec_queue_.empty(); });
       lock.unlock();
       std::this_thread::sleep_for(std::chrono::microseconds(10));
       continue;
@@ -353,7 +360,9 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
 
     lock.unlock();
 
-    if (args.expert_node == nullptr) { continue; }
+    if (args.expert_node == nullptr) {
+      continue;
+    }
 
     torch::Tensor output;
 
@@ -362,7 +371,7 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
     // random int [0,8)
     int rnd = std::rand() % 8;
     c10::cuda::CUDAStream stream =
-      c10::cuda::getStreamFromExternal(exec_streams_[gpu_id + rnd], gpu_id);
+        c10::cuda::getStreamFromExternal(exec_streams_[gpu_id + rnd], gpu_id);
 
     {
       auto start = TIME_NOW;
@@ -375,66 +384,72 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id)
       try {
         switch (expert_type) {
           case SWITCH_TRANSFORMERS_DENSE_ACT_DENSE:
-            output = reinterpret_cast<SwitchTransformersDenseActDense*>(expert_module)
-                       ->forward(args.hidden_states);
+            output = reinterpret_cast<SwitchTransformersDenseActDense*>(
+                         expert_module)
+                         ->forward(args.hidden_states);
             break;
           case SWITCH_TRANSFORMERS_DENSE_GATED_ACT_DENSE:
-            output = reinterpret_cast<SwitchTransformersDenseGatedActDense*>(expert_module)
-                       ->forward(args.hidden_states);
+            output = reinterpret_cast<SwitchTransformersDenseGatedActDense*>(
+                         expert_module)
+                         ->forward(args.hidden_states);
             break;
           case NLLB_MOE_DENSE_ACT_DENSE:
-            output =
-              reinterpret_cast<NllbMoeDenseActDense*>(expert_module)->forward(args.hidden_states);
+            output = reinterpret_cast<NllbMoeDenseActDense*>(expert_module)
+                         ->forward(args.hidden_states);
             break;
           case FSGPT_MOE_DENSE_ACT_DENSE:
-            output =
-              reinterpret_cast<FSGPTMoEDenseActDense*>(expert_module)->forward(args.hidden_states);
+            output = reinterpret_cast<FSGPTMoEDenseActDense*>(expert_module)
+                         ->forward(args.hidden_states);
             break;
           case MIXTRAL_MOE_DENSE_ACT_DENSE:
             output = reinterpret_cast<MixtralMoEDenseActDense*>(expert_module)
-                       ->forward(args.hidden_states);
+                         ->forward(args.hidden_states);
             break;
           case DEEPSEEK_MOE_DENSE_ACT_DENSE:
             output = reinterpret_cast<DeepSeekMoEDenseActDense*>(expert_module)
-                       ->forward(args.hidden_states);
+                         ->forward(args.hidden_states);
             break;
-          default: DLOG_FATAL("ExpertDispatcher::GPUExecFunc: unknown expert type", expert_type);
+          default:
+            DLOG_FATAL("ExpertDispatcher::GPUExecFunc: unknown expert type",
+                       expert_type);
         }
 
       } catch (const std::exception& e) {
         std::stringstream ss;
         ss << "DenseActDense tensor_ids: [";
-        for (auto& id : args.expert_node->node->tensor_ids) { ss << id << " "; }
+        for (auto& id : args.expert_node->node->tensor_ids) {
+          ss << id << " ";
+        }
         ss << "]";
-        DLOG_FATAL("ExpertDispatcher::GPUExecFunc", ss.str(), "expert_type", expert_type, e.what());
+        DLOG_FATAL("ExpertDispatcher::GPUExecFunc", ss.str(), "expert_type",
+                   expert_type, e.what());
       }
 
       stream.synchronize();
       auto end = TIME_NOW;
       // DLOG_INFO("ExpertDispatcher::GPUExecFunc: forward time ",
-      //                  std::chrono::duration_cast<MCIROSECONDS>(end - start).count(),
-      //                  "us");
+      //                  std::chrono::duration_cast<MCIROSECONDS>(end -
+      //                  start).count(), "us");
     }
 
-    (void)std::async(std::launch::async,
-                     &ExpertDispatcher::OutputFunc,
-                     this,
-                     std::move(args),
-                     std::move(output),
-                     gpu_id);
+    (void)std::async(std::launch::async, &ExpertDispatcher::OutputFunc, this,
+                     std::move(args), std::move(output), gpu_id);
   }
 }
 
-void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_id)
-{
-  // c10::cuda::CUDAStream stream = c10::cuda::getStreamFromExternal(out_streams_[gpu_id],
-  // gpu_id); c10::cuda::CUDAStreamGuard guard(stream);
+void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
+                                  int gpu_id) {
+  // c10::cuda::CUDAStream stream =
+  // c10::cuda::getStreamFromExternal(out_streams_[gpu_id], gpu_id);
+  // c10::cuda::CUDAStreamGuard guard(stream);
 
-  auto output_device = (args.out_gpu_id < 0) ? CPU_DEVICE : CUDA_DEVICE(args.out_gpu_id);
+  auto output_device =
+      (args.out_gpu_id < 0) ? CPU_DEVICE : CUDA_DEVICE(args.out_gpu_id);
   torch::Tensor output_tensor = output.to(output_device).to(args.out_dtype);
 
   if (args.evict) {
-    args.expert_node->node->SetDevice(args.expert_node->node->default_host, true, nullptr);
+    args.expert_node->node->SetDevice(args.expert_node->node->default_host,
+                                      true, nullptr);
     {
       std::lock_guard<std::mutex> lock(gpu_overload_mutex_);
       gpu_overload_[gpu_id] = false;
@@ -447,28 +462,19 @@ void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output, int gpu_i
     std::lock_guard<std::mutex> lock(output_mutex_);
     output_queue_.emplace_back(std::move(output_tensor),
                                args.expert_node->layer_idx,
-                               args.expert_node->expert_idx,
-                               args.hit);
+                               args.expert_node->expert_idx, args.hit);
     DLOG_DEBUG("ExpertDispatcher::OutputFunc: output_queue_",
-               output_queue_.size(),
-               "output",
-               std::get<0>(output_queue_.back()).device().str(),
-               "evict",
-               args.evict,
-               "(",
-               args.expert_node->layer_idx,
-               args.expert_node->expert_idx,
-               gpu_id,
-               args.hit,
-               ")");
+               output_queue_.size(), "output",
+               std::get<0>(output_queue_.back()).device().str(), "evict",
+               args.evict, "(", args.expert_node->layer_idx,
+               args.expert_node->expert_idx, gpu_id, args.hit, ")");
   }
   // stream.synchronize();
   pending_.fetch_sub(1);
   pending_cv_.notify_all();
 }
 
-std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait()
-{
+std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait() {
   int wait_count = 0;
 
   // std::unique_lock<std::mutex> lock(pending_mutex_);
@@ -479,16 +485,11 @@ std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait()
     std::this_thread::sleep_for(std::chrono::microseconds(10));
     wait_count++;
     if (wait_count % 1000 == 0) {
-      DLOG_WARN("ExpertDispatcher::Wait: wait_count:",
-                wait_count,
-                "pending_: ",
-                pending_.load(),
-                "num_enqueued: ",
-                num_enqueued_.load(),
-                "input_queue_: ",
-                input_queue_.size(),
-                "exec_queue_: ",
-                exec_queue_.size());
+      DLOG_WARN("ExpertDispatcher::Wait: wait_count:", wait_count,
+                "pending_: ", pending_.load(),
+                "num_enqueued: ", num_enqueued_.load(),
+                "input_queue_: ", input_queue_.size(),
+                "exec_queue_: ", exec_queue_.size());
     }
   }
   input_queue_.clear();
@@ -503,7 +504,8 @@ std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait()
   // std::stringstream ss;
   // ss << "ExpertDispatcher::Wait: output_queue_ " << output_queue.size();
   // for (auto& output : output_queue) {
-  //     ss << " (" << std::get<0>(output).sizes() << "," << std::get<1>(output) << ","
+  //     ss << " (" << std::get<0>(output).sizes() << "," << std::get<1>(output)
+  //     << ","
   //        << std::get<2>(output) << "," << std::get<3>(output) << ")";
   // }
   // DLOG_DEBUG(ss.str());
