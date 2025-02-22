@@ -11,7 +11,6 @@
 #include "prefetch/task_thread.h"
 #include "utils/cuda_utils.h"
 #include "utils/logger.h"
-#include "utils/cache.h"
 #include "model/model_topology.h"
 
 #include <c10/core/ScalarType.h>
