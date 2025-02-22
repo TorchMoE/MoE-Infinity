@@ -66,4 +66,3 @@ void SetThreadAffinity(pid_t tid) {
     assert(false);
   }
 }
-

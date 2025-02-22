@@ -36,6 +36,7 @@ from moe_infinity.models import (
     SyncSwitchTransformersSparseMLP,
 )
 from moe_infinity.ops.op_builder.prefetch import PrefetchBuilder
+from moe_infinity.runtime.hooks import *
 from moe_infinity.utils import (
     ArcherConfig,
     parse_expert_dtype,
@@ -46,7 +47,6 @@ from moe_infinity.utils.arguments import (
     copy_args_to_device,
     copy_kwargs_to_device,
 )
-from moe_infinity.runtime.hooks import *
 
 use_jit = False
 try:
@@ -166,7 +166,6 @@ class OffloadEngine(object):
         return self
 
     def __enter__(self):
-
         def torch_index_select_decorator(orig_torch_index_select: Callable):
             @functools.wraps(orig_torch_index_select)
             def archer_torch_index_select(input, dim, index):
@@ -227,13 +226,17 @@ class OffloadEngine(object):
         QuantLinear._old_init = QuantLinear.__init__
         QuantLinear.__init__ = empty_param_init_decorator(QuantLinear.__init__)
         QuantLinearOld._old_init = QuantLinearOld.__init__
-        QuantLinearOld.__init__ = empty_param_init_decorator(QuantLinearOld.__init__)
+        QuantLinearOld.__init__ = empty_param_init_decorator(
+            QuantLinearOld.__init__
+        )
 
         # GPTQ Override
         QuantLinear._old_init = QuantLinear.__init__
         QuantLinear.__init__ = empty_param_init_decorator(QuantLinear.__init__)
         QuantLinearOld._old_init = QuantLinearOld.__init__
-        QuantLinearOld.__init__ = empty_param_init_decorator(QuantLinearOld.__init__)
+        QuantLinearOld.__init__ = empty_param_init_decorator(
+            QuantLinearOld.__init__
+        )
 
         self.cls._old_init = self.cls.__init__
         self.cls.__init__ = do_nothing_decorator(self.cls._old_init)
@@ -269,9 +272,9 @@ class OffloadEngine(object):
         PreTrainedModel.post_init = do_nothing_decorator(
             PreTrainedModel._old_post_init
         )
-        
+
         activate_empty_init()
-        
+
         transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._old_cast_classifier = transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier
         transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier = cast_classifier_decorator(
             transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier
@@ -335,7 +338,7 @@ class OffloadEngine(object):
                     parse_moe_param(self.config)
                 )
 
-                self.dtype = parse_expert_dtype(self.config)
+                self.dtype = parse_expert_dtype(self.configw)
                 self.dtype_cls = self.config.torch_dtype
 
                 if self.config.model_type == "deepseek_v3":

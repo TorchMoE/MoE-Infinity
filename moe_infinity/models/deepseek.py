@@ -97,7 +97,7 @@ class DeepseekMoEBlock(nn.Module):
         # self.expert_prefetcher.fetch_experts_lock_cache(
         #     self.layer_id, unique_expert_list
         # )
-        
+
         # self.expert_prefetcher.prefetch_experts_list(self.layer_id, unique_expert_list)
 
         # expert_index = topk_idx.reshape(

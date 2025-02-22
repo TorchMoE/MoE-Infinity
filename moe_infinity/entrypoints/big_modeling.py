@@ -125,7 +125,12 @@ class MoE:
 
             is_flash_attn_available = True
 
-            if arch == "switch" or arch == "deepseek" or arch == "deepseek_v3" or arch == "nllb":
+            if (
+                arch == "switch"
+                or arch == "deepseek"
+                or arch == "deepseek_v3"
+                or arch == "nllb"
+            ):
                 is_flash_attn_available = False
         except ImportError:
             print(
