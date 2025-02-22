@@ -138,18 +138,12 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
   int expert_idx = args.expert_idx;
   auto expert_node = experts_[expert_idx][layer_idx];
 
-  // if (!expert_node->node->mutex.try_lock()) {
-  //     DLOG_WARN("ExpertDispatcher::Enqueue: mutex try_lock failed (expert_idx
-  //     ",
-  //                     expert_idx,
-  //                     " layer_idx ",
-  //                     layer_idx,
-  //                     "node ",
-  //                     expert_node->node->str(),
-  //                     ")");
-  //     return;
-  // }
-  expert_node->node->mutex.try_lock();
+  if (!expert_node->node->mutex.try_lock()) {
+    // NOTE: try lock must success, if there is no prefetching
+    DLOG_FATAL("ExpertDispatcher::Enqueue: mutex try_lock failed (expert_idx ",
+               expert_idx, " layer_idx ", layer_idx, "node ",
+               expert_node->node->str(), ")");
+  }
   expert_node->node->last_access_time = MCIROSECONDS_SINCE_EPOCH;
 
   if (expert_node->node->device.is_cuda()) {
@@ -231,64 +225,6 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
 
     lock.unlock();
 
-    // if (input_queue_.empty()) {
-    //   // cvs_[MUTEX_TYPE::INPUT_MUTEX].wait(lock, [&] { return
-    //   // !input_queue_.empty(); });
-    //   lock.unlock();
-    //   std::this_thread::sleep_for(std::chrono::microseconds(10));
-    //   continue;
-    // }
-
-    // CallArgs args;
-
-    // // find all the args with gpu_id
-    // std::vector<CallArgs> args_list;
-    // auto it = input_queue_.begin();
-    // while (it != input_queue_.end()) {
-    //   if (it->gpu_id == gpu_id) {
-    //     args_list.emplace_back(std::move(*it));
-    //     it = input_queue_.erase(it);
-    //   } else {
-    //     ++it;
-    //   }
-    // }
-
-    // lock.unlock();
-
-    // if (args_list.empty()) {
-    //   continue;
-    // }
-
-    // for (auto& a : args_list) {
-    //   int layer_idx = a.layer_idx;
-    //   int expert_idx = a.expert_idx;
-    //   auto expert_node = experts_[expert_idx][layer_idx];
-
-    //   if (expert_node->node->device.is_cuda()) {
-    //     args = std::move(a);
-    //     break;
-    //   }
-    // }
-
-    // if (args.gpu_id == -1) {
-    //   args = std::move(args_list[0]);
-    // }
-
-    // //  put back the rest
-    // args_list.erase(std::remove_if(args_list.begin(), args_list.end(),
-    //                                [&](const CallArgs& a) {
-    //                                  return (a.expert_idx == args.expert_idx)
-    //                                  &&
-    //                                         (a.layer_idx == args.layer_idx);
-    //                                }),
-    //                 args_list.end());
-
-    // lock.lock();
-    // for (auto& a : args_list) {
-    //   input_queue_.push_back(std::move(a));
-    // }
-    // lock.unlock();
-
     auto device = CUDA_DEVICE(gpu_id);
     auto original_device = (args.remote) ? CPU_DEVICE : hidden_states_.device();
     int layer_idx = args.layer_idx;
@@ -336,61 +272,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
     }
 
     bool success = true;
-    // if (!expert_node->node->device.is_cuda()) {
-    //   success = kTaskPool->RemoveCachedSparseNode(expert_node->node, gpu_id);
 
-    //   int wait_count = 0;
-    //   while (!success && gpu_overload_[gpu_id]) {
-    //     std::this_thread::sleep_for(std::chrono::microseconds(10));
-    //     wait_count++;
-    //     // if (wait_count % 100000 == 0) {
-    //     //     DLOG_WARN(
-    //     //         "ExpertDispatcher::EnqueueTask: gpu_overload_ gpu_id {}
-    //     //         wait_count {}
-    //     //         {}", gpu_id, wait_count, expert_node->node->str());
-    //     // }
-    //   }
-
-    //   if (!success && !gpu_overload_[gpu_id]) {
-    //     {
-    //       std::lock_guard<std::mutex> lock(gpu_overload_mutex_);
-    //       gpu_overload_[gpu_id] = true;
-    //     }
-    //   }
-
-    //   // c10::cuda::CUDAStream stream =
-    //   //   c10::cuda::getStreamFromExternal(exec_streams_[gpu_id + rnd],
-    //   //   gpu_id);
-    //   expert_node->node->SetDevice(CUDA_DEVICE(gpu_id), true,
-    //                                fetch_streams_[gpu_id]);
-
-    //   // auto task = std::make_shared<Task>();
-    //   // task->priority = 0;
-    //   // task->node = expert_node->node;
-    //   // task->on_demand = true;
-    //   // task->src_device = expert_node->node->device;
-    //   // task->dst_device = CUDA_DEVICE(gpu_id);
-    //   // task->remove_layer = true;
-    //   // kTaskPool->EnqueueTask(task);
-
-    //   // wait_count = 0;
-    //   // while (!expert_node->node->device.is_cuda()) {
-    //   //   std::this_thread::sleep_for(std::chrono::microseconds(10));
-    //   //   wait_count++;
-    //   //   if (wait_count % 100000 == 0) {
-    //   //     DLOG_WARN("ExpertDispatcher::EnqueueTask: wait_count ",
-    //   wait_count,
-    //   //               expert_node->node->str());
-    //   //   }
-    //   // }
-
-    //   // DLOG_TRACE(
-    //   //     "ExpertDispatcher::GPUFetchFunc: move to device gpu_id {}
-    //   layer_idx
-    //   //     {} expert_idx
-    //   //     {} node {}", gpu_id, layer_idx, expert_idx,
-    //   //     expert_node->node->device.str());
-    // }
     expert_node->node->SetDevice(CUDA_DEVICE(gpu_id), true,
                                  fetch_streams_[gpu_id]);
     expert_node->node->incache_visit_count += 1;
@@ -446,24 +328,6 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id) {
 
     ExecArgs args = std::move(exec_queue_[gpu_id].front());
     exec_queue_[gpu_id].pop_front();
-
-    // if (exec_queue_.empty()) {
-    //   // cvs_[MUTEX_TYPE::EXEC_MUTEX].wait(lock, [&] { return
-    //   // !exec_queue_.empty(); });
-    //   lock.unlock();
-    //   std::this_thread::sleep_for(std::chrono::microseconds(10));
-    //   continue;
-    // }
-
-    // ExecArgs args;
-
-    // for (auto it = exec_queue_.begin(); it != exec_queue_.end(); ++it) {
-    //   if (it->expert_node->node->device.index() == gpu_id) {
-    //     args = std::move(*it);
-    //     exec_queue_.erase(it);
-    //     break;
-    //   }
-    // }
 
     lock.unlock();
 
@@ -589,20 +453,6 @@ std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait() {
   std::unique_lock<std::mutex> lock(pending_mutex_);
   pending_cv_.wait(lock, [&] { return pending_.load() == 0; });
 
-  // while (pending_.load() > 0) {
-  //   std::unique_lock<std::mutex> lock(pending_mutex_);
-  //   std::this_thread::sleep_for(std::chrono::microseconds(10));
-  //   wait_count++;
-  //   if (wait_count % 1000 == 0) {
-  //     DLOG_WARN("ExpertDispatcher::Wait: wait_count:", wait_count,
-  //               "pending_: ", pending_.load(),
-  //               "num_enqueued: ", num_enqueued_.load(),
-  //               "input_queue_: ", input_queue_.size(),
-  //               "exec_queue_: ", exec_queue_.size());
-  //   }
-  // }
-  // input_queue_.clear();
-  // exec_queue_.clear();
   num_enqueued_.store(0);
   std::vector<CallResult> output_queue;
   {
@@ -610,13 +460,5 @@ std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait() {
     output_queue.swap(output_queue_);
   }
 
-  // std::stringstream ss;
-  // ss << "ExpertDispatcher::Wait: output_queue_ " << output_queue.size();
-  // for (auto& output : output_queue) {
-  //     ss << " (" << std::get<0>(output).sizes() << "," << std::get<1>(output)
-  //     << ","
-  //        << std::get<2>(output) << "," << std::get<3>(output) << ")";
-  // }
-  // DLOG_TRACE(ss.str());
   return output_queue;
 }
