@@ -51,9 +51,9 @@ Node::Node()
 
 void Node::SetDevice(const torch::Device& target_device, bool on_demand,
                      cudaStream_t stream) noexcept {
-  DLOG_DEBUG("SetDevice: " + str() + " to " + target_device.str());
+  DLOG_TRACE("SetDevice: " + str() + " to " + target_device.str());
   if (device == target_device) {
-    DLOG_DEBUG("SetDevice: " + str() + " to " + target_device.str() +
+    DLOG_TRACE("SetDevice: " + str() + " to " + target_device.str() +
                " but device is the same");
     return;
   }
@@ -95,14 +95,14 @@ void Node::SetDevice(const torch::Device& target_device, bool on_demand,
       auto start_time = MCIROSECONDS_SINCE_EPOCH;
       SetModuleMemoryFromDisk(tensor_ids, host_memory_ptr, on_demand);
       auto end_time = MCIROSECONDS_SINCE_EPOCH;
-      DLOG_DEBUG("SetModuleMemoryFromDisk time: {} us", end_time - start_time);
+      DLOG_TRACE("SetModuleMemoryFromDisk time: {} us", end_time - start_time);
     }
 
     if (target_device.is_cuda()) {
-      // DLOG_DEBUG("Allocate GPU Memory for node {}", this->id);
+      // DLOG_TRACE("Allocate GPU Memory for node {}", this->id);
       device_memory_ptr =
           kDeviceMemoryPool->AllocateMemory(id, byte_size, target_device);
-      // DLOG_DEBUG("Allocate GPU Memory for node {} done", this->id);
+      // DLOG_TRACE("Allocate GPU Memory for node {} done", this->id);
       assert(device_memory_ptr != nullptr);
       assert(host_memory_ptr != nullptr);
 
@@ -117,7 +117,7 @@ void Node::SetDevice(const torch::Device& target_device, bool on_demand,
       }
       SetModuleCudaMemoryFromCPU(tensor_ids, device_memory_ptr, target_device);
       auto end_time = MCIROSECONDS_SINCE_EPOCH;
-      DLOG_DEBUG("SetModuleCudaMemoryFromCPU time: {} us",
+      DLOG_TRACE("SetModuleCudaMemoryFromCPU time: {} us",
                  end_time - start_time);
     }
 
@@ -128,7 +128,7 @@ void Node::SetDevice(const torch::Device& target_device, bool on_demand,
       kDeviceMemoryPool->FreeMemory(id, device_memory_ptr, byte_size, device);
       device_memory_ptr = nullptr;
       auto end_time = MCIROSECONDS_SINCE_EPOCH;
-      DLOG_DEBUG("SetModuleMemoryFromCuda time: {} us", end_time - start_time);
+      DLOG_TRACE("SetModuleMemoryFromCuda time: {} us", end_time - start_time);
     }
   }
   device = target_device;
@@ -485,12 +485,12 @@ void ArcherTopologyHandle::InitializeTopology(
       for (auto& tensor_id : node->node->tensor_ids) {
         ss << tensor_id << " ";
       }
-      // DLOG_DEBUG("Node {} tensor ids {}", node->node->id, ss.str());
+      // DLOG_TRACE("Node {} tensor ids {}", node->node->id, ss.str());
       lfu_nodes_.push_back(node);
     }
   }
 
-  DLOG_DEBUG("InitializeTopology pipeline_.stages.size() {}",
+  DLOG_TRACE("InitializeTopology pipeline_.stages.size() {}",
              pipeline_.stages.size());
 
   // Model placement
@@ -504,7 +504,7 @@ void ArcherTopologyHandle::InitializeTopology(
   auto sparse_nodes = GetSparseNodes();
   auto dense_nodes = GetDenseNodes();
 
-  DLOG_DEBUG(
+  DLOG_TRACE(
       "InitializeTopology num_gpu {} sparse_nodes.size() {} dense_nodes.size() "
       "{}",
       num_gpu, sparse_nodes.size(), dense_nodes.size());
@@ -533,11 +533,11 @@ void ArcherTopologyHandle::InitializeTopology(
     target_device_id = (target_device_id + 1) % num_gpu;
   }
 
-  DLOG_DEBUG("InitializeTopology pipeline_.stages.size() {}",
+  DLOG_TRACE("InitializeTopology pipeline_.stages.size() {}",
              pipeline_.stages.size());
 
   for (auto& node_ptr : all_nodes) {
-    DLOG_DEBUG("Node {} {} device {}", node_ptr->id, node_ptr->is_sparse,
+    DLOG_TRACE("Node {} {} device {}", node_ptr->id, node_ptr->is_sparse,
                node_ptr->default_device.str());
   }
 
@@ -625,7 +625,7 @@ ArcherTopologyHandle::GetNumLayersAndExperts() {
 // CPU, GPU -> DISK
 // Moves tensors from CPU/GPU to disk.
 void SetModuleDisk(std::vector<TensorID>& tensor_ids) {
-  // DLOG_DEBUG("SetModuleDisk {} tensors", tensor_ids.size());
+  // DLOG_TRACE("SetModuleDisk {} tensors", tensor_ids.size());
   for (const auto& tensor_id : tensor_ids) {
     // void* old_ptr = kTensorIndex->find(tensor_id)->second.tensor.data_ptr();
     auto it = kTensorIndex->find(tensor_id);
@@ -656,7 +656,7 @@ void SetModuleMemoryFromDisk(std::vector<TensorID>& tensor_ids, void* host_ptr,
                        .requires_grad(it->second.options.requires_grad())
                        .pinned_memory(it->second.options.pinned_memory());
 
-    DLOG_DEBUG("SetModuleMemoryFromDisk tensor {}", it->second.DebugString());
+    DLOG_TRACE("SetModuleMemoryFromDisk tensor {}", it->second.DebugString());
     auto tensor_tmp =
         torch::from_blob((void*)((char*)host_ptr + param_size),
                          it->second.shape, DoNothingDeleter<void>{}, options);
@@ -673,11 +673,11 @@ void SetModuleMemoryFromDisk(std::vector<TensorID>& tensor_ids, void* host_ptr,
 // CPU -> GPU
 void SetModuleCudaMemoryFromCPU(std::vector<TensorID>& tensor_ids,
                                 void* device_ptr, const torch::Device& device) {
-  // DLOG_DEBUG("SetModuleCudaMemoryFromCPU {} tensors", tensor_ids.size());
+  // DLOG_TRACE("SetModuleCudaMemoryFromCPU {} tensors", tensor_ids.size());
   std::int64_t param_size = 0;
   for (const auto& tensor_id : tensor_ids) {
     auto it = kTensorIndex->find(tensor_id);
-    DLOG_DEBUG("SetModuleCudaMemoryFromCPU tensor {} -> {}",
+    DLOG_TRACE("SetModuleCudaMemoryFromCPU tensor {} -> {}",
                it->second.DebugString(), device.str());
     auto tensor_options = torch::TensorOptions()
                               .dtype(it->second.options.dtype())
@@ -692,7 +692,7 @@ void SetModuleCudaMemoryFromCPU(std::vector<TensorID>& tensor_ids,
         (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
     param_size += size_aligned;
   }
-  // DLOG_DEBUG("SetModuleCudaMemoryFromCPU {} tensors done",
+  // DLOG_TRACE("SetModuleCudaMemoryFromCPU {} tensors done",
   // tensor_ids.size());
 }
 
@@ -704,7 +704,7 @@ void SetModuleMemoryFromCuda(std::vector<TensorID>& tensor_ids,
     // void* old_ptr = kTensorIndex->find(tensor_id)->second.tensor.data_ptr();
 
     auto it = kTensorIndex->find(tensor_id);
-    DLOG_DEBUG("SetModuleMemoryFromCuda tensor {}", it->second.DebugString());
+    DLOG_TRACE("SetModuleMemoryFromCuda tensor {}", it->second.DebugString());
     it->second.tensor.set_data(
         torch::from_blob((char*)host_ptr + param_size, it->second.shape,
                          DoNothingDeleter<void>{}, it->second.options));
@@ -714,5 +714,5 @@ void SetModuleMemoryFromCuda(std::vector<TensorID>& tensor_ids,
         (it->second.size + kAioAlignment - 1) & ~(kAioAlignment - 1);
     param_size += size_aligned;
   }
-  // DLOG_DEBUG("SetModuleMemoryFromCuda {} tensors done", tensor_ids.size());
+  // DLOG_TRACE("SetModuleMemoryFromCuda {} tensors done", tensor_ids.size());
 }

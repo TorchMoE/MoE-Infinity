@@ -37,7 +37,7 @@ ArcherTensorHandle::ArcherTensorHandle(const std::string& prefix)
     mkdir(prefix_.c_str(), 0777);
   }
 
-  DLOG_DEBUG("Aio alignment size ", st.st_blksize);
+  DLOG_TRACE("Aio alignment size ", st.st_blksize);
 
   auto ckpt_index_path = prefix_ + std::string(ARCHER_IHDEX_NAME);
   if (access(ckpt_index_path.c_str(), F_OK) != -1) {
@@ -129,12 +129,12 @@ void ArcherTensorHandle::SetTensor(std::uint32_t tensor_id,
   if (buffer.dtype() != it->second.tensor.dtype()) {
     std::ostringstream oss;
     oss << buffer.dtype() << " -> " << it->second.tensor.dtype();
-    DLOG_DEBUG("Tensor dtype mismatch", tensor_id, oss.str());
+    DLOG_TRACE("Tensor dtype mismatch", tensor_id, oss.str());
     buffer.set_data(it->second.tensor.to(buffer.dtype()));
   } else {
     buffer.set_data(it->second.tensor);
   }
-  DLOG_DEBUG("Set tensor to device", tensor_id, buffer.device().str());
+  DLOG_TRACE("Set tensor to device", tensor_id, buffer.device().str());
 }
 
 void ArcherTensorHandle::RegisterTensor(const std::uint32_t tensor_id,
@@ -180,7 +180,7 @@ void ArcherTensorHandle::UpdateTensorMap(void* old_data_ptr,
     return;
   }
   tensor_to_id_.insert(std::make_pair(new_data_ptr, tensor_id));
-  // DLOG_DEBUG("Update tensor {} with address {} to {}",
+  // DLOG_TRACE("Update tensor {} with address {} to {}",
   //                  tensor_id,
   //                  (void*)old_data_ptr,
   //                  (void*)new_data_ptr);

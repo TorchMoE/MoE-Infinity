@@ -68,9 +68,9 @@ class SyncMixtralSparseMoeBlock(nn.Module):
         expert_index = selected_experts.reshape(
             batch_size, sequence_length, self.top_k
         )
-        self.expert_prefetcher.fetch_experts_lock_cache(
-            self.layer_id, expert_index
-        )
+        # self.expert_prefetcher.fetch_experts_lock_cache(
+        #     self.layer_id, expert_index
+        # )
         # for i in range(batch_size):
         #     seq_id = self.seq_id_list[i]
         #     # start_time = time.time()

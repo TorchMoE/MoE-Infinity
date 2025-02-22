@@ -26,7 +26,7 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
   kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
   kHostMemoryPool = std::make_unique<HostMemoryPool>();
   kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
-  DLOG_DEBUG("Free Device Memory ",
+  DLOG_TRACE("Free Device Memory ",
              kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
 
   if (prefix_.back() != '/') {
@@ -84,7 +84,7 @@ void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id,
                                          torch::Tensor& buffer) {
   auto tensor_id = kArcherTensorHandle->GetTensorId((void*)buffer.data_ptr());
   void* old_ptr = (void*)buffer.data_ptr();
-  DLOG_DEBUG("Acquire tensor ", tensor_id, old_ptr);
+  DLOG_TRACE("Acquire tensor ", tensor_id, old_ptr);
 
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
   node->state = 1;
@@ -123,7 +123,7 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id,
                                          torch::Tensor& buffer) {
   auto tensor_id = kArcherTensorHandle->GetTensorId((void*)buffer.data_ptr());
   void* old_ptr = (void*)buffer.data_ptr();
-  DLOG_DEBUG("Release tensor ", tensor_id, old_ptr);
+  DLOG_TRACE("Release tensor ", tensor_id, old_ptr);
 
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
   // node->state = 1;
@@ -155,7 +155,7 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id,
   last_node_ = node;
 
   node_id_to_tensor_ids_[node->id].erase(tensor_id);
-  // DLOG_DEBUG(
+  // DLOG_TRACE(
   //     "Node {} tensor_ids size {}", node->id,
   //     node_id_to_tensor_ids_[node->id].size());
 
@@ -167,7 +167,7 @@ void ArcherPrefetchHandle::ReleaseTensor(std::uint64_t& request_id,
   }
 
   if (kTopologyHandle->IsLastNode(node)) {
-    DLOG_DEBUG("Node is last, clean up", node->str());
+    DLOG_TRACE("Node is last, clean up", node->str());
     request_id_to_nodes_.erase(request_id);
   }
 
@@ -197,6 +197,7 @@ void ArcherPrefetchHandle::ReplaceCacheCandidates(
   std::vector<NodePtr> candidates;
   for (std::uint32_t tensor_id : tensor_ids) {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
+    node->mutex.try_lock();
     candidates.push_back(node);
   }
 
@@ -256,7 +257,7 @@ void ArcherPrefetchHandle::RegisterModule(torch::nn::Module& module) {
 }
 
 void ArcherPrefetchHandle::RegisterTensor(torch::Tensor* tensor) {
-  DLOG_DEBUG("Register tensor: is view ", (void*)tensor, tensor->is_view());
+  DLOG_TRACE("Register tensor: is view ", (void*)tensor, tensor->is_view());
 }
 
 torch::Tensor ArcherPrefetchHandle::GetTrace() {
@@ -317,7 +318,7 @@ void ArcherPrefetchHandle::TraceRequest(const std::uint64_t request_id,
 
   auto node_it = request_id_to_nodes_[request_id].find(node);
   if (node_it != request_id_to_nodes_[request_id].end()) {
-    DLOG_DEBUG("Node already traced for request ", request_id, node->str());
+    DLOG_TRACE("Node already traced for request ", request_id, node->str());
     return;
   }
 
@@ -334,7 +335,7 @@ void ArcherPrefetchHandle::SetTopology(
 bool ArcherPrefetchHandle::IsTensorOffloaded(const std::uint32_t tensor_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto it = kTensorIndex->find(tensor_id);
-  // DLOG_DEBUG("Check tensor {} {}", tensor_id, it == kTensorIndex->end());
+  // DLOG_TRACE("Check tensor {} {}", tensor_id, it == kTensorIndex->end());
   bool is_offloaded = it != kTensorIndex->end();
   if (is_offloaded) {
     it->second.id = tensor_id;
@@ -347,7 +348,7 @@ void ArcherPrefetchHandle::SetTensorDevice(torch::Tensor& tensor,
   void* device_ptr = nullptr;
   auto byte_size = tensor.element_size() * tensor.numel();
 
-  DLOG_DEBUG("Set tensor to device ", (void*)tensor.data_ptr(), device.str());
+  DLOG_TRACE("Set tensor to device ", (void*)tensor.data_ptr(), device.str());
 
   // then copy to target device
   cudaSetDevice(device.index());
@@ -386,14 +387,14 @@ bool ArcherPrefetchHandle::IsTensorOnDevice(const TensorID tensor_id) const {
 int ArcherPrefetchHandle::GetNodeDefaultDevice(
     std::vector<std::uint32_t> tensor_ids) const {
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_ids[0]);
-  // DLOG_DEBUG("Get node {} default device {}", node->str(),
+  // DLOG_TRACE("Get node {} default device {}", node->str(),
   return node->default_device.index();
 }
 
 int ArcherPrefetchHandle::GetNodeDevice(
     std::vector<std::uint32_t> tensor_ids) const {
   auto node = kTopologyHandle->GetNodeFromTensorID(tensor_ids[0]);
-  // DLOG_DEBUG("Get node {} device {}", node->str(), node->device.str());
+  // DLOG_TRACE("Get node {} device {}", node->str(), node->device.str());
   return node->device.index();
 }
 
