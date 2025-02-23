@@ -6,6 +6,8 @@
 #include "cuda_utils.h"
 #include "logger.h"
 
+int kNumDevices = GetDeviceCount();
+
 bool IsDevicePointer(const void* ptr) {
   cudaPointerAttributes attr;
   cudaError_t err = cudaPointerGetAttributes(&attr, ptr);

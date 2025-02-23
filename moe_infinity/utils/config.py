@@ -40,6 +40,9 @@ class ArcherConfig:
         default=0.9,
         metadata={"help": "Ratio of device memory to use"},
     )
+    num_threads: int = field(
+        default=8, metadata={"help": "Number of threads for each GPU exec"}
+    )
     host_memory_ratio: float = field(
         default=0.9,
         metadata={"help": "Ratio of host memory to use"},

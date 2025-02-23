@@ -45,7 +45,7 @@ class ExpertDispatcher : public base::noncopyable {
 
  public:
   explicit ExpertDispatcher(int num_experts, int num_layers, int dtype,
-                            int expert_type);
+                            int expert_type, int num_threads = 8);
   ~ExpertDispatcher() {
     main_thread_stop_flag_.store(true);
     for (auto& thread : threads_) {
@@ -109,9 +109,6 @@ class ExpertDispatcher : public base::noncopyable {
   std::atomic<bool> main_thread_stop_flag_;
 
   std::atomic<size_t> pending_;
-
-  // std::vector<std::mutex> mutexes_;
-  // std::vector<std::condition_variable> cvs_;
 
   std::mutex pending_mutex_;
   std::condition_variable pending_cv_;

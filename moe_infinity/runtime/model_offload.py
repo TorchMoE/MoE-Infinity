@@ -338,7 +338,7 @@ class OffloadEngine(object):
                     parse_moe_param(self.config)
                 )
 
-                self.dtype = parse_expert_dtype(self.configw)
+                self.dtype = parse_expert_dtype(self.config)
                 self.dtype_cls = self.config.torch_dtype
 
                 if self.config.model_type == "deepseek_v3":
@@ -467,6 +467,7 @@ class OffloadEngine(object):
                     self.num_layers,
                     self.dtype,
                     parse_expert_type(self.config),
+                    self.archer_config.num_threads,
                 )
 
                 for name, param in model.named_parameters(recurse=True):
