@@ -83,14 +83,14 @@ class SyncSwitchTransformersSparseMLP(nn.Module):
         # n_tokens = hidden_states.shape[1] * hidden_states.shape[0]
         batch_size = hidden_states.shape[0]
         expert_index = expert_index.reshape(batch_size, -1)
-        for i in range(batch_size):
-            seq_id = self.seq_id_list[i]
-            expert_matrix = self.expert_predictor.predict(
-                seq_id, expert_index[i], self.layer_id
-            )
-            self.expert_prefetcher.prefetch_experts(
-                self.layer_id, expert_matrix
-            )
+        # for i in range(batch_size):
+        #     seq_id = self.seq_id_list[i]
+        #     expert_matrix = self.expert_predictor.predict(
+        #         seq_id, expert_index[i], self.layer_id
+        #     )
+        #     self.expert_prefetcher.prefetch_experts(
+        #         self.layer_id, expert_matrix
+        #     )
 
         results = self.expert_executor.dispatch_local(
             hidden_states, router_mask, self.layer_id

@@ -50,3 +50,19 @@ void SetThreadAffinity(std::thread& th) {
     assert(false);
   }
 }
+
+void SetThreadAffinity(pid_t tid) {
+  // get number of cpus
+  int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+  kCPUCounter++;
+  int cpu_id = kCPUCounter % num_cpus;
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(cpu_id, &cpuset);
+
+  if (pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset)) {
+    std::cerr << "Failed to set Thread affinity : " << std::strerror(errno)
+              << std::endl;
+    assert(false);
+  }
+}

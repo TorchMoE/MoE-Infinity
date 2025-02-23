@@ -36,6 +36,7 @@ from moe_infinity.models import (
     SyncSwitchTransformersSparseMLP,
 )
 from moe_infinity.ops.op_builder.prefetch import PrefetchBuilder
+from moe_infinity.runtime.hooks import *
 from moe_infinity.utils import (
     ArcherConfig,
     parse_expert_dtype,
@@ -69,7 +70,7 @@ class OffloadEngine(object):
         self.offload_exemption = set()
         self.expert_modules = []
 
-        self.model_create_counter = None
+        # self.model_create_counter = None
 
         self.ckpt_files = []
 
@@ -165,21 +166,6 @@ class OffloadEngine(object):
         return self
 
     def __enter__(self):
-        def do_nothing_decorator(orig_func: Callable) -> Callable:
-            @functools.wraps(orig_func)
-            def do_nothing(*args, **kwargs):
-                pass
-
-            return do_nothing
-
-        def post_init_decorator(orig_post_init: Callable) -> Callable:
-            # FIXME: this is a hacky way to get rid of the write to weight in the post_init, need a better way to do this if we need to support model training
-            @functools.wraps(orig_post_init)
-            def archer_post_init(cls, *args, **kwargs):
-                pass
-
-            return archer_post_init
-
         def torch_index_select_decorator(orig_torch_index_select: Callable):
             @functools.wraps(orig_torch_index_select)
             def archer_torch_index_select(input, dim, index):
@@ -214,60 +200,6 @@ class OffloadEngine(object):
 
             return archer_apply_to_model
 
-        # def load_state_dict(checkpoint_file: Union[str, os.PathLike]):
-        #     self.ckpt_files.append(checkpoint_file)
-        #     raise ArcherException("Well correct with single!")
-
-        # def load_pretrained_model_decorator(
-        #         orig_load_pm: Callable) -> Callable:
-
-        #     @functools.wraps(orig_load_pm)
-        #     def archer_load_pretrained_model(cls, *args, **kwargs):
-        #         self.ckpt_files.extend(args[-2])  # TODO: check this
-        #         raise ArcherException("Well correct with shards!")
-
-        #     return archer_load_pretrained_model
-
-        def init_decorator(orig_init: Callable) -> Callable:
-            @functools.wraps(orig_init)
-            def archer_init(cls, config, *args, **kwargs):
-                # self.config = config
-                pass
-
-            return archer_init
-
-        # def config_decorator(orig_config: Callable) -> Callable:
-
-        #     @functools.wraps(orig_config)
-        #     def archer_config(cls, *args, **kwargs):
-        #         config, model_kwargs = orig_config(*args, **kwargs)
-        #         self.config = config
-        #         return config, model_kwargs
-
-        #     return archer_config
-
-        def param_init_decorator(orig_param_init: Callable) -> Callable:
-            @functools.wraps(orig_param_init)
-            def archer_param_init(cls, *args, **kwargs):
-                orig_param_init(cls, *args, **kwargs)
-
-                cls.param_real_shape = {}
-                for name, param in cls.named_parameters(recurse=False):
-                    cls.param_real_shape[name] = param.shape
-                    param.data = torch.zeros(
-                        1, dtype=param.dtype, device=param.device
-                    )
-                    self.model_create_counter.update(1)
-
-                for name, buf in cls.named_buffers(recurse=False):
-                    cls.param_real_shape[name] = buf.shape
-                    buf.data = torch.zeros(
-                        1, dtype=buf.dtype, device=buf.device
-                    )
-                    self.model_create_counter.update(1)
-
-            return archer_param_init
-
         def cast_classifier_decorator(
             orig_cast_classifier: Callable,
         ) -> Callable:
@@ -292,18 +224,22 @@ class OffloadEngine(object):
 
         # GPTQ Override
         QuantLinear._old_init = QuantLinear.__init__
-        QuantLinear.__init__ = param_init_decorator(QuantLinear.__init__)
+        QuantLinear.__init__ = empty_param_init_decorator(QuantLinear.__init__)
         QuantLinearOld._old_init = QuantLinearOld.__init__
-        QuantLinearOld.__init__ = param_init_decorator(QuantLinearOld.__init__)
+        QuantLinearOld.__init__ = empty_param_init_decorator(
+            QuantLinearOld.__init__
+        )
 
         # GPTQ Override
         QuantLinear._old_init = QuantLinear.__init__
-        QuantLinear.__init__ = param_init_decorator(QuantLinear.__init__)
+        QuantLinear.__init__ = empty_param_init_decorator(QuantLinear.__init__)
         QuantLinearOld._old_init = QuantLinearOld.__init__
-        QuantLinearOld.__init__ = param_init_decorator(QuantLinearOld.__init__)
+        QuantLinearOld.__init__ = empty_param_init_decorator(
+            QuantLinearOld.__init__
+        )
 
         self.cls._old_init = self.cls.__init__
-        self.cls.__init__ = init_decorator(self.cls._old_init)
+        self.cls.__init__ = do_nothing_decorator(self.cls._old_init)
         # self.cls.config_class._old_from_pretrained = (
         #     self.cls.config_class.from_pretrained)
         # self.cls.config_class.from_pretrained = classmethod(
@@ -331,36 +267,13 @@ class OffloadEngine(object):
         )
 
         self.cls._old_post_init = self.cls.post_init
-        self.cls.post_init = post_init_decorator(self.cls._old_post_init)
+        self.cls.post_init = do_nothing_decorator(self.cls._old_post_init)
         PreTrainedModel._old_post_init = PreTrainedModel.post_init
-        PreTrainedModel.post_init = post_init_decorator(
+        PreTrainedModel.post_init = do_nothing_decorator(
             PreTrainedModel._old_post_init
         )
 
-        # for all the modules in torch.nn, add post_init method
-        # assert False, torch.nn.modules.__dict__
-        for name, module in torch.nn.modules.__dict__.items():
-            if not isinstance(module, type):
-                continue
-            if not issubclass(module, torch.nn.modules.module.Module):
-                continue
-            if name in [
-                "Module",
-                "Sequential",
-                "ModuleDict",
-                "ModuleList",
-                "ParameterList",
-                "ParameterDict",
-            ]:
-                continue
-            module._old_init = module.__init__
-            module.__init__ = param_init_decorator(module.__init__)
-
-            if hasattr(module, "reset_parameters"):
-                module._old_reset_parameters = module.reset_parameters
-                module.reset_parameters = do_nothing_decorator(
-                    module.reset_parameters
-                )
+        activate_empty_init()
 
         transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._old_cast_classifier = transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier
         transformers.models.switch_transformers.modeling_switch_transformers.SwitchTransformersTop1Router._cast_classifier = cast_classifier_decorator(
@@ -481,10 +394,10 @@ class OffloadEngine(object):
                 # print(self.name_id_map, flush=True)
 
                 # get max tensor id from the name_id_map
-                max_tensor_id = max(self.name_id_map.values())
-                self.model_create_counter = tqdm(
-                    total=max_tensor_id, desc="Model create"
-                )
+                # max_tensor_id = max(self.name_id_map.values())
+                # self.model_create_counter = tqdm(
+                #     total=max_tensor_id, desc="Model create"
+                # )
 
                 is_flash_attn_available = kwargs.get(
                     "is_flash_attn_available", False
@@ -554,6 +467,7 @@ class OffloadEngine(object):
                     self.num_layers,
                     self.dtype,
                     parse_expert_type(self.config),
+                    self.archer_config.num_threads,
                 )
 
                 for name, param in model.named_parameters(recurse=True):
@@ -713,24 +627,7 @@ class OffloadEngine(object):
         self.cls.post_init = self.cls._old_post_init
         PreTrainedModel.post_init = PreTrainedModel._old_post_init
 
-        for name, module in torch.nn.modules.__dict__.items():
-            if not isinstance(module, type):
-                continue
-            if not issubclass(module, torch.nn.modules.module.Module):
-                continue
-            if name in [
-                "Module",
-                "Sequential",
-                "ModuleDict",
-                "ModuleList",
-                "ParameterList",
-                "ParameterDict",
-            ]:
-                continue
-            module.__init__ = module._old_init
-
-            if hasattr(module, "reset_parameters"):
-                module.reset_parameters = module._old_reset_parameters
+        deactivate_empty_init()
 
     def get_topology(self, model):
         name_lst = []
@@ -938,12 +835,12 @@ class OffloadEngine(object):
                             expert_tensors
                         )
                     )
-                    gen_args_hook(
-                        expert_key,
-                        input_device_index,
-                        output_device_index,
-                        expert_tensors,
-                    )
+                    # gen_args_hook(
+                    #     expert_key,
+                    #     input_device_index,
+                    #     output_device_index,
+                    #     expert_tensors,
+                    # )
 
                     self.expert_dispatcher.register_expert(
                         expert_layer_id, expert_idx, expert_tensors

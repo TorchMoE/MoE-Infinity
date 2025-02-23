@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "base/noncopyable.h"
+#include "base/thread.h"
 #include "expert_module.h"
 
 enum MUTEX_TYPE {
@@ -44,11 +45,11 @@ class ExpertDispatcher : public base::noncopyable {
 
  public:
   explicit ExpertDispatcher(int num_experts, int num_layers, int dtype,
-                            int expert_type);
+                            int expert_type, int num_threads = 8);
   ~ExpertDispatcher() {
     main_thread_stop_flag_.store(true);
     for (auto& thread : threads_) {
-      thread.join();
+      thread->join();
     }
 
     for (auto& stream : fetch_streams_) {
@@ -84,22 +85,22 @@ class ExpertDispatcher : public base::noncopyable {
   }
 
  private:
-  void Enqueue(const CallArgs& args);
+  void Enqueue(CallArgs& args);
   std::vector<CallResult> Wait();
   void Start() { start_ = true; }
 
   void GPUFetchFunc(int gpu_id);
   void GPUExecFunc(int gpu_id);
 
-  void GPUThreadFunc(int gpu_id);
+  // void GPUThreadFunc(int gpu_id);
 
   void OutputFunc(ExecArgs args, torch::Tensor output, int gpu_id);
 
  private:
-  std::vector<std::thread> threads_;
+  std::vector<std::unique_ptr<base::Thread>> threads_;
   std::mutex mutex_;
-  std::vector<CallArgs> input_queue_;
-  std::vector<ExecArgs> exec_queue_;
+  std::vector<std::deque<CallArgs>> input_queue_;
+  std::vector<std::deque<ExecArgs>> exec_queue_;
   std::vector<CallResult> output_queue_;
   std::vector<std::vector<ExpertNodePtr>> experts_;
   std::atomic<size_t> num_enqueued_;
@@ -109,15 +110,16 @@ class ExpertDispatcher : public base::noncopyable {
 
   std::atomic<size_t> pending_;
 
-  std::vector<std::mutex> mutexes_;
-  std::vector<std::condition_variable> cvs_;
-
   std::mutex pending_mutex_;
   std::condition_variable pending_cv_;
 
-  std::mutex input_mutex_;
+  std::vector<std::mutex> input_mutex_;
+  std::vector<std::mutex> exec_mutex_;
+  std::vector<std::condition_variable> input_cv_;
+  std::vector<std::condition_variable> exec_cv_;
+
   std::mutex output_mutex_;
-  std::mutex exec_mutex_;
+  // std::mutex exec_mutex_;
   std::mutex gpu_overload_mutex_;
 
   std::vector<cudaStream_t> fetch_streams_;
@@ -128,4 +130,8 @@ class ExpertDispatcher : public base::noncopyable {
 
   torch::Tensor hidden_states_;
   torch::Tensor router_mask_;
+
+  std::vector<int64_t> cache_sizes_;
+
+  int cache_capacity_ = 0;
 };

@@ -93,10 +93,11 @@ class DeepseekMoEBlock(nn.Module):
         # print("routing_weights_mask", routing_weights_mask.shape)
 
         # overlap current layer with unique expert list
-        unique_expert_list = torch.unique(topk_idx).tolist()
-        self.expert_prefetcher.fetch_experts_lock_cache(
-            self.layer_id, unique_expert_list
-        )
+        # unique_expert_list = torch.unique(topk_idx).tolist()
+        # self.expert_prefetcher.fetch_experts_lock_cache(
+        #     self.layer_id, unique_expert_list
+        # )
+
         # self.expert_prefetcher.prefetch_experts_list(self.layer_id, unique_expert_list)
 
         # expert_index = topk_idx.reshape(

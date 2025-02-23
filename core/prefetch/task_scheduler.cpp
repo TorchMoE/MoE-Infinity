@@ -51,7 +51,7 @@ void ArcherTaskPool::FetchExec(const std::uint64_t& request_id,
   task->dst_device = node->default_device;
   task->request_id = request_id;
 
-  DLOG_DEBUG("FetchExec: {}", task->DebugString());
+  DLOG_TRACE("FetchExec: {}", task->DebugString());
 
   {
     std::lock_guard<std::mutex> lock(unified_mutex_);
@@ -80,7 +80,7 @@ void ArcherTaskPool::FetchExec(const std::uint64_t& request_id,
 }
 
 void ArcherTaskPool::EnqueueTask(const TaskPtr& task) {
-  DLOG_DEBUG("EnqueueTask: {}", task->DebugString());
+  DLOG_TRACE("EnqueueTask: {}", task->DebugString());
 
   {
     std::lock_guard<std::mutex> lock(unified_mutex_);
@@ -105,7 +105,7 @@ void ArcherTaskPool::EnqueueTask(const TaskPtr& task) {
   if (task->src_device == task->dst_device) {
     task->node->state = 0;
     task->node->cv.notify_all();
-    DLOG_DEBUG("EnqueueTask: {} is on the same device", task->DebugString());
+    DLOG_TRACE("EnqueueTask: {} is on the same device", task->DebugString());
     return;
   }
 
@@ -114,7 +114,7 @@ void ArcherTaskPool::EnqueueTask(const TaskPtr& task) {
     unified_queue_[task->priority].push_back(task);
   }
 
-  DLOG_DEBUG("EnqueueTask: finish {}", task->DebugString());
+  DLOG_TRACE("EnqueueTask: finish {}", task->DebugString());
 }
 
 void ArcherTaskPool::StartExec(const std::uint64_t& request_id,
@@ -127,7 +127,7 @@ void ArcherTaskPool::StartExec(const std::uint64_t& request_id,
   task->dst_device = node->default_device;
   task->request_id = request_id;
 
-  DLOG_DEBUG("StartExec: {}", task->DebugString());
+  DLOG_TRACE("StartExec: {}", task->DebugString());
 
   node->visit_count += 1;
   if (node->device.is_cuda()) {
@@ -170,7 +170,7 @@ void ArcherTaskPool::StartExec(const std::uint64_t& request_id,
   }
 
   if (task->src_device.is_cuda()) {
-    // DLOG_DEBUG("StartExec: {} is on the same device", task->DebugString());
+    // DLOG_TRACE("StartExec: {} is on the same device", task->DebugString());
     std::lock_guard<std::mutex> lock(exec_mutex_);
     exec_queue_.insert({node->id, task});
     node->state = 0;
@@ -221,7 +221,7 @@ void ArcherTaskPool::StopExec(const std::uint64_t& request_id,
   task->dst_device = node->default_host;
   task->request_id = request_id;
 
-  DLOG_DEBUG("StopExec: {}", task->DebugString());
+  DLOG_TRACE("StopExec: {}", task->DebugString());
 
   node->state = 0;
   node->cv.notify_all();
@@ -235,7 +235,7 @@ void ArcherTaskPool::StopExec(const std::uint64_t& request_id,
 
 bool ArcherTaskPool::RemoveCachedSparseNode(const NodePtr& node,
                                             int device_id) {
-  // DLOG_DEBUG("RemoveCachedSparseNode: {}", node->str());
+  // DLOG_TRACE("RemoveCachedSparseNode: {}", node->str());
 
   if (node->device.is_cuda()) {
     return true;
@@ -269,7 +269,7 @@ bool ArcherTaskPool::RemoveCachedSparseNode(const NodePtr& node,
     }
   }
 
-  DLOG_DEBUG("RemoveCachedSparseNode: {} {}MB {}MB {}", device_id,
+  DLOG_TRACE("RemoveCachedSparseNode: {} {}MB {}MB {}", device_id,
              cache_size / MB, cache_limit / MB, device_nodes.size());
 
   if (cache_size > cache_limit) {
@@ -296,7 +296,7 @@ bool ArcherTaskPool::RemoveCachedSparseNode(const NodePtr& node,
         continue;
       }
       if (n->mutex.try_lock()) {
-        DLOG_DEBUG("RemoveCachedSparseNode: {}", n->str());
+        DLOG_TRACE("RemoveCachedSparseNode: {}", n->str());
         n->SetDevice(n->default_host);
         // n->incache_visit_count = 0;
         n->mutex.unlock();
@@ -310,7 +310,7 @@ bool ArcherTaskPool::RemoveCachedSparseNode(const NodePtr& node,
   }
 
   auto end_time = MILLISECONDS_SINCE_EPOCH;
-  DLOG_DEBUG("RemoveCachedSparseNode: {}MB {}MB {} {}us", cache_size / MB,
+  DLOG_TRACE("RemoveCachedSparseNode: {}MB {}MB {} {}us", cache_size / MB,
              cache_limit / MB, node->str(), end_time - start_time);
 
   return cache_size <= cache_limit;
@@ -336,7 +336,7 @@ bool ArcherTaskPool::RemoveCachedDenseNode(const NodePtr& node) {
     }
   }
 
-  DLOG_DEBUG("RemoveCachedDenseNode: {} {}MB {}MB {}", device_id,
+  DLOG_TRACE("RemoveCachedDenseNode: {} {}MB {}MB {}", device_id,
              cache_size / MB, cache_limit / MB, device_nodes.size());
 
   if (cache_size > cache_limit) {
@@ -346,7 +346,7 @@ bool ArcherTaskPool::RemoveCachedDenseNode(const NodePtr& node) {
 
     for (auto& n : device_nodes) {
       if (n->mutex.try_lock()) {
-        DLOG_DEBUG("RemoveCachedDenseNode: {} {}MB {}MB {}", device_id,
+        DLOG_TRACE("RemoveCachedDenseNode: {} {}MB {}MB {}", device_id,
                    cache_size / MB, cache_limit / MB, n->str());
 
         n->SetDevice(n->default_host);
@@ -368,11 +368,11 @@ bool ArcherTaskPool::RemoveCachedDenseNode(const NodePtr& node) {
 
   auto free_memory =
       kDeviceMemoryPool->GetFreeMemory(torch::Device(torch::kCUDA, device_id));
-  DLOG_DEBUG("RemoveCachedDenseNode: {} {}MB {}MB {}", device_id,
+  DLOG_TRACE("RemoveCachedDenseNode: {} {}MB {}MB {}", device_id,
              cache_size / MB, cache_limit / MB, free_memory / MB);
 
   auto end_time = MILLISECONDS_SINCE_EPOCH;
-  DLOG_DEBUG("RemoveCachedDenseNode: {} {}us", node->str(),
+  DLOG_TRACE("RemoveCachedDenseNode: {} {}us", node->str(),
              end_time - start_time);
   return cache_size > cache_limit;
 }
@@ -408,7 +408,7 @@ bool ArcherTaskPool::RemoveCachedDenseNode(const NodePtr& node) {
 //         }
 //     }
 
-//     DLOG_DEBUG("RemoveCachedNode: {} {}MB {}MB {}",
+//     DLOG_TRACE("RemoveCachedNode: {} {}MB {}MB {}",
 //                      device_id,
 //                      cache_size / MB,
 //                      cache_limit / MB,
@@ -423,7 +423,7 @@ bool ArcherTaskPool::RemoveCachedDenseNode(const NodePtr& node) {
 //         for (auto& n : device_nodes) {
 //             if (nodes_exec.find(n) != nodes_exec.end()) { continue; }
 //             if (n->mutex.try_lock()) {
-//                 DLOG_DEBUG("RemoveCachedNode: {} {}MB {}MB {}",
+//                 DLOG_TRACE("RemoveCachedNode: {} {}MB {}MB {}",
 //                                  device_id,
 //                                  cache_size / MB,
 //                                  cache_limit / MB,
@@ -492,14 +492,14 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
           unified_queue_[i].end());
     }
 
-    DLOG_DEBUG(("Execute task " + task->DebugString()).c_str());
+    DLOG_TRACE(("Execute task " + task->DebugString()).c_str());
 
     lock.unlock();
 
     if (!task->on_demand) {
       bool success = RemoveCachedSparseNode(node);
       if (!success) {
-        DLOG_DEBUG("{} evict failed, move to CPU", task->DebugString());
+        DLOG_TRACE("{} evict failed, move to CPU", task->DebugString());
         continue;
       }
     }
@@ -515,17 +515,17 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
 void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
   auto node = task->node;
 
-  DLOG_DEBUG("SetNodeDevice: task: {}, node: {}", task->DebugString(),
+  DLOG_TRACE("SetNodeDevice: task: {}, node: {}", task->DebugString(),
              node->str());
   if (!task->on_demand) {
     if (!node->mutex.try_lock()) {
-      DLOG_DEBUG("SetNodeDevice: task: {}, mutex locked", task->DebugString());
+      DLOG_TRACE("SetNodeDevice: task: {}, mutex locked", task->DebugString());
       return;
     }
   }
 
   if (node->device.type() == task->dst_device.type()) {
-    DLOG_DEBUG("SetNodeDevice: task: {}, skip same device",
+    DLOG_TRACE("SetNodeDevice: task: {}, skip same device",
                task->DebugString());
     if (!task->on_demand) node->mutex.unlock();
     return;
@@ -537,7 +537,7 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
   task->stream = TORCH_STREAM_H2D_VIEW(task->dst_device.index()).stream();
   node->SetDevice(task->dst_device, task->on_demand, task->stream);
   auto end_time = MCIROSECONDS_SINCE_EPOCH;
-  DLOG_DEBUG("SetNodeDevice: task: {}, emplace time {} us", task->DebugString(),
+  DLOG_TRACE("SetNodeDevice: task: {}, emplace time {} us", task->DebugString(),
              end_time - start_time);
 
   // do not unlock if node in exec queue, leave this to the release of node
@@ -551,7 +551,7 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
     node->io_state =
         static_cast<NodeState>(node->io_state | NODE_STATE_PREFETCHED);
     node->last_prefetch_time = MCIROSECONDS_SINCE_EPOCH;
-    DLOG_DEBUG("Prefetch Node: task: {}, prefetch_cnt: {}", task->DebugString(),
+    DLOG_TRACE("Prefetch Node: task: {}, prefetch_cnt: {}", task->DebugString(),
                node_body->prefetch_cnt);
   }
 }

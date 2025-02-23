@@ -38,11 +38,12 @@ Lower per-token-latency is preferable.
 
 |  | Switch-large-128 | NLLB-MoE-54B | Mixtral-8x7b | DeepSeek-V2-Lite
 | :---: | :---: | :---: | :---: | :---: |
-| <ins>MoE-Infinity</ins> | <ins>*0.230*</ins>	| <ins>*0.239*</ins> | <ins>*0.895*</ins> | <ins>*0.181*</ins> |
+| <ins>MoE-Infinity</ins> | <ins>*0.130*</ins>	| <ins>*0.119*</ins> | <ins>*0.735*</ins> | <ins>*0.155*</ins> |
 | Accelerate | 1.043 | 3.071 | 6.633 |  1.743  |
 |DeepSpeed | 4.578 | 8.381 | 2.486 | 0.737 |
 |Mixtral Offloading| X | X | 1.752 | X |
 |Ollama | X | X | 0.903 | 1.250 |
+|vLLM| X | X | 2.137 | 0.493 |
 
 
 <!-- Single GPU A5000, throughput (token/s) for generation with batch size 32.

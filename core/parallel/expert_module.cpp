@@ -23,11 +23,11 @@ void SwitchTransformersDenseActDense::SetTensorsFromBlob(
 
 torch::Tensor SwitchTransformersDenseActDense::forward(
     torch::Tensor hidden_states) {
-  // DLOG_DEBUG("SwitchTransformersDenseActDense wi {} wo {}, hidden_states {}",
+  // DLOG_TRACE("SwitchTransformersDenseActDense wi {} wo {}, hidden_states {}",
   //                  torch_dtype_to_int(wi.dtype()),
   //                     torch_dtype_to_int(wo.dtype()),
   //                     torch_dtype_to_int(hidden_states.dtype()));
-  // DLOG_DEBUG("SwitchTransformersDenseActDense wi {} wo {}, hidden_states {}",
+  // DLOG_TRACE("SwitchTransformersDenseActDense wi {} wo {}, hidden_states {}",
   return torch::matmul(
       torch::relu(torch::matmul(hidden_states,
                                 wi.transpose(0, 1).to(hidden_states.dtype()))),
@@ -77,7 +77,7 @@ void NllbMoeDenseActDense::SetTensorsFromBlob(
 }
 
 torch::Tensor NllbMoeDenseActDense::forward(torch::Tensor hidden_states) {
-  // DLOG_DEBUG("NllbMoeDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {}
+  // DLOG_TRACE("NllbMoeDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {}
   // hidden_states
   // {}",
   //                  fc1.device().str(),
@@ -111,7 +111,7 @@ void FSGPTMoEDenseActDense::SetTensorsFromBlob(
 }
 
 torch::Tensor FSGPTMoEDenseActDense::forward(torch::Tensor hidden_states) {
-  // DLOG_DEBUG("FSGPTMoEDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {}
+  // DLOG_TRACE("FSGPTMoEDenseActDense fc1 {} fc1_bias {} fc2 {} fc2_bias {}
   // hidden_states
   // {}",
   //                  fc1.device().str(),
