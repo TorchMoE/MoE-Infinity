@@ -19,9 +19,12 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <chrono>
 #include <future>
+#include <iterator>
 #include <regex>
 #include <sstream>
+#include <thread>
 
 extern void fp8_dequant_blockwise_cuda(const void* weight, const void* scale,
                                        void* out, int N, int K,
@@ -131,6 +134,9 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
     cudaStream_t exec_stream;
     cudaStreamCreateWithFlags(&exec_stream, cudaStreamNonBlocking);
     exec_streams_.emplace_back(exec_stream);
+    cudaEvent_t exec_done_event;
+    cudaEventCreateWithFlags(&exec_done_event, cudaEventDisableTiming);
+    exec_done_events_.emplace_back(exec_done_event);
 
     modules_[i] = new MoEMLP(dtype, expert_type);
 
@@ -138,6 +144,26 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
         std::bind(&ExpertDispatcher::GPUExecFunc, this, i % kNumDevices(), i);
     std::string thread_name = "GPUExecFunc" + std::to_string(i);
     threads_.emplace_back(new base::Thread(thread_func, thread_name));
+    threads_.back()->start();
+  }
+
+  {
+    auto route_func = std::bind(&ExpertDispatcher::RouteFunc, this);
+    threads_.emplace_back(new base::Thread(route_func, "ExpertRouteFunc"));
+    threads_.back()->start();
+  }
+  {
+    auto retire_func =
+        std::bind(&ExpertDispatcher::CompletionRetirementFunc, this);
+    threads_.emplace_back(
+        new base::Thread(retire_func, "CompletionRetirementFunc"));
+    threads_.back()->start();
+  }
+  {
+    auto expert_retire_func =
+        std::bind(&ExpertDispatcher::RetirementFunc, this);
+    threads_.emplace_back(
+        new base::Thread(expert_retire_func, "ExpertRetirementFunc"));
     threads_.back()->start();
   }
 
@@ -184,6 +210,7 @@ void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id,
   args.expert_idx = expert_idx;
   args.gpu_id = gpu_id;
   args.remote = remote;
+  args.generation = current_generation_.load(std::memory_order_acquire);
   Enqueue(args);
 }
 
@@ -233,6 +260,7 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
     exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
     exec_args.evict = false;
     exec_args.hit = true;
+    exec_args.generation = args.generation;
     cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
     cache_access_count_.fetch_add(1, std::memory_order_relaxed);
     // transfer_event = nullptr: expert is already on GPU, no H2D wait needed
@@ -392,196 +420,220 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       break;
     }
 
-    auto device = CUDA_DEVICE(gpu_id);
-    auto original_device = (args.remote) ? CPU_DEVICE : hidden_states_.device();
-    int64_t layer_idx = args.layer_idx;
-    int64_t expert_idx = args.expert_idx;
-    int64_t batch_size = hidden_states_.size(0);
-
-    auto expert_node = experts_[expert_idx][layer_idx];
-
-    if (args.wait_for_prefetch) {
-      while (expert_node->node->exec_state.load(std::memory_order_acquire) !=
-                 NodeExecState::IDLE &&
-             !main_thread_stop_flag_.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
+    FailureContext failure;
+    failure.gpu_id = gpu_id;
+    try {
+      int fetch_fault = static_cast<int>(DispatchFaultPoint::FETCH_WORKER);
+      if (dispatch_fault_for_test_.compare_exchange_strong(
+              fetch_fault, 0, std::memory_order_acq_rel)) {
+        throw std::runtime_error("injected fetch failure");
       }
-      if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
+
+      auto device = CUDA_DEVICE(gpu_id);
+      auto original_device =
+          (args.remote) ? CPU_DEVICE : hidden_states_.device();
+      int64_t layer_idx = args.layer_idx;
+      int64_t expert_idx = args.expert_idx;
+      int64_t batch_size = hidden_states_.size(0);
+
+      auto expert_node = experts_[expert_idx][layer_idx];
+      failure.expert_node = expert_node;
+
+      if (args.wait_for_prefetch) {
+        while (expert_node->node->exec_state.load(std::memory_order_acquire) !=
+                   NodeExecState::IDLE &&
+               !main_thread_stop_flag_.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
+        {
+          auto expected = NodeExecState::IDLE;
+          expert_node->node->exec_state.compare_exchange_strong(
+              expected, NodeExecState::FETCHING, std::memory_order_acq_rel);
+        }
+        expert_node->node->pending_dispatches.fetch_sub(
+            1, std::memory_order_acq_rel);
+        if (expert_node->node->device.is_cuda()) {
+          expert_node->node->incache_visit_count += 1;
+          expert_node->SetTensorsFromBlob(expert_node->node->device);
+          ExecArgs exec_args;
+          exec_args.expert_node = expert_node;
+          exec_args.out_gpu_id = original_device.index();
+          exec_args.out_dtype =
+              c10::typeMetaToScalarType(hidden_states_.dtype());
+          exec_args.evict = false;
+          exec_args.hit = true;
+          exec_args.generation = args.generation;
+          cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
+          cache_access_count_.fetch_add(1, std::memory_order_relaxed);
+          exec_args.transfer_event = nullptr;
+          exec_queue_[gpu_id].Push(exec_args);
+          continue;
+        }
+      }
+
+      bool cache_hit = expert_node->node->device.is_cuda();
+
+      // std::cerr << "ExpertDispatcher::GPUFetchFunc: gpu_id " << gpu_id
+      //           << " layer_idx " << layer_idx << " expert_idx " << expert_idx
+      //           << " cache_hit " << cache_hit << " node "
+      //           << expert_node->node->device.str() << std::endl;
+      DLOG_DEBUG("ExpertDispatcher::GPUFetchFunc: gpu_id ", gpu_id,
+                 " layer_idx ", layer_idx, " expert_idx ", expert_idx,
+                 "cache_hit ", cache_hit, "cache_size ", cache_sizes_[gpu_id],
+                 " incache count ", cached_experts_[gpu_id].size());
+
+      if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
+        if (batch_size > 1) {
+          // force fetch to GPU regardless of cache size, only for prefill
+          // only one extra cache slot for prefill
+          DLOG_DEBUG("overloading expert cache: gpu_id ", gpu_id,
+                     " cache size ", cache_sizes_[gpu_id], " incache count ",
+                     cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
+                     " expert_idx ", expert_idx);
+          while (gpu_overload_[gpu_id].load(std::memory_order_acquire) &&
+                 !main_thread_stop_flag_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+          }
+          if (main_thread_stop_flag_.load(std::memory_order_acquire)) {
+            break;
+          }
+          gpu_overload_[gpu_id].store(true, std::memory_order_release);
+          failure.overload_owned = true;
+        } else {
+          // find the expert in gpu and min incache_visit_count
+          ExpertNodePtr evict_expert_node = FindExpertEvict(gpu_id);
+          if (evict_expert_node == nullptr) {
+            // wait for notification that cache is available
+            DLOG_WARN(
+                "All cached expert locked, waiting for cache to be available. "
+                "gpu_id ",
+                gpu_id, " cache size ", cache_sizes_[gpu_id], " incache count ",
+                cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
+                " expert_idx ", expert_idx);
+            {
+              std::unique_lock<std::mutex> lock(cache_mutex_[gpu_id]);
+              cache_cv_[gpu_id].wait(lock, [&] {
+                return main_thread_stop_flag_.load(std::memory_order_acquire) ||
+                       FindExpertEvict(gpu_id) != nullptr;
+              });
+            }
+            if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
+            evict_expert_node = FindExpertEvict(gpu_id);
+          }
+          // auto num_layers = experts_[0].size();
+          // auto num_experts = experts_.size();
+
+          // for (size_t i = 0; i < num_experts; ++i) {
+          //   for (size_t j = 0; j < num_layers; ++j) {
+          // auto node = experts_[i][j]->node;
+          // if (node == nullptr) {
+          //   // std::cerr << "ExpertDispatcher::GPUFetchFunc: node is nullptr"
+          //   //           << " layer_idx " << j << " expert_idx " << i <<
+          //   //           std::endl;
+          //   continue;
+          // }
+          // if (node->device.is_cuda() &&
+          //     node->incache_visit_count < min_visit_count &&
+          //     node->mutex.try_lock()) {
+          //   evict_node = node;
+          //   min_visit_count = node->incache_visit_count;
+          //   node->mutex.unlock();
+          //   // std::cerr << "ExpertDispatcher::GPUFetchFunc: evict node "
+          //   //           << evict_node->device.str() << " incache_visit_count
+          //   "
+          //   //           << min_visit_count << std::endl;
+          // }
+          //   }
+          // }
+          if (evict_expert_node == nullptr) {
+            for (int retry = 0;
+                 retry < 100 && evict_expert_node == nullptr &&
+                 !main_thread_stop_flag_.load(std::memory_order_acquire);
+                 ++retry) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+              evict_expert_node = FindExpertEvict(gpu_id);
+            }
+            if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
+            DLOG_FATAL_IF(
+                evict_expert_node == nullptr,
+                "ExpertDispatcher::GPUFetchFunc: evict_node is nullptr after "
+                "retries, gpu_id",
+                gpu_id, "cache size", cache_sizes_[gpu_id], "in cache count",
+                cached_experts_[gpu_id].size());
+          }
+
+          DLOG_DEBUG("evicting expert: gpu_id ", gpu_id, " cache size ",
+                     cache_sizes_[gpu_id], " incache count ",
+                     cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
+                     " expert_idx ", expert_idx);
+
+          auto evict_node = evict_expert_node->node;
+          evict_node->SetDevice(evict_node->default_host);
+          cache_sizes_[gpu_id] += evict_node->byte_size;
+          int64_t evict_layer_idx = evict_expert_node->layer_idx;
+          int64_t evict_expert_idx = evict_expert_node->expert_idx;
+
+          // std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
+          uint64_t evict_key = (evict_layer_idx << 32) + evict_expert_idx;
+          auto it = cached_experts_[gpu_id].find(evict_key);
+          if (it != cached_experts_[gpu_id].end()) {
+            cached_experts_[gpu_id].erase(it);
+          } else {
+            DLOG_FATAL(
+                "ExpertDispatcher::GPUFetchFunc: evict_key not found. "
+                "layer_idx ",
+                evict_layer_idx, " expert_idx ", evict_expert_idx);
+          }
+        }
+      }
+
+      if (!gpu_overload_[gpu_id].load(std::memory_order_acquire)) {
+        cache_sizes_[gpu_id] -= expert_node->node->byte_size;
+        failure.cache_slot_reserved = true;
+        uint64_t key = (layer_idx << 32) + expert_idx;
+        cached_experts_[gpu_id].insert(key);
+        failure.cache_key_inserted = true;
+      }
+
+      cudaEvent_t transfer_done = nullptr;
+      expert_node->node->SetDevice(device, true, stream, &transfer_done);
+      expert_node->node->incache_visit_count += 1;
+      expert_node->SetTensorsFromBlob(device);
+      // module_->SetTensorsFromIds(expert_node->node->tensor_ids);
+
+      // std::cerr << "ExpertDispatcher::GPUFetchFunc: move to device gpu_id "
+      //           << gpu_id << " layer_idx " << layer_idx << " expert_idx "
+      //           << expert_idx << " node "
+      //           << expert_node->node->device.str() << std::endl;
+
+      // DLOG_TRACE("ExpertDispatcher::GPUFetchFunc gpu_id ", gpu_id, "layer_idx
+      // ",
+      //            layer_idx, "expert_idx ", expert_idx, "input ",
+      //            input.device().str(), "node ",
+      //            expert_node->node->device.str());
       {
-        auto expected = NodeExecState::IDLE;
-        expert_node->node->exec_state.compare_exchange_strong(
-            expected, NodeExecState::FETCHING, std::memory_order_acq_rel);
-      }
-      expert_node->node->pending_dispatches.fetch_sub(
-          1, std::memory_order_acq_rel);
-      if (expert_node->node->device.is_cuda()) {
-        expert_node->node->incache_visit_count += 1;
-        expert_node->SetTensorsFromBlob(expert_node->node->device);
         ExecArgs exec_args;
+        // exec_args.hidden_states = std::move(input);
         exec_args.expert_node = expert_node;
         exec_args.out_gpu_id = original_device.index();
         exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
-        exec_args.evict = false;
-        exec_args.hit = true;
-        cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
+        exec_args.evict = gpu_overload_[gpu_id].load(std::memory_order_acquire);
+        exec_args.hit = cache_hit;
+        exec_args.generation = args.generation;
+        exec_args.cache_slot_reserved = failure.cache_slot_reserved;
+        exec_args.cache_key_inserted = failure.cache_key_inserted;
         cache_access_count_.fetch_add(1, std::memory_order_relaxed);
-        exec_args.transfer_event = nullptr;
+        if (cache_hit) cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
+        exec_args.transfer_event = transfer_done;
+        // std::lock_guard<std::mutex> lock(exec_mutex_[gpu_id]);
+        // exec_queue_[gpu_id].emplace_back(std::move(exec_args));
         exec_queue_[gpu_id].Push(exec_args);
-        continue;
       }
+      // exec_cv_[gpu_id].notify_all();
+    } catch (...) {
+      FailDispatch(args.generation, std::current_exception(), {failure});
     }
-
-    bool cache_hit = expert_node->node->device.is_cuda();
-
-    // std::cerr << "ExpertDispatcher::GPUFetchFunc: gpu_id " << gpu_id
-    //           << " layer_idx " << layer_idx << " expert_idx " << expert_idx
-    //           << " cache_hit " << cache_hit << " node "
-    //           << expert_node->node->device.str() << std::endl;
-    DLOG_DEBUG("ExpertDispatcher::GPUFetchFunc: gpu_id ", gpu_id, " layer_idx ",
-               layer_idx, " expert_idx ", expert_idx, "cache_hit ", cache_hit,
-               "cache_size ", cache_sizes_[gpu_id], " incache count ",
-               cached_experts_[gpu_id].size());
-
-    if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
-      if (batch_size > 1) {
-        // force fetch to GPU regardless of cache size, only for prefill
-        // only one extra cache slot for prefill
-        DLOG_DEBUG("overloading expert cache: gpu_id ", gpu_id, " cache size ",
-                   cache_sizes_[gpu_id], " incache count ",
-                   cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
-                   " expert_idx ", expert_idx);
-        while (gpu_overload_[gpu_id].load(std::memory_order_acquire) &&
-               !main_thread_stop_flag_.load(std::memory_order_acquire)) {
-          std::this_thread::sleep_for(std::chrono::microseconds(1));
-        }
-        if (main_thread_stop_flag_.load(std::memory_order_acquire)) {
-          break;
-        }
-        gpu_overload_[gpu_id].store(true, std::memory_order_release);
-      } else {
-        // find the expert in gpu and min incache_visit_count
-        ExpertNodePtr evict_expert_node = FindExpertEvict(gpu_id);
-        if (evict_expert_node == nullptr) {
-          // wait for notification that cache is available
-          DLOG_WARN(
-              "All cached expert locked, waiting for cache to be available. "
-              "gpu_id ",
-              gpu_id, " cache size ", cache_sizes_[gpu_id], " incache count ",
-              cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
-              " expert_idx ", expert_idx);
-          {
-            std::unique_lock<std::mutex> lock(cache_mutex_[gpu_id]);
-            cache_cv_[gpu_id].wait(lock, [&] {
-              return main_thread_stop_flag_.load(std::memory_order_acquire) ||
-                     FindExpertEvict(gpu_id) != nullptr;
-            });
-          }
-          if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
-          evict_expert_node = FindExpertEvict(gpu_id);
-        }
-        // auto num_layers = experts_[0].size();
-        // auto num_experts = experts_.size();
-
-        // for (size_t i = 0; i < num_experts; ++i) {
-        //   for (size_t j = 0; j < num_layers; ++j) {
-        // auto node = experts_[i][j]->node;
-        // if (node == nullptr) {
-        //   // std::cerr << "ExpertDispatcher::GPUFetchFunc: node is nullptr"
-        //   //           << " layer_idx " << j << " expert_idx " << i <<
-        //   //           std::endl;
-        //   continue;
-        // }
-        // if (node->device.is_cuda() &&
-        //     node->incache_visit_count < min_visit_count &&
-        //     node->mutex.try_lock()) {
-        //   evict_node = node;
-        //   min_visit_count = node->incache_visit_count;
-        //   node->mutex.unlock();
-        //   // std::cerr << "ExpertDispatcher::GPUFetchFunc: evict node "
-        //   //           << evict_node->device.str() << " incache_visit_count "
-        //   //           << min_visit_count << std::endl;
-        // }
-        //   }
-        // }
-        if (evict_expert_node == nullptr) {
-          for (int retry = 0;
-               retry < 100 && evict_expert_node == nullptr &&
-               !main_thread_stop_flag_.load(std::memory_order_acquire);
-               ++retry) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            evict_expert_node = FindExpertEvict(gpu_id);
-          }
-          if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
-          DLOG_FATAL_IF(
-              evict_expert_node == nullptr,
-              "ExpertDispatcher::GPUFetchFunc: evict_node is nullptr after "
-              "retries, gpu_id",
-              gpu_id, "cache size", cache_sizes_[gpu_id], "in cache count",
-              cached_experts_[gpu_id].size());
-        }
-
-        DLOG_DEBUG("evicting expert: gpu_id ", gpu_id, " cache size ",
-                   cache_sizes_[gpu_id], " incache count ",
-                   cached_experts_[gpu_id].size(), " layer_idx ", layer_idx,
-                   " expert_idx ", expert_idx);
-
-        auto evict_node = evict_expert_node->node;
-        evict_node->SetDevice(evict_node->default_host);
-        cache_sizes_[gpu_id] += evict_node->byte_size;
-        int64_t evict_layer_idx = evict_expert_node->layer_idx;
-        int64_t evict_expert_idx = evict_expert_node->expert_idx;
-
-        // std::lock_guard<std::mutex> lock(cache_mutex_[gpu_id]);
-        uint64_t evict_key = (evict_layer_idx << 32) + evict_expert_idx;
-        auto it = cached_experts_[gpu_id].find(evict_key);
-        if (it != cached_experts_[gpu_id].end()) {
-          cached_experts_[gpu_id].erase(it);
-        } else {
-          DLOG_FATAL(
-              "ExpertDispatcher::GPUFetchFunc: evict_key not found. layer_idx ",
-              evict_layer_idx, " expert_idx ", evict_expert_idx);
-        }
-      }
-    }
-
-    if (!gpu_overload_[gpu_id].load(std::memory_order_acquire)) {
-      cache_sizes_[gpu_id] -= expert_node->node->byte_size;
-      uint64_t key = (layer_idx << 32) + expert_idx;
-      cached_experts_[gpu_id].insert(key);
-    }
-
-    cudaEvent_t transfer_done = nullptr;
-    expert_node->node->SetDevice(device, true, stream, &transfer_done);
-    expert_node->node->incache_visit_count += 1;
-    expert_node->SetTensorsFromBlob(device);
-    // module_->SetTensorsFromIds(expert_node->node->tensor_ids);
-
-    // std::cerr << "ExpertDispatcher::GPUFetchFunc: move to device gpu_id "
-    //           << gpu_id << " layer_idx " << layer_idx << " expert_idx "
-    //           << expert_idx << " node "
-    //           << expert_node->node->device.str() << std::endl;
-
-    // DLOG_TRACE("ExpertDispatcher::GPUFetchFunc gpu_id ", gpu_id, "layer_idx
-    // ",
-    //            layer_idx, "expert_idx ", expert_idx, "input ",
-    //            input.device().str(), "node ",
-    //            expert_node->node->device.str());
-    {
-      ExecArgs exec_args;
-      // exec_args.hidden_states = std::move(input);
-      exec_args.expert_node = expert_node;
-      exec_args.out_gpu_id = original_device.index();
-      exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
-      exec_args.evict = gpu_overload_[gpu_id].load(std::memory_order_acquire);
-      exec_args.hit = cache_hit;
-      cache_access_count_.fetch_add(1, std::memory_order_relaxed);
-      if (cache_hit) cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
-      exec_args.transfer_event = transfer_done;
-      // std::lock_guard<std::mutex> lock(exec_mutex_[gpu_id]);
-      // exec_queue_[gpu_id].emplace_back(std::move(exec_args));
-      exec_queue_[gpu_id].Push(exec_args);
-    }
-    // exec_cv_[gpu_id].notify_all();
   }
 }
 
@@ -599,22 +651,36 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
       continue;
     }
 
-    if (args.transfer_event != nullptr) {
-      cudaStreamWaitEvent(stream, args.transfer_event, 0);
-      kCudaEventPool->Release(args.transfer_event);
-      args.transfer_event = nullptr;
-    }
-
+    FailureContext failure{
+        args.expert_node,        gpu_id,     args.cache_slot_reserved,
+        args.cache_key_inserted, args.evict,
+    };
     try {
+      int exec_fault = static_cast<int>(DispatchFaultPoint::EXEC_WORKER);
+      if (dispatch_fault_for_test_.compare_exchange_strong(
+              exec_fault, 0, std::memory_order_acq_rel)) {
+        throw std::runtime_error("injected exec failure");
+      }
+
+      c10::cuda::CUDAStream torch_stream =
+          c10::cuda::getStreamFromExternal(stream, gpu_id);
+      c10::cuda::CUDAStreamGuard guard(torch_stream);
+
       if (args.transfer_event != nullptr) {
-        cudaStreamWaitEvent(stream, args.transfer_event, 0);
-        cudaEventDestroy(args.transfer_event);
+        CUDA_CHECK(cudaStreamWaitEvent(stream, args.transfer_event, 0));
+        kCudaEventPool->Release(args.transfer_event);
         args.transfer_event = nullptr;
       }
 
       int64_t batch_size = hidden_states_.size(0);
       auto device = CUDA_DEVICE(gpu_id);
       auto expert_idx = args.expert_node->expert_idx;
+
+      // Order the exec stream after the producer stream that wrote
+      // hidden_states_/router_mask_ (recorded in SetInputs).
+      if (input_ready_event_ != nullptr) {
+        cudaStreamWaitEvent(stream, input_ready_event_, 0);
+      }
 
       auto token_mask = router_mask_.index({"...", expert_idx});
       torch::Tensor input = (batch_size == 1)
@@ -635,10 +701,6 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
         }
       }
 
-      c10::cuda::CUDAStream torch_stream =
-          c10::cuda::getStreamFromExternal(stream, gpu_id);
-      c10::cuda::CUDAStreamGuard guard(torch_stream);
-
       if (expert_type_ == GPT_OSS_MOE_DENSE_ACT_DENSE) {
         modules_[thread_idx]->DequantMxfp4Params(stream);
       }
@@ -650,69 +712,111 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
 #endif
         output = modules_[thread_idx]->forward(input, stream);
       }
-      OutputFunc(args, output, token_mask, gpu_id);
-    } catch (const std::exception& e) {
+      OutputFunc(args, output, token_mask, gpu_id, stream);
+    } catch (...) {
       if (args.transfer_event != nullptr) {
-        cudaEventDestroy(args.transfer_event);
+        kCudaEventPool->Release(args.transfer_event);
         args.transfer_event = nullptr;
       }
-      DLOG_WARN("GPUExecFunc: expert forward failed: ", e.what(),
-                " (expert_idx=", args.expert_node->expert_idx,
-                " layer_idx=", args.expert_node->layer_idx, ")");
-      args.expert_node->node->exec_state.store(NodeExecState::IDLE,
-                                               std::memory_order_release);
-      pending_.fetch_sub(1);
-      if (pending_.load() == 0) {
-        pending_cv_.notify_all();
-      }
+      FailDispatch(args.generation, std::current_exception(), {failure});
     }
   }
 }
 
-void ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
-                                  torch::Tensor token_mask, int gpu_id) {
-  auto output_device =
-      (args.out_gpu_id < 0) ? CPU_DEVICE : CUDA_DEVICE(args.out_gpu_id);
-  torch::Tensor output_tensor = output.to(output_device).to(torch::kFloat32);
-
-  DLOG_TRACE("ExpertDispatcher::OutputFunc: output_tensor ",
-             output_tensor.sizes().vec(), "(", output_tensor.device().str(),
-             ")");
-
-  // args.expert_node->node->mutex.unlock();
-  int64_t expert_idx = args.expert_node->expert_idx;
-  int64_t layer_idx = args.expert_node->layer_idx;
-  int64_t batch_size = hidden_states_.size(0);
-
-  args.expert_node->node->exec_state.store(NodeExecState::IDLE,
-                                           std::memory_order_release);
-  if (args.evict) {
-    args.expert_node->node->SetDevice(args.expert_node->node->default_host,
-                                      true, nullptr);
-    DLOG_DEBUG("pop out overloaded expert cache_sizes_[gpu_id] ",
-               cache_sizes_[gpu_id], "gpu_id ", gpu_id, "layer_idx ", layer_idx,
-               "expert_idx ", expert_idx);
-    gpu_overload_[gpu_id].store(false, std::memory_order_release);
-  }
-  cache_cv_[gpu_id].notify_all();
-
-  {
-    std::lock_guard<std::mutex> lock(accum_mutex_);
-    if (batch_size == 1) {
-      final_hidden_states_.add_(
-          output_tensor *
-          router_weight_.index({torch::indexing::Slice(), expert_idx}));
-    } else {
-      auto token_indices = torch::nonzero(token_mask).squeeze(1);
-      auto weights =
-          router_weight_.index({token_mask, expert_idx}).unsqueeze(1);
-      auto weighted_output = output_tensor * weights;
-      final_hidden_states_.index_add_(0, token_indices, weighted_output);
+bool ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
+                                  torch::Tensor token_mask, int gpu_id,
+                                  cudaStream_t exec_stream) noexcept {
+  FailureContext failure{
+      args.expert_node,        gpu_id,     args.cache_slot_reserved,
+      args.cache_key_inserted, args.evict,
+  };
+  try {
+    int output_fault = static_cast<int>(DispatchFaultPoint::OUTPUT);
+    if (dispatch_fault_for_test_.compare_exchange_strong(
+            output_fault, 0, std::memory_order_acq_rel)) {
+      throw std::runtime_error("injected output failure");
     }
-  }
-  pending_.fetch_sub(1);
-  if (pending_.load() == 0) {
-    pending_cv_.notify_all();
+
+    auto output_device =
+        (args.out_gpu_id < 0) ? CPU_DEVICE : CUDA_DEVICE(args.out_gpu_id);
+    torch::Tensor output_tensor = output.to(output_device).to(torch::kFloat32);
+
+    int64_t expert_idx = args.expert_node->expert_idx;
+    int64_t batch_size = hidden_states_.size(0);
+
+    {
+      std::lock_guard<std::mutex> lock(accum_mutex_);
+      // Drop stragglers from a failed or superseded generation: after
+      // FailDispatch zeros pending_, a late worker must not accumulate into a
+      // reused final_hidden_states_ or leave a stray completion event that
+      // would trip the next dispatch's empty-events check.
+      if (current_generation_.load(std::memory_order_acquire) !=
+              args.generation ||
+          failed_generation_.load(std::memory_order_acquire) ==
+              args.generation) {
+        return true;
+      }
+      if (batch_size == 1) {
+        final_hidden_states_.add_(
+            output_tensor *
+            router_weight_.index({torch::indexing::Slice(), expert_idx}));
+      } else {
+        auto token_indices = torch::nonzero(token_mask).squeeze(1);
+        auto weights =
+            router_weight_.index({token_mask, expert_idx}).unsqueeze(1);
+        auto weighted_output = output_tensor * weights;
+        final_hidden_states_.index_add_(0, token_indices, weighted_output);
+      }
+
+      cudaEvent_t output_done = AcquireCompletionEvent(gpu_id);
+      int event_fault =
+          static_cast<int>(DispatchFaultPoint::COMPLETION_EVENT_RECORD);
+      if (dispatch_fault_for_test_.compare_exchange_strong(
+              event_fault, 0, std::memory_order_acq_rel)) {
+        ReleaseCompletionEvent(output_done, gpu_id);
+        throw std::runtime_error("injected completion_event failure");
+      }
+      cudaError_t record_status = cudaEventRecord(output_done, exec_stream);
+      if (record_status != cudaSuccess) {
+        ReleaseCompletionEvent(output_done, gpu_id);
+        throw std::runtime_error(
+            std::string("OutputFunc: cudaEventRecord failed: ") +
+            cudaGetErrorString(record_status));
+      }
+      {
+        std::lock_guard<std::mutex> state_lock(route_state_mutex_);
+        completion_events_.push_back(
+            CompletionEventRecord{output_done, args.generation, gpu_id});
+        completion_events_outstanding_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
+    auto* retire = new ExpertRetireArgs{this, args.expert_node, args.generation,
+                                        gpu_id, args.evict};
+    pending_retirement_callbacks_.fetch_add(1, std::memory_order_acq_rel);
+    int retirement_fault =
+        static_cast<int>(DispatchFaultPoint::RETIREMENT_CALLBACK_LAUNCH);
+    if (dispatch_fault_for_test_.compare_exchange_strong(
+            retirement_fault, 0, std::memory_order_acq_rel)) {
+      pending_retirement_callbacks_.fetch_sub(1, std::memory_order_acq_rel);
+      delete retire;
+      throw std::runtime_error("injected retirement_launch failure");
+    }
+    cudaError_t retire_status = cudaLaunchHostFunc(
+        exec_stream, &ExpertDispatcher::ExpertReadyToRetireCallback, retire);
+    if (retire_status != cudaSuccess) {
+      pending_retirement_callbacks_.fetch_sub(1, std::memory_order_acq_rel);
+      delete retire;
+      throw std::runtime_error(
+          std::string("cudaLaunchHostFunc expert retirement failed: ") +
+          cudaGetErrorString(retire_status));
+    }
+
+    CompleteOne(args.generation);
+    return true;
+  } catch (...) {
+    FailDispatch(args.generation, std::current_exception(), {failure});
+    return false;
   }
 }
 
@@ -721,6 +825,7 @@ std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait() {
 
   std::unique_lock<std::mutex> lock(pending_mutex_);
   pending_cv_.wait(lock, [&] { return pending_.load() == 0; });
+  SyncExecStreamsWithCurrent();
 
   num_enqueued_.store(0);
   std::vector<CallResult> output_queue;
@@ -734,17 +839,97 @@ std::vector<ExpertDispatcher::CallResult> ExpertDispatcher::Wait() {
 
 torch::Tensor ExpertDispatcher::WaitHiddenStates() {
 #ifndef NVTX_DISABLE
-  nvtx3::scoped_range r("expert_wait_barrier");
+  nvtx3::scoped_range range("expert_completion_handoff");
 #endif
   std::unique_lock<std::mutex> lock(pending_mutex_);
-  pending_cv_.wait(lock, [&] { return pending_.load() == 0; });
-  num_enqueued_.store(0);
+  pending_cv_.wait(lock, [&] {
+    return !route_pending_.load(std::memory_order_acquire) &&
+           pending_.load(std::memory_order_acquire) == 0;
+  });
+  lock.unlock();
+
+  const std::uint64_t generation =
+      current_generation_.load(std::memory_order_acquire);
+  std::exception_ptr route_error;
+  std::vector<CompletionEventRecord> events;
+  {
+    std::lock_guard<std::mutex> state_lock(route_state_mutex_);
+    route_error.swap(route_error_);
+    auto it = completion_events_.begin();
+    while (it != completion_events_.end()) {
+      if (it->generation == generation) {
+        events.push_back(*it);
+        it = completion_events_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  const int device = final_hidden_states_.device().index();
+  c10::cuda::CUDAGuard device_guard(device);
+  auto caller_stream = c10::cuda::getCurrentCUDAStream(device).stream();
+  std::size_t waits_inserted = 0;
+  try {
+    for (const CompletionEventRecord& record : events) {
+      CUDA_CHECK(cudaStreamWaitEvent(caller_stream, record.event, 0));
+      ++waits_inserted;
+    }
+    if (!events.empty()) {
+      auto callback = std::make_unique<CompletionRetireBatch>(
+          CompletionRetireBatch{this, std::move(events)});
+      pending_completion_retirement_callbacks_.fetch_add(
+          1, std::memory_order_acq_rel);
+      cudaError_t status = cudaLaunchHostFunc(
+          caller_stream, &ExpertDispatcher::CompletionWaitsConsumedCallback,
+          callback.get());
+      if (status != cudaSuccess) {
+        pending_completion_retirement_callbacks_.fetch_sub(
+            1, std::memory_order_acq_rel);
+        events = std::move(callback->records);
+        throw std::runtime_error(
+            std::string("completion retirement callback launch failed: ") +
+            cudaGetErrorString(status));
+      }
+      callback.release();
+    }
+  } catch (...) {
+    std::exception_ptr cleanup_error = std::current_exception();
+    std::vector<CompletionEventRecord> unwaited(
+        std::make_move_iterator(events.begin() + waits_inserted),
+        std::make_move_iterator(events.end()));
+    events.erase(events.begin() + waits_inserted, events.end());
+    QueueUnwaitedEventsForQuery(std::move(unwaited));
+    {
+      std::lock_guard<std::mutex> state_lock(route_state_mutex_);
+      destructor_fallback_events_.insert(
+          destructor_fallback_events_.end(),
+          std::make_move_iterator(events.begin()),
+          std::make_move_iterator(events.end()));
+    }
+    std::exception_ptr error = route_error ? route_error : cleanup_error;
+    FailDispatch(generation, error);
+    std::rethrow_exception(error);
+  }
+  num_enqueued_.store(0, std::memory_order_release);
+  if (route_error) std::rethrow_exception(route_error);
   return final_hidden_states_;
 }
 
 void ExpertDispatcher::SetInputs(const torch::Tensor& hidden_states,
                                  const torch::Tensor& router_mask,
                                  const torch::Tensor& router_weight) {
+  TORCH_CHECK(!route_pending_.load(std::memory_order_acquire) &&
+                  pending_.load(std::memory_order_acquire) == 0,
+              "SetInputs: previous dispatch is still active");
+  current_generation_.store(
+      dispatch_generation_.fetch_add(1, std::memory_order_acq_rel) + 1,
+      std::memory_order_release);
+  failed_generation_.store(0, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(route_state_mutex_);
+    route_error_ = nullptr;
+  }
   int device = at::cuda::current_device();
   auto options =
       torch::TensorOptions().dtype(torch::kFloat32).device(CUDA_DEVICE(device));
@@ -752,4 +937,430 @@ void ExpertDispatcher::SetInputs(const torch::Tensor& hidden_states,
   router_mask_ = router_mask;
   router_weight_ = router_weight;  // this can be float32
   final_hidden_states_ = torch::zeros_like(hidden_states, options);
+
+  if (input_ready_event_ == nullptr) {
+    cudaEventCreateWithFlags(&input_ready_event_, cudaEventDisableTiming);
+  }
+  cudaEventRecord(input_ready_event_, c10::cuda::getCurrentCUDAStream());
+}
+
+void ExpertDispatcher::SyncExecStreamsWithCurrent() {
+  auto current = c10::cuda::getCurrentCUDAStream();
+  for (size_t i = 0; i < exec_streams_.size(); ++i) {
+    cudaEventRecord(exec_done_events_[i], exec_streams_[i]);
+    cudaStreamWaitEvent(current.stream(), exec_done_events_[i], 0);
+  }
+}
+
+void ExpertDispatcher::DispatchExperts(int layer_idx) {
+  TORCH_CHECK(router_mask_.defined(),
+              "DispatchExperts: SetInputs must be called first");
+  TORCH_CHECK(router_mask_.is_cuda(),
+              "DispatchExperts: router_mask must be CUDA-resident");
+  TORCH_CHECK(router_mask_.dim() == 2 && router_mask_.size(1) == num_experts_,
+              "DispatchExperts: router_mask must be [tokens, num_experts]");
+
+  bool expected = false;
+  TORCH_CHECK(route_pending_.compare_exchange_strong(expected, true,
+                                                     std::memory_order_acq_rel),
+              "DispatchExperts: previous dispatch has not been waited");
+  const std::uint64_t generation =
+      current_generation_.load(std::memory_order_acquire);
+  DispatchSubmissionGuard submission(this, generation);
+  try {
+    int submission_fault = static_cast<int>(DispatchFaultPoint::SUBMISSION);
+    if (dispatch_fault_for_test_.compare_exchange_strong(
+            submission_fault, 0, std::memory_order_acq_rel)) {
+      throw std::runtime_error("injected submission failure");
+    }
+    {
+      std::lock_guard<std::mutex> lock(route_state_mutex_);
+      TORCH_CHECK(completion_events_.empty(),
+                  "DispatchExperts: unreaped completion events remain active");
+      completion_events_.reserve(num_experts_);
+    }
+    const int device = router_mask_.device().index();
+    c10::cuda::CUDAGuard device_guard(device);
+    auto active_flags = router_mask_.to(torch::kBool).any(0).contiguous();
+    auto host_options = torch::TensorOptions()
+                            .dtype(torch::kBool)
+                            .device(torch::kCPU)
+                            .pinned_memory(true);
+    auto active_flags_host = torch::empty({num_experts_}, host_options);
+    active_flags_host.copy_(active_flags, true);
+    auto stream = c10::cuda::getCurrentCUDAStream(device).stream();
+
+    RouteArgs args;
+    args.layer_idx = layer_idx;
+    args.active_flags_host = active_flags_host;
+    args.generation = generation;
+    auto callback_args = std::make_unique<RouteCallbackArgs>(
+        RouteCallbackArgs{this, std::move(args)});
+    pending_route_callbacks_.fetch_add(1, std::memory_order_acq_rel);
+    cudaError_t status = cudaLaunchHostFunc(
+        stream, &ExpertDispatcher::RouteReadyCallback, callback_args.get());
+    if (status != cudaSuccess) {
+      pending_route_callbacks_.fetch_sub(1, std::memory_order_acq_rel);
+      throw std::runtime_error(
+          std::string("DispatchExperts: cudaLaunchHostFunc failed: ") +
+          cudaGetErrorString(status));
+    }
+    callback_args.release();
+    submission.Release();
+  } catch (...) {
+    submission.Capture(std::current_exception());
+    throw;
+  }
+}
+
+void ExpertDispatcher::FailDispatch(
+    const std::uint64_t failing_generation, std::exception_ptr error,
+    const std::vector<FailureContext>& contexts) noexcept {
+  const std::uint64_t current =
+      current_generation_.load(std::memory_order_acquire);
+  if (failing_generation != current) {
+    stale_failures_quarantined_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(route_state_mutex_);
+    if (failing_generation !=
+        current_generation_.load(std::memory_order_acquire)) {
+      stale_failures_quarantined_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (!route_error_) route_error_ = std::move(error);
+    last_active_experts_.clear();
+  }
+  failed_generation_.store(failing_generation, std::memory_order_release);
+  for (const FailureContext& context : contexts) {
+    if (context.expert_node && context.expert_node->node) {
+      auto node = context.expert_node->node;
+      if (context.overload_owned && node->device.is_cuda()) {
+        try {
+          node->SetDevice(node->default_host, true, nullptr);
+        } catch (...) {
+          // FailDispatch is noexcept; preserve the first dispatch exception
+          // while still restoring terminal state below.
+        }
+      }
+      if (context.gpu_id >= 0) {
+        try {
+          uint64_t key =
+              (static_cast<uint64_t>(context.expert_node->layer_idx) << 32) |
+              static_cast<uint32_t>(context.expert_node->expert_idx);
+          std::lock_guard<std::mutex> cache_lock(cache_mutex_[context.gpu_id]);
+          if (node->device.is_cuda() && !context.overload_owned) {
+            cached_experts_[context.gpu_id].insert(key);
+          } else if (context.cache_key_inserted) {
+            cached_experts_[context.gpu_id].erase(key);
+            if (context.cache_slot_reserved) {
+              cache_sizes_[context.gpu_id] += node->byte_size;
+            }
+          }
+        } catch (...) {
+          // FailDispatch is noexcept; continue terminal restoration.
+        }
+      }
+      node->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
+    }
+    if (context.overload_owned && context.gpu_id >= 0) {
+      gpu_overload_[context.gpu_id].store(false, std::memory_order_release);
+    }
+    if (context.gpu_id >= 0) cache_cv_[context.gpu_id].notify_all();
+  }
+  route_failures_.fetch_add(1, std::memory_order_relaxed);
+  last_active_experts_count_.store(0, std::memory_order_relaxed);
+  pending_.store(0, std::memory_order_release);
+  route_pending_.store(false, std::memory_order_release);
+  pending_cv_.notify_all();
+  route_callback_cv_.notify_all();
+  retirement_callback_cv_.notify_all();
+}
+
+void ExpertDispatcher::CompleteOne(std::uint64_t generation) noexcept {
+  if (current_generation_.load(std::memory_order_acquire) != generation) return;
+  if (failed_generation_.load(std::memory_order_acquire) == generation) return;
+  size_t previous = pending_.fetch_sub(1, std::memory_order_acq_rel);
+  if (previous <= 1) {
+    pending_.store(0, std::memory_order_release);
+    pending_cv_.notify_all();
+  }
+}
+
+void CUDART_CB ExpertDispatcher::RouteReadyCallback(void* opaque) {
+  std::unique_ptr<RouteCallbackArgs> callback(
+      static_cast<RouteCallbackArgs*>(opaque));
+  ExpertDispatcher* dispatcher = callback->dispatcher;
+  try {
+    int callback_fault = static_cast<int>(DispatchFaultPoint::ROUTE_CALLBACK);
+    if (dispatcher->dispatch_fault_for_test_.compare_exchange_strong(
+            callback_fault, 0, std::memory_order_acq_rel)) {
+      throw std::runtime_error("injected callback routing failure");
+    }
+    dispatcher->route_queue_.Push(callback->route);
+  } catch (...) {
+    dispatcher->FailDispatch(callback->route.generation,
+                             std::current_exception());
+    // Hand the pinned RouteArgs to the route worker so its owning
+    // torch::Tensor is destroyed off the CUDA host-callback thread, where a
+    // pinned free would issue a forbidden CUDA call. RouteFunc drops already
+    // failed generations without routing.
+    dispatcher->route_queue_.Push(callback->route);
+  }
+  if (dispatcher->pending_route_callbacks_.fetch_sub(
+          1, std::memory_order_acq_rel) == 1) {
+    // Serialize with the destructor's predicate load to close the
+    // notify-after-check lost-wakeup window on the drain condition variable.
+    std::lock_guard<std::mutex> lock(dispatcher->route_callback_mutex_);
+    dispatcher->route_callback_cv_.notify_all();
+  }
+}
+
+void ExpertDispatcher::RouteFunc() noexcept {
+  RouteArgs args;
+  while (route_queue_.Pop(args)) {
+    if (failed_generation_.load(std::memory_order_acquire) == args.generation &&
+        args.generation != 0) {
+      args.active_flags_host = torch::Tensor();
+      continue;
+    }
+    std::vector<FailureContext> routed_contexts;
+    try {
+#ifndef NVTX_DISABLE
+      nvtx3::scoped_range range("gpu_route_handoff");
+#endif
+      int worker_fault = static_cast<int>(DispatchFaultPoint::ROUTE_WORKER);
+      if (dispatch_fault_for_test_.compare_exchange_strong(
+              worker_fault, 0, std::memory_order_acq_rel)) {
+        throw std::runtime_error("injected worker routing failure");
+      }
+      const auto started = std::chrono::steady_clock::now();
+      std::vector<int> active_experts;
+      const bool* flags = args.active_flags_host.data_ptr<bool>();
+      for (int expert_idx = 0; expert_idx < num_experts_; ++expert_idx) {
+        if (flags[expert_idx]) active_experts.push_back(expert_idx);
+      }
+      pending_.store(active_experts.size(), std::memory_order_release);
+      {
+        std::lock_guard<std::mutex> lock(route_state_mutex_);
+        last_active_experts_ = active_experts;
+      }
+      for (int expert_idx : active_experts) {
+        int gpu_id = expert_idx % kNumDevices();
+        routed_contexts.push_back(FailureContext{
+            experts_[expert_idx][args.layer_idx], gpu_id, false, false, false});
+        EnqueueExpert(args.layer_idx, expert_idx, expert_idx % kNumDevices(),
+                      false);
+      }
+      NotifyFetchStart();
+      route_batches_.fetch_add(1, std::memory_order_relaxed);
+      last_active_experts_count_.store(active_experts.size(),
+                                       std::memory_order_relaxed);
+      const auto elapsed =
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - started);
+      last_route_handoff_us_.store(elapsed.count(), std::memory_order_relaxed);
+      route_pending_.store(false, std::memory_order_release);
+      pending_cv_.notify_all();
+    } catch (...) {
+      FailDispatch(args.generation, std::current_exception(), routed_contexts);
+    }
+  }
+}
+
+void ExpertDispatcher::SetDispatchFaultForTest(const std::string& stage) {
+  static const std::map<std::string, DispatchFaultPoint> faults = {
+      {"callback", DispatchFaultPoint::ROUTE_CALLBACK},
+      {"worker", DispatchFaultPoint::ROUTE_WORKER},
+      {"fetch", DispatchFaultPoint::FETCH_WORKER},
+      {"exec", DispatchFaultPoint::EXEC_WORKER},
+      {"output", DispatchFaultPoint::OUTPUT},
+      {"completion_event", DispatchFaultPoint::COMPLETION_EVENT_RECORD},
+      {"retirement_launch", DispatchFaultPoint::RETIREMENT_CALLBACK_LAUNCH},
+      {"submission", DispatchFaultPoint::SUBMISSION},
+  };
+  auto it = faults.find(stage);
+  TORCH_CHECK(it != faults.end(), "unknown dispatch fault stage: ", stage);
+  dispatch_fault_for_test_.store(static_cast<int>(it->second),
+                                 std::memory_order_release);
+}
+
+std::vector<int> ExpertDispatcher::TakeLastActiveExperts() {
+  std::lock_guard<std::mutex> lock(route_state_mutex_);
+  return last_active_experts_;
+}
+
+std::map<std::string, std::int64_t> ExpertDispatcher::GetRoutingStats() const {
+  std::lock_guard<std::mutex> state_lock(route_state_mutex_);
+  return {
+      {"route_batches", route_batches_.load(std::memory_order_relaxed)},
+      {"route_failures", route_failures_.load(std::memory_order_relaxed)},
+      {"last_active_experts",
+       last_active_experts_count_.load(std::memory_order_relaxed)},
+      {"last_route_handoff_us",
+       last_route_handoff_us_.load(std::memory_order_relaxed)},
+      {"completion_events_retired",
+       completion_events_retired_.load(std::memory_order_relaxed)},
+      {"completion_events_outstanding",
+       completion_events_outstanding_.load(std::memory_order_relaxed)},
+      {"stale_failures_quarantined",
+       stale_failures_quarantined_.load(std::memory_order_relaxed)},
+      {"current_generation", static_cast<std::int64_t>(current_generation_.load(
+                                 std::memory_order_acquire))},
+      {"pending",
+       static_cast<std::int64_t>(pending_.load(std::memory_order_acquire))},
+      {"route_pending", route_pending_.load(std::memory_order_acquire) ? 1 : 0},
+  };
+}
+
+void ExpertDispatcher::FailDispatchForTest(std::uint64_t generation,
+                                           const std::string& message) {
+  FailDispatch(generation,
+               std::make_exception_ptr(std::runtime_error(message)));
+}
+
+void ExpertDispatcher::QueueUnwaitedEventsForQuery(
+    std::vector<CompletionEventRecord> records) noexcept {
+  if (records.empty()) return;
+  std::vector<CompletionRetireItem> items;
+  items.reserve(records.size());
+  for (const CompletionEventRecord& record : records) {
+    items.push_back(CompletionRetireItem{record, false});
+  }
+  try {
+    completion_retirement_queue_.Push(items);
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(route_state_mutex_);
+    destructor_fallback_events_.insert(destructor_fallback_events_.end(),
+                                       std::make_move_iterator(records.begin()),
+                                       std::make_move_iterator(records.end()));
+  }
+}
+
+void CUDART_CB ExpertDispatcher::CompletionWaitsConsumedCallback(void* opaque) {
+  std::unique_ptr<CompletionRetireBatch> batch(
+      static_cast<CompletionRetireBatch*>(opaque));
+  ExpertDispatcher* dispatcher = batch->dispatcher;
+  try {
+    std::vector<CompletionRetireItem> items;
+    items.reserve(batch->records.size());
+    for (const CompletionEventRecord& record : batch->records) {
+      items.push_back(CompletionRetireItem{record, true});
+    }
+    dispatcher->completion_retirement_queue_.Push(items);
+    batch->records.clear();
+  } catch (...) {
+    std::exception_ptr error = std::current_exception();
+    const std::uint64_t generation = batch->records.front().generation;
+    {
+      std::lock_guard<std::mutex> lock(dispatcher->route_state_mutex_);
+      dispatcher->destructor_fallback_events_.insert(
+          dispatcher->destructor_fallback_events_.end(),
+          std::make_move_iterator(batch->records.begin()),
+          std::make_move_iterator(batch->records.end()));
+    }
+    dispatcher->FailDispatch(generation, error);
+  }
+  if (dispatcher->pending_completion_retirement_callbacks_.fetch_sub(
+          1, std::memory_order_acq_rel) == 1) {
+    std::lock_guard<std::mutex> lock(
+        dispatcher->completion_retirement_callback_mutex_);
+    dispatcher->completion_retirement_callback_cv_.notify_all();
+  }
+}
+
+void ExpertDispatcher::CompletionRetirementFunc() {
+  std::vector<CompletionRetireItem> items;
+  while (completion_retirement_queue_.Pop(items)) {
+    std::vector<CompletionRetireItem> retry;
+    for (CompletionRetireItem& item : items) {
+      cudaError_t status = item.caller_wait_consumed
+                               ? cudaSuccess
+                               : cudaEventQuery(item.record.event);
+      if (status == cudaErrorNotReady) {
+        retry.push_back(std::move(item));
+        continue;
+      }
+      if (status != cudaSuccess) {
+        auto error = std::make_exception_ptr(
+            std::runtime_error(std::string("completion event query failed: ") +
+                               cudaGetErrorString(status)));
+        FailDispatch(item.record.generation, error);
+        std::lock_guard<std::mutex> lock(route_state_mutex_);
+        destructor_fallback_events_.push_back(std::move(item.record));
+        continue;
+      }
+      ReleaseCompletionEvent(item.record.event, item.record.device);
+      completion_events_retired_.fetch_add(1, std::memory_order_relaxed);
+      completion_events_outstanding_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    if (!retry.empty()) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      completion_retirement_queue_.Push(retry);
+    }
+    items.clear();
+  }
+}
+
+void CUDART_CB ExpertDispatcher::ExpertReadyToRetireCallback(void* opaque) {
+  std::unique_ptr<ExpertRetireArgs> retire(
+      static_cast<ExpertRetireArgs*>(opaque));
+  ExpertDispatcher* dispatcher = retire->dispatcher;
+  try {
+    dispatcher->retirement_queue_.Push(*retire);
+  } catch (...) {
+    // Runs on a CUDA host-callback thread, so pass no FailureContext: node/
+    // cache restoration issues CUDA calls that are forbidden here. State is
+    // still closed and waiters notified; the destructor resets node state.
+    dispatcher->FailDispatch(retire->generation, std::current_exception());
+  }
+  if (dispatcher->pending_retirement_callbacks_.fetch_sub(
+          1, std::memory_order_acq_rel) == 1) {
+    std::lock_guard<std::mutex> lock(dispatcher->retirement_callback_mutex_);
+    dispatcher->retirement_callback_cv_.notify_all();
+  }
+}
+
+cudaEvent_t ExpertDispatcher::AcquireCompletionEvent(int device) {
+  {
+    std::lock_guard<std::mutex> lock(completion_event_pool_mutex_);
+    auto it = completion_event_pool_.find(device);
+    if (it != completion_event_pool_.end() && !it->second.empty()) {
+      cudaEvent_t event = it->second.back();
+      it->second.pop_back();
+      return event;
+    }
+  }
+  c10::cuda::CUDAGuard device_guard(device);
+  cudaEvent_t event = nullptr;
+  CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+  return event;
+}
+
+void ExpertDispatcher::ReleaseCompletionEvent(cudaEvent_t event,
+                                              int device) noexcept {
+  if (event == nullptr) return;
+  std::lock_guard<std::mutex> lock(completion_event_pool_mutex_);
+  completion_event_pool_[device].push_back(event);
+}
+
+void ExpertDispatcher::RetirementFunc() {
+  ExpertRetireArgs args;
+  while (retirement_queue_.Pop(args)) {
+    try {
+      if (args.evict) {
+        args.expert_node->node->SetDevice(args.expert_node->node->default_host,
+                                          true, nullptr);
+        gpu_overload_[args.gpu_id].store(false, std::memory_order_release);
+      }
+      args.expert_node->node->exec_state.store(NodeExecState::IDLE,
+                                               std::memory_order_release);
+      cache_cv_[args.gpu_id].notify_all();
+    } catch (...) {
+      FailDispatch(args.generation, std::current_exception(),
+                   {FailureContext{args.expert_node, args.gpu_id, false, false,
+                                   args.evict}});
+    }
+  }
 }

@@ -1,6 +1,20 @@
 [build-system]
-requires = ["setuptools>=75.3.2", "wheel", "torch"]
+requires = ["setuptools>=75.3.2", "setuptools-scm>=8", "wheel", "torch"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+# Version is derived from git tags (e.g. tag "v0.1.0" -> version "0.1.0").
+# The resolved version is written to this file, which moe_infinity/__init__.py
+# imports at runtime. The file is git-ignored and regenerated on every build.
+version_file = "moe_infinity/_version.py"
+# PyPI/PEP 440 forbid local version segments (the "+gHASH" / "+dYYYYMMDD"
+# suffix), so strip them. Untagged nightly builds then become PyPI-valid
+# pre-releases, e.g. "0.0.2.dev4" for the 4th commit after tag "v0.0.1".
+local_scheme = "no-local-version"
+# Used only when building with neither git metadata nor sdist PKG-INFO
+# (e.g. a GitHub "Download ZIP" tarball). Normal sdist installs read the
+# version from the PKG-INFO baked into the tarball, so this is a last resort.
+fallback_version = "0.0.0"
 
 
 [tool.ruff]

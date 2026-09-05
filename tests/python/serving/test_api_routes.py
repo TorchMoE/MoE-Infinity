@@ -1,6 +1,7 @@
 # pyright: reportAny=false, reportCallIssue=false, reportExplicitAny=false, reportMissingParameterType=false, reportMissingTypeArgument=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownParameterType=false, reportUnknownVariableType=false
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, cast
@@ -50,6 +51,40 @@ def _completion_payload() -> dict[str, Any]:
         "prompt": "hello",
         "max_tokens": 4,
     }
+
+
+def _mock_model() -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=32,
+            head_dim=8,
+            max_position_embeddings=128,
+            eos_token_id=2,
+            dtype="float32",
+        ),
+        dtype="float32",
+    )
+
+
+def _parse_args(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    extra: list[str] | None = None,
+) -> Any:
+    argv = [
+        "api_server_v2.py",
+        "--model",
+        "test-model",
+        "--offload-dir",
+        "/tmp/offload",
+    ]
+    if extra:
+        argv.extend(extra)
+    monkeypatch.setattr(sys, "argv", argv)
+    return srv.parse_args()
 
 
 def _configure_auth_state(
@@ -163,6 +198,110 @@ def test_initialize_with_model_forwards_speculative_draft(
         return MagicMock()
 
     monkeypatch.setattr(srv, "ContinuousBatchingEngine", _capture_engine)
+    model = _mock_model()
+    offload_engine = object()
+    moe_model = SimpleNamespace(model=model, engine=offload_engine)
+    speculator = object()
+
+    srv.initialize_with_model(
+        moe_model=moe_model,
+        model_name="test-model",
+        tok=None,
+        max_seq_length=128,
+        speculative_draft=speculator,
+        enable_deepseek_mla_paging=True,
+        max_resident_paged_speculative_sessions=3,
+        min_free_mla_blocks_after_admission=2,
+    )
+
+    assert captured["model"] is model
+    assert captured["engine"] is offload_engine
+    assert captured["speculative_draft"] is speculator
+    assert captured["decode_graph_capability_provider"] is moe_model
+
+
+def test_decode_cuda_graphs_are_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _parse_args(monkeypatch)
+
+    assert args.enable_decode_cuda_graphs is False
+    config = srv._build_engine_config(args, _mock_model())
+    assert config["enable_decode_cuda_graphs"] is False
+
+
+def test_decode_cuda_graph_cli_values_reach_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = _parse_args(
+        monkeypatch,
+        extra=[
+            "--enable-decode-cuda-graphs",
+            "--decode-cuda-graph-batch-sizes",
+            "1",
+            "2",
+            "4",
+            "--decode-cuda-graph-context-sizes",
+            "128",
+            "256",
+            "--decode-cuda-graph-warmup-iters",
+            "3",
+            "--decode-cuda-graph-max-memory-bytes",
+            "1073741824",
+        ],
+    )
+
+    config = srv._build_engine_config(args, _mock_model())
+
+    assert config["enable_decode_cuda_graphs"] is True
+    assert config["decode_cuda_graph_batch_sizes"] == (1, 2, 4)
+    assert config["decode_cuda_graph_context_sizes"] == (128, 256)
+    assert config["decode_cuda_graph_warmup_iters"] == 3
+    assert config["decode_cuda_graph_max_memory_bytes"] == 1073741824
+
+
+def test_dflash_paged_cli_defaults_remain_off_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "api_server_v2.py",
+            "--model",
+            "demo/model",
+            "--offload-dir",
+            "/tmp/offload",
+        ],
+    )
+
+    args = srv.parse_args()
+
+    assert args.enable_deepseek_mla_paging is False
+    assert args.max_resident_paged_speculative_sessions == 1
+    assert args.min_free_mla_blocks_after_admission == 1
+
+
+def test_dflash_paged_cli_values_forward_to_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "api_server_v2.py",
+            "--model",
+            "demo/model",
+            "--offload-dir",
+            "/tmp/offload",
+            "--enable-deepseek-mla-paging",
+            "--max-resident-paged-speculative-sessions",
+            "4",
+            "--min-free-mla-blocks-after-admission",
+            "3",
+        ],
+    )
+    args = srv.parse_args()
     model = SimpleNamespace(
         config=SimpleNamespace(
             num_hidden_layers=2,
@@ -176,21 +315,12 @@ def test_initialize_with_model_forwards_speculative_draft(
         ),
         dtype="float32",
     )
-    offload_engine = object()
-    moe_model = SimpleNamespace(model=model, engine=offload_engine)
-    speculator = object()
 
-    srv.initialize_with_model(
-        moe_model=moe_model,
-        model_name="test-model",
-        tok=None,
-        max_seq_length=128,
-        speculative_draft=speculator,
-    )
+    config = srv._build_engine_config(args=args, model=model)
 
-    assert captured["model"] is model
-    assert captured["engine"] is offload_engine
-    assert captured["speculative_draft"] is speculator
+    assert config["enable_deepseek_mla_paging"] is True
+    assert config["max_resident_paged_speculative_sessions"] == 4
+    assert config["min_free_mla_blocks_after_admission"] == 3
 
 
 def test_list_models_engine_not_ready(client: TestClient) -> None:
@@ -228,6 +358,42 @@ def test_metrics_endpoint(client: TestClient) -> None:
     assert "moe_queue_depth" in body
     assert "moe_kv_cache_free_blocks" in body
     assert "moe_tokens_generated_total" in body
+
+
+def test_metrics_endpoint_exports_graph_counters_and_bounded_reasons(
+    client: TestClient,
+) -> None:
+    srv.engine.get_stats.return_value = {
+        **_make_mock_stats(),
+        "cuda_graph": {
+            "captures": 2,
+            "replays": 9,
+            "capture_failures": 1,
+            "graphs": 2,
+            "graph_pool_bytes": 4096,
+            "scratch_kv_bytes": 2048,
+            "fallback_reasons": {
+                "expert_dispatcher": 7,
+                "not_decode": 3,
+                "unbounded-exception-text": 99,
+            },
+            "capability_reason": "expert_dispatcher",
+        },
+    }
+
+    response = client.get("/metrics")
+
+    assert "moe_cuda_graph_captures_total 2" in response.text
+    assert "moe_cuda_graph_replays_total 9" in response.text
+    assert "moe_cuda_graph_capture_failures_total 1" in response.text
+    assert "moe_cuda_graph_instances 2" in response.text
+    assert "moe_cuda_graph_pool_bytes 4096" in response.text
+    assert "moe_cuda_graph_scratch_kv_bytes 2048" in response.text
+    assert (
+        'moe_cuda_graph_fallback_total{reason="expert_dispatcher"} 7'
+        in response.text
+    )
+    assert 'reason="unbounded-exception-text"' not in response.text
 
 
 def test_metrics_engine_not_ready(client: TestClient) -> None:

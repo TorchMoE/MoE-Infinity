@@ -14,6 +14,16 @@ from .batch import (
     SchedulerOutput,
     split_prefill_decode_batch,
 )
+from moe_infinity.runtime.attention_backend import PagedAttentionBackend
+from moe_infinity.runtime.attention_types import DECODE_GRAPH_REASONS
+
+from .batch import (
+    BatchBuilder,
+    BatchMetadata,
+    _slice_batch,
+    split_prefill_decode_batch,
+)
+from .cuda_graph import CudaGraphRunner
 from .kv_cache import PagedKVCache
 from .memory_manager import MemoryManager
 from .model_runner import ModelRunner
@@ -25,6 +35,12 @@ from .sequence import (
     SequenceGroup,
     SequenceStatus,
 )
+from .spec_session_driver import (
+    ServingSpecSession,
+    SpecSessionDriver,
+)
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +78,29 @@ def validate_chunked_prefill_config(config: dict[str, object]) -> None:
         config.get("enable_prefix_caching", False)
     ):
         raise ValueError(CHUNKED_PREFIX_INCOMPATIBLE)
+
+
+def _debug_cleanup_reporting_failure(
+    *,
+    action: str,
+    request_id: str,
+    phase: str,
+    primary: BaseException,
+    reporting_error: BaseException,
+) -> None:
+    try:
+        logger.debug(
+            "cleanup %s attachment failed for request %s during %s; "
+            "primary=%s reporting=%s",
+            action,
+            request_id,
+            phase,
+            type(primary).__name__,
+            type(reporting_error).__name__,
+            exc_info=reporting_error,
+        )
+    except BaseException:
+        return
 
 
 def set_eviction_sync(adapter: Optional[EvictionSyncAdapter]) -> None:
@@ -108,6 +147,7 @@ class ContinuousBatchingEngine:
         config: dict[str, object],
         tokenizer: Optional[object] = None,
         speculative_draft: SpeculativeGenerator | None = None,
+        decode_graph_capability_provider: object = None,
     ) -> None:
         validate_chunked_prefill_config(dict(config))
         self.model = model
@@ -140,6 +180,7 @@ class ContinuousBatchingEngine:
             head_dim=head_dim,
         )
 
+        backend_storage = self._resolve_backend_storage(engine)
         self.kv_cache = PagedKVCache(
             num_blocks=num_blocks,
             block_size=block_size,
@@ -148,6 +189,7 @@ class ContinuousBatchingEngine:
             head_dim=head_dim,
             dtype=self.dtype,
             device=self.device,
+            storage=backend_storage,
         )
         self.scheduler = Scheduler(
             self.kv_cache,
@@ -175,12 +217,82 @@ class ContinuousBatchingEngine:
                 "verify_expert_byte_deficit_cap"
             ),
         )
-        self.model_runner = ModelRunner(model, engine, device=self.device)
+        from moe_infinity.models.paged_attention_registry import (
+            PagedAttentionLayerRegistry,
+        )
+
+        storage = self.kv_cache.storage
+        backend = backend_storage and self._resolve_attention_backend(engine)
+        if storage is None:
+            self.paged_attention_registry = PagedAttentionLayerRegistry.empty(
+                reason="native_paged_required"
+            )
+        else:
+            self.paged_attention_registry = (
+                PagedAttentionLayerRegistry.register(
+                    model=model, backend=backend, storage=storage
+                )
+            )
+        self.model_runner = ModelRunner(
+            model,
+            engine,
+            device=self.device,
+            paged_kv_storage=storage,
+            paged_attention_registry=self.paged_attention_registry,
+            decode_graph_capability_provider=decode_graph_capability_provider,
+        )
+        self.cuda_graph_runner = CudaGraphRunner(
+            self.model_runner,
+            storage,
+            enabled=self._get_bool_config("enable_decode_cuda_graphs", False),
+            batch_buckets=self._get_int_tuple_config(
+                "decode_cuda_graph_batch_sizes", (1, 2, 4, 8, 16, 32)
+            ),
+            context_buckets=self._get_int_tuple_config(
+                "decode_cuda_graph_context_sizes",
+                (128, 256, 512, 1024, 2048, 4096),
+            ),
+            warmup_iters=self._get_int_config(
+                "decode_cuda_graph_warmup_iters", 2
+            ),
+            max_graph_memory_bytes=self._get_int_config(
+                "decode_cuda_graph_max_memory_bytes", 0
+            ),
+        )
         self.sampler = Sampler()
         self.batch_builder = BatchBuilder()
         self.speculative_draft = speculative_draft
+        enable_paged_mla = self.config.get("enable_deepseek_mla_paging", False)
+        if not isinstance(enable_paged_mla, bool):
+            raise ValueError(
+                "enable_deepseek_mla_paging must be a boolean value"
+            )
+        max_resident_paged_sessions = self._get_int_config(
+            "max_resident_paged_speculative_sessions", 1
+        )
+        min_free_mla_blocks = self._get_int_config(
+            "min_free_mla_blocks_after_admission", 1
+        )
+        if max_resident_paged_sessions < 0:
+            raise ValueError(
+                "max_resident_paged_speculative_sessions must be >= 0"
+            )
+        if min_free_mla_blocks < 1:
+            raise ValueError("min_free_mla_blocks_after_admission must be >= 1")
         self._verify_scheduling_enabled = (
             self.scheduler.verify_scheduling_enabled
+        )
+        self._spec_session_driver = (
+            SpecSessionDriver(
+                speculative_draft,
+                enable_paged_mla=enable_paged_mla,
+                max_resident_paged_speculative_sessions=(
+                    max_resident_paged_sessions
+                ),
+                min_free_mla_blocks_after_admission=min_free_mla_blocks,
+            )
+            if self._can_drive_verify_rounds()
+            else None
         )
 
         self._bind_layered_paged_kv_store()
@@ -195,6 +307,7 @@ class ContinuousBatchingEngine:
         self._num_prefill_chunks = 0
 
         self._next_seq_id = 0
+        self._shutdown = False
         self._sequences: dict[int, SequenceData] = {}
         self._sequence_to_request_id: dict[int, str] = {}
         self._request_to_seq_ids: dict[str, list[int]] = {}
@@ -202,6 +315,7 @@ class ContinuousBatchingEngine:
         self._callbacks: dict[str, list[Callable[[RequestOutput], None]]] = {}
         self._completed_request_ids: set[str] = set()
         self._cancelled_request_ids: set[str] = set()
+        self._request_failures: dict[str, dict[str, str]] = {}
         self._num_steps = 0
         self._total_generated_tokens = 0
 
@@ -245,12 +359,18 @@ class ContinuousBatchingEngine:
         self.scheduler.add_request(group)
 
     def step(self) -> list[RequestOutput]:
+        self._prepare_speculative_rounds()
         scheduler_output = self.scheduler.schedule()
+        outputs = self._verify_speculative_rounds(
+            scheduler_output.verify_seq_ids
+        )
         if (
             not scheduler_output.prefill_seq_ids
             and not scheduler_output.decode_seq_ids
         ):
-            return []
+            if outputs:
+                self._num_steps += 1
+            return outputs
 
         batch = self.batch_builder.from_scheduler_output(
             scheduler_output,
@@ -264,6 +384,9 @@ class ContinuousBatchingEngine:
 
         if self._can_delegate_speculative(batch, scheduler_output):
             speculative_transaction_id = scheduler_output.prefill_transaction_id
+        if self._spec_session_driver is None and self._can_delegate_speculative(
+            batch
+        ):
             if self._can_drive_verify_rounds():
                 return self._step_speculative_session(
                     batch, speculative_transaction_id
@@ -299,7 +422,65 @@ class ContinuousBatchingEngine:
             self._num_steps += 1
             return []
 
-        next_token_ids = sampler_output.token_ids
+        # Compatibility limit: pre-Stage4a session doubles do not accept a
+        # request-scoped generator and retain the original singleton,
+        # whole-request Step-5 behavior. Canonical SpecSession implementations
+        # always take the persistent path below.
+        if (
+            self._spec_session_driver is not None
+            and not self._spec_session_driver.supports_request_generator
+            and self._can_delegate_speculative(batch)
+        ):
+            outputs.extend(self._step_speculative_session(batch))
+            return outputs
+
+        speculative_indices = [
+            index
+            for index, seq_id in enumerate(batch.seq_ids)
+            if self._can_start_persistent_speculative(
+                seq_id, batch.is_prefill[index]
+            )
+        ]
+        for index in speculative_indices:
+            outputs.extend(
+                self._begin_persistent_speculative(batch.seq_ids[index])
+            )
+
+        speculative_index_set = set(speculative_indices)
+        fallback_indices = [
+            index
+            for index in range(len(batch.seq_ids))
+            if index not in speculative_index_set
+        ]
+        if fallback_indices:
+            fallback_batch = (
+                batch
+                if len(fallback_indices) == len(batch.seq_ids)
+                else _slice_batch(batch, fallback_indices)
+            )
+            outputs.extend(self._step_standard(fallback_batch))
+
+        if speculative_indices and not fallback_indices:
+            self._num_steps += 1
+        return outputs
+
+    def _step_standard(self, batch: BatchMetadata) -> list[RequestOutput]:
+        """Execute the ordinary serving path for a scheduler-selected subset."""
+
+        sampled_indices = self._sampled_row_indices(batch)
+        logits = self._execute_batch(batch)
+        next_token_ids = None
+        if sampled_indices:
+            sampled_logits = self._extract_last_token_logits(
+                logits, batch, sampled_indices
+            )
+            sampled_params = [
+                batch.sampling_params[index] for index in sampled_indices
+            ]
+            sampler_output = self.sampler.sample(
+                sampled_logits, sampled_params
+            )
+            next_token_ids = sampler_output.token_ids
 
         outputs: list[RequestOutput] = []
         completed_seq_ids: list[int] = []
@@ -382,6 +563,296 @@ class ContinuousBatchingEngine:
                 indices.append(index)
         return indices
 
+    @property
+    def speculative_sessions(self) -> dict[int, ServingSpecSession]:
+        """Live Stage 4a records, keyed by serving sequence id."""
+        driver = self._spec_session_driver
+        return {} if driver is None else driver.sessions
+
+    def _can_start_persistent_speculative(
+        self, seq_id: int, is_prefill: bool
+    ) -> bool:
+        """Check semantics that the temporary DynamicCache path can preserve."""
+        if self._spec_session_driver is None or not is_prefill:
+            return False
+        sequence = self._sequences[seq_id]
+        params = sequence.sampling_params
+        return (
+            sequence.status is SequenceStatus.PREFILL
+            and not sequence.output_token_ids
+            and params.max_tokens > 0
+            and not params.stop
+            and params.temperature >= 0
+            and params.top_p > 0
+            and params.top_p <= 1
+            and params.repetition_penalty == 1.0
+            and params.logprobs <= 0
+            and not self._has_unsupported_speculative_metadata(params)
+        )
+
+    @staticmethod
+    def _has_unsupported_speculative_metadata(params: SamplingParams) -> bool:
+        for name in (
+            "grammar",
+            "guided_decoding",
+            "response_format",
+            "logit_bias",
+            "logits_processors",
+        ):
+            if getattr(params, name, None):
+                return True
+        for name in ("presence_penalty", "frequency_penalty", "min_p"):
+            if float(getattr(params, name, 0.0) or 0.0) != 0.0:
+                return True
+        return False
+
+    def _begin_persistent_speculative(self, seq_id: int) -> list[RequestOutput]:
+        driver = self._spec_session_driver
+        if driver is None:
+            raise RuntimeError(
+                "persistent speculative driver is not configured"
+            )
+        sequence = self._sequences[seq_id]
+        request_id = self._sequence_to_request_id[seq_id]
+        params = sequence.sampling_params
+        stop_token_ids = (
+            [self.eos_token_id] if self.eos_token_id is not None else []
+        )
+        generator: torch.Generator | None = None
+        if params.temperature > 0:
+            generator_device = (
+                self.device
+                if self.device.type == "cuda"
+                else torch.device("cpu")
+            )
+            generator = torch.Generator(device=generator_device)
+            base_seed = self._get_int_config("speculative_seed", 0)
+            generator.manual_seed(base_seed + seq_id)
+        record = driver.begin(
+            request_id=request_id,
+            seq_id=seq_id,
+            prompt_token_ids=sequence.prompt_token_ids,
+            max_new_tokens=params.max_tokens,
+            temperature=params.temperature,
+            top_k=max(0, params.top_k),
+            top_p=params.top_p,
+            stop_token_ids=stop_token_ids,
+            callbacks=tuple(self._callbacks.get(request_id, ())),
+            generator=generator,
+        )
+        sequence.set_status(SequenceStatus.DRAFT)
+        committed = driver.commit(record)
+        return self._publish_speculative_commit(record, committed)
+
+    def _prepare_speculative_rounds(self) -> None:
+        driver = self._spec_session_driver
+        if driver is None:
+            return
+        for record in tuple(driver.sessions.values()):
+            sequence = self._sequences.get(record.seq_id)
+            if (
+                record.cancelled
+                or record.released
+                or sequence is None
+                or sequence.status is not SequenceStatus.DRAFT
+                or record.finished
+            ):
+                continue
+            try:
+                draft = driver.draft(record)
+            except BaseException as exc:
+                self._fail_speculative_request(record, "draft", exc)
+                raise
+            if record.cancelled or record.released:
+                continue
+            self.scheduler.set_verify_demand(
+                record.seq_id,
+                tokens=int(getattr(draft, "tokens")),
+                expert_bytes=int(getattr(draft, "expert_bytes")),
+                in_flight=False,
+            )
+
+    def _verify_speculative_rounds(
+        self, admitted_seq_ids: list[int]
+    ) -> list[RequestOutput]:
+        driver = self._spec_session_driver
+        if driver is None:
+            return []
+        outputs: list[RequestOutput] = []
+        for seq_id in admitted_seq_ids:
+            record = driver.sessions.get(seq_id)
+            sequence = self._sequences.get(seq_id)
+            if (
+                record is None
+                or sequence is None
+                or record.pending_draft is None
+            ):
+                continue
+            sequence.set_status(SequenceStatus.VERIFY)
+            try:
+                _ = driver.verify(record)
+            except BaseException as exc:
+                self._fail_speculative_request(record, "verify", exc)
+                raise
+            self.scheduler.clear_verify_demand(seq_id)
+            if (
+                record.cancelled
+                or record.released
+                or seq_id not in self._sequences
+            ):
+                continue
+            committed = driver.commit(record)
+            outputs.extend(self._publish_speculative_commit(record, committed))
+        return outputs
+
+    def _fail_speculative_request(
+        self,
+        failed_record: ServingSpecSession,
+        phase: str,
+        primary: BaseException,
+    ) -> None:
+        """Fail one request atomically while preserving its backend exception."""
+        request_id = failed_record.request_id
+        failure = {
+            "phase": phase,
+            "failure_type": type(primary).__name__,
+            "code": f"speculative_{phase}_failed",
+        }
+        self._request_failures[request_id] = failure
+        seq_ids = list(self._request_to_seq_ids.get(request_id, ()))
+        cleanup_errors: list[BaseException] = []
+        driver = self._spec_session_driver
+        if driver is not None:
+            records = [
+                record
+                for record in tuple(driver.sessions.values())
+                if record.request_id == request_id
+            ]
+            for record in records:
+                self.scheduler.clear_verify_demand(record.seq_id)
+                try:
+                    driver.fail(record, failure)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+        try:
+            self.scheduler.abort_request(request_id)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+        self._callbacks.pop(request_id, None)
+        self._request_outputs.pop(request_id, None)
+        self._request_to_seq_ids.pop(request_id, None)
+        for seq_id in seq_ids:
+            self.scheduler.clear_verify_demand(seq_id)
+            self._sequence_to_request_id.pop(seq_id, None)
+            self._sequences.pop(seq_id, None)
+        if _eviction_sync is not None:
+            try:
+                _eviction_sync.on_request_aborted(request_id)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            cleanup_metadata = tuple(cleanup_errors)
+            try:
+                setattr(primary, "session_cleanup_errors", cleanup_metadata)
+            except BaseException as reporting_error:
+                _debug_cleanup_reporting_failure(
+                    action="metadata",
+                    request_id=request_id,
+                    phase=phase,
+                    primary=primary,
+                    reporting_error=reporting_error,
+                )
+            try:
+                add_note = getattr(primary, "add_note", None)
+            except BaseException as reporting_error:
+                _debug_cleanup_reporting_failure(
+                    action="note-lookup",
+                    request_id=request_id,
+                    phase=phase,
+                    primary=primary,
+                    reporting_error=reporting_error,
+                )
+                add_note = None
+            if callable(add_note):
+                for cleanup_error in cleanup_metadata:
+                    try:
+                        add_note(
+                            "speculative request cleanup failed: "
+                            f"{cleanup_error}"
+                        )
+                    except BaseException as reporting_error:
+                        _debug_cleanup_reporting_failure(
+                            action="note",
+                            request_id=request_id,
+                            phase=phase,
+                            primary=primary,
+                            reporting_error=reporting_error,
+                        )
+
+    def _publish_speculative_commit(
+        self,
+        record: ServingSpecSession,
+        committed: tuple[int, ...],
+    ) -> list[RequestOutput]:
+        if record.cancelled or record.released:
+            return []
+        sequence = self._sequences.get(record.seq_id)
+        if sequence is None:
+            return []
+
+        outputs: list[RequestOutput] = []
+        for token_id in committed:
+            sequence.append_output_token(token_id)
+            self._request_outputs[record.request_id][record.seq_id].append(
+                token_id
+            )
+            self._total_generated_tokens += 1
+            finish_reason = self._get_finish_reason(sequence, token_id)
+            finished = finish_reason is not None
+            output = RequestOutput(
+                request_id=record.request_id,
+                seq_id=record.seq_id,
+                token_id=token_id,
+                token_text=self._decode_token(token_id),
+                finished=finished,
+                finish_reason=finish_reason,
+                usage=(self._build_usage(sequence) if finished else None),
+            )
+            outputs.append(output)
+            for callback in record.callbacks:
+                callback(output)
+            if finished:
+                break
+
+        finished = record.finished or self._output_finished(outputs)
+        committed_count = len(outputs)
+        if finished:
+            if sequence.status in (SequenceStatus.DRAFT, SequenceStatus.VERIFY):
+                sequence.set_status(SequenceStatus.FINISHED)
+            self.scheduler.update_after_step(
+                completed_seq_ids=[record.seq_id],
+                new_decode_seq_ids=[],
+                committed_counts={record.seq_id: committed_count},
+            )
+            driver = self._spec_session_driver
+            if driver is not None:
+                driver.release(record)
+            if self._is_request_finished(record.request_id):
+                self._completed_request_ids.add(record.request_id)
+                if _eviction_sync is not None:
+                    _eviction_sync.on_request_finished(record.request_id)
+                self._callbacks.pop(record.request_id, None)
+        else:
+            if sequence.status is SequenceStatus.VERIFY:
+                sequence.set_status(SequenceStatus.DRAFT)
+            self.scheduler.update_after_step(
+                completed_seq_ids=[],
+                new_decode_seq_ids=[],
+                committed_counts={record.seq_id: committed_count},
+            )
+        return outputs
+
     def _can_delegate_speculative(
         self,
         batch: BatchMetadata,
@@ -399,6 +870,13 @@ class ContinuousBatchingEngine:
             return False
         if batch.is_prefill != [True]:
             return False
+
+        if scheduler_output is not None:
+            chunk = scheduler_output.prefill_chunks.get(batch.seq_ids[0])
+            if chunk is not None and (
+                chunk.start_pos != 0 or not chunk.is_terminal
+            ):
+                return False
 
         if scheduler_output is not None:
             chunk = scheduler_output.prefill_chunks.get(batch.seq_ids[0])
@@ -741,12 +1219,19 @@ class ContinuousBatchingEngine:
                 SequenceStatus.WAITING,
                 SequenceStatus.PREFILL,
                 SequenceStatus.DECODE,
+                SequenceStatus.DRAFT,
+                SequenceStatus.VERIFY,
                 SequenceStatus.SWAPPED,
             }
             for seq_id in seq_ids
             if seq_id in self._sequences
         )
 
+        driver = self._spec_session_driver
+        if driver is not None:
+            for seq_id in seq_ids:
+                driver.cancel(seq_id)
+                self.scheduler.clear_verify_demand(seq_id)
         self.scheduler.abort_request(request_id)
         _ = self._callbacks.pop(request_id, None)
 
@@ -767,20 +1252,100 @@ class ContinuousBatchingEngine:
     def has_pending_requests(self) -> bool:
         return bool(self._pending_request_ids())
 
+    def invalidate_cuda_graphs(self, reason: str) -> None:
+        self.cuda_graph_runner.invalidate(reason)
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self.cuda_graph_runner.close()
+        self._shutdown = True
+
     def get_stats(self) -> dict[str, object]:
         status_counts = {status.value: 0 for status in SequenceStatus}
         for sequence in self._sequences.values():
             status_counts[sequence.status.value] += 1
 
+        graph_runner = getattr(self, "cuda_graph_runner", None)
+        cuda_graph_stats = graph_runner.stats() if graph_runner else {}
+        storage = getattr(self.kv_cache, "storage", None)
+        scratch_kv_bytes = 0
+        if storage is not None:
+            scratch_kv_bytes = (
+                storage.num_graph_scratch_blocks
+                * storage.spec.block_size
+                * storage.spec.num_layers
+                * 2
+                * storage.spec.num_kv_heads
+                * storage.spec.head_dim
+                * torch.empty((), dtype=storage.spec.dtype).element_size()
+            )
+        graph_pool_bytes = int(cuda_graph_stats.get("graph_pool_bytes", 0))
+        set_graph_usage = getattr(
+            self.memory_manager, "set_cuda_graph_usage", None
+        )
+        if callable(set_graph_usage):
+            set_graph_usage(
+                graph_pool_bytes=graph_pool_bytes,
+                scratch_kv_bytes=scratch_kv_bytes,
+            )
+
+        capability_fn = getattr(
+            getattr(self, "model_runner", None),
+            "decode_graph_capability",
+            None,
+        )
+        capability = capability_fn() if callable(capability_fn) else None
+        registry = getattr(self, "paged_attention_registry", None)
+        if capability is not None and registry is not None:
+            capability_reason = (
+                capability.reason
+                if capability.reason in DECODE_GRAPH_REASONS
+                else "missing_capability"
+            )
+            bindings = tuple(registry.bindings)
+            proved_write_layers = sum(
+                1 for binding in bindings if binding.has_write_proof
+            )
+            cuda_graph_stats.update(
+                {
+                    "scratch_kv_bytes": scratch_kv_bytes,
+                    "kv_storage_owner_id": (
+                        storage.owner_id if storage is not None else None
+                    ),
+                    "capability_safe": (
+                        capability.safe and capability_reason == "eligible"
+                    ),
+                    "capability_reason": capability_reason,
+                    "registered_paged_layers": len(bindings),
+                    "proved_write_layers": proved_write_layers,
+                }
+            )
+
         return {
             "pending_requests": len(self._pending_request_ids()),
             "completed_requests": len(self._completed_request_ids),
             "cancelled_requests": len(self._cancelled_request_ids),
+            "failed_requests": len(self._request_failures),
             "num_steps": self._num_steps,
             "total_generated_tokens": self._total_generated_tokens,
             "kv_cache_num_blocks": self.kv_cache.num_blocks,
             "kv_cache_free_blocks": self.kv_cache.block_allocator.num_free_blocks,
             "sequence_status_counts": status_counts,
+            "speculative_execution_context": (
+                self._spec_session_driver.execution_context_mode
+                if self._spec_session_driver is not None
+                else None
+            ),
+            "speculative_sessions": [
+                record.diagnostics()
+                for record in self.speculative_sessions.values()
+            ],
+            "paged_mla_admission": (
+                self._spec_session_driver.admission_stats
+                if self._spec_session_driver is not None
+                else None
+            ),
             "memory": self.memory_manager.report(),
             "num_prefill_chunks": self._num_prefill_chunks,
             "chunked_prefill_requested": (
@@ -790,7 +1355,13 @@ class ContinuousBatchingEngine:
             "chunked_prefill_fallback_reason": (
                 self._chunked_prefill_fallback_reason
             ),
+            "cuda_graph": cuda_graph_stats,
         }
+
+    def get_request_failure(self, request_id: str) -> dict[str, str]:
+        if request_id not in self._request_failures:
+            raise KeyError(f"request_id '{request_id}' has no recorded failure")
+        return dict(self._request_failures[request_id])
 
     def get_config(self) -> dict[str, object]:
         config: dict[str, object] = {}
@@ -899,19 +1470,14 @@ class ContinuousBatchingEngine:
     def _execute_batch(self, batch: BatchMetadata) -> torch.Tensor:
         has_prefill = any(batch.is_prefill)
         has_decode = any(not p for p in batch.is_prefill)
-        paged_classes_getter = getattr(
-            self.model_runner,
-            "_get_paged_attention_classes",
-            None,
-        )
-        paged_classes: list[object] = []
-        if callable(paged_classes_getter):
-            maybe_paged_classes: object = paged_classes_getter()
-            if isinstance(maybe_paged_classes, list):
-                paged_classes = cast(list[object], maybe_paged_classes)
-        uses_paged = bool(paged_classes)
+        uses_paged = bool(self.paged_attention_registry.bindings)
 
-        if not uses_paged or not (has_prefill and has_decode):
+        if not (has_prefill and has_decode):
+            if has_decode and not has_prefill:
+                return self._execute_decode_batch(batch)
+            return self.model_runner.execute(batch)
+
+        if not uses_paged:
             return self.model_runner.execute(batch)
 
         split = split_prefill_decode_batch(batch)
@@ -920,8 +1486,14 @@ class ContinuousBatchingEngine:
         if split.prefill_batch is not None:
             prefill_logits = self.model_runner.execute(split.prefill_batch)
         if split.decode_batch is not None:
-            decode_logits = self.model_runner.execute(split.decode_batch)
+            decode_logits = self._execute_decode_batch(split.decode_batch)
         return split.recombine_outputs(prefill_logits, decode_logits)
+
+    def _execute_decode_batch(self, batch: BatchMetadata) -> torch.Tensor:
+        graph_logits = self.cuda_graph_runner.try_execute(batch)
+        if graph_logits is not None:
+            return graph_logits
+        return self.model_runner.execute(batch)
 
     @staticmethod
     def _extract_last_token_logits(
@@ -988,6 +1560,8 @@ class ContinuousBatchingEngine:
             SequenceStatus.WAITING,
             SequenceStatus.PREFILL,
             SequenceStatus.DECODE,
+            SequenceStatus.DRAFT,
+            SequenceStatus.VERIFY,
             SequenceStatus.SWAPPED,
         }
 
@@ -1120,6 +1694,30 @@ class ContinuousBatchingEngine:
         return torch.device("cpu")
 
     @staticmethod
+    def _resolve_attention_backend(engine: object) -> object | None:
+        getter = getattr(engine, "get_attention_backend", None)
+        if callable(getter):
+            backend = getter()
+            if backend is not None:
+                return backend
+        for attr_name in (
+            "attention_backend",
+            "_attention_backend",
+            "_native_attention_backend",
+        ):
+            backend = getattr(engine, attr_name, None)
+            if backend is not None:
+                return backend
+        return None
+
+    @classmethod
+    def _resolve_backend_storage(cls, engine: object) -> object | None:
+        backend = cls._resolve_attention_backend(engine)
+        if not isinstance(backend, PagedAttentionBackend):
+            return None
+        return backend.storage
+
+    @staticmethod
     def _resolve_model_memory_bytes(model: object) -> int:
         get_memory_footprint = getattr(model, "get_memory_footprint", None)
         if callable(get_memory_footprint):
@@ -1184,6 +1782,29 @@ class ContinuousBatchingEngine:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{key} must be an integer value")
         return value
+
+    def _get_bool_config(self, key: str, default: bool) -> bool:
+        value = self.config.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a boolean value")
+        return value
+
+    def _get_int_tuple_config(
+        self, key: str, default: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        if key not in self.config:
+            return default
+        value = self.config[key]
+        if isinstance(value, (str, bytes)) or not isinstance(
+            value, (list, tuple)
+        ):
+            raise ValueError(f"{key} must be a sequence of integers")
+        result: list[int] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError(f"{key} must contain only integers")
+            result.append(item)
+        return tuple(result)
 
 
 __all__ = [

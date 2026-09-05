@@ -2,16 +2,16 @@ import importlib.util
 import sys
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Optional, Protocol, cast
 
 ROOT = str(Path(__file__).resolve().parents[3])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-_ = sys.modules.pop("moe_infinity", None)
-_ = sys.modules.pop("moe_infinity.serving", None)
 MEMORY_MANAGER_PATH = (
     Path(ROOT) / "moe_infinity" / "serving" / "memory_manager.py"
 )
+_MISSING_MODULE = object()
 
 
 class AdaptiveKVSchedulerProtocol(Protocol):
@@ -46,8 +46,15 @@ def _load_adaptive_scheduler() -> type[AdaptiveKVSchedulerProtocol]:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load module from {MEMORY_MANAGER_PATH}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    previous_module = sys.modules.get(module_name, _MISSING_MODULE)
+    try:
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    finally:
+        if previous_module is _MISSING_MODULE:
+            _ = sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = cast(ModuleType, previous_module)
     return cast(
         type[AdaptiveKVSchedulerProtocol],
         getattr(module, "AdaptiveKVScheduler"),

@@ -398,7 +398,9 @@ print(f"find_packages: {find_packages()}")
 # install all files in the package, rather than just the egg
 setup(
     name="moe_infinity",
-    version=os.getenv("MOEINF_VERSION", "0.0.1"),
+    # version is supplied dynamically by setuptools-scm (see pyproject.toml
+    # [tool.setuptools_scm]); it is derived from git tags at build time and
+    # baked into the sdist's PKG-INFO so it survives a source reinstall.
     packages=find_packages(exclude=["extensions", "extensions.*"]),
     include_package_data=True,
     install_requires=install_requires,

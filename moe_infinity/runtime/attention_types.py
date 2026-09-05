@@ -1,8 +1,51 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import torch
+
+DECODE_GRAPH_REASONS = (
+    "eligible",
+    "missing_capability",
+    "active_model_hooks",
+    "archer_callbacks",
+    "transfer_scheduler",
+    "expert_dispatcher",
+    "kv_offload",
+    "flashinfer_plan_path",
+    "dynamic_allocations",
+    "native_paged_required",
+    "mla_layout_unsupported",
+    "kv_storage_mismatch",
+    "paged_class_unregistered",
+    "layer_idx_invalid",
+    "layer_write_unproven",
+)
+
+
+@dataclass(frozen=True)
+class PagedLayerWriteProof:
+    class_fqn: str
+    layer_idx: int
+    storage_owner_id: str
+    writer: str
+    writes_before_attention: bool
+    allocation_free: bool
+
+
+@dataclass(frozen=True)
+class DecodeGraphCapability:
+    safe: bool
+    reason: str
+    storage_owner_id: str | None = None
+    layer_write_proofs: tuple[PagedLayerWriteProof, ...] = ()
+
+
+@runtime_checkable
+class DecodeGraphCapabilityProvider(Protocol):
+    def decode_graph_capability(self) -> DecodeGraphCapability: ...
 
 
 @dataclass(frozen=True)
@@ -71,6 +114,8 @@ class AttentionMetadata:
     is_prefill: bool
     seq_lens: torch.Tensor | None = None
     lengths: PagedBatchLengths | None = field(default=None)
+    kv_storage_owner_id: str | None = None
+    seq_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.lengths is not None and self.seq_lens is None:
@@ -86,3 +131,5 @@ def _as_int_list(value: list[int] | torch.Tensor) -> list[int]:
     if isinstance(value, torch.Tensor):
         return [int(item) for item in value.detach().cpu().tolist()]
     return list(value)
+    kv_storage_owner_id: str | None = None
+    seq_id: int | None = None

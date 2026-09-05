@@ -1,6 +1,18 @@
+from moe_infinity.spec_decode.backends import (
+    DFlashExecutionBackend,
+    ExecutionBackend,
+    PhysicalCohortBackend,
+    PhysicalCohortResult,
+)
+from moe_infinity.spec_decode.backends_bare_hf import (
+    BareHFCohortResult,
+    BatchedBareHFBackend,
+)
+from moe_infinity.spec_decode.backends_rich import BatchedRichBackend
 from moe_infinity.spec_decode.dflash import (
     DFlashConfig,
     DFlashSpeculator,
+    build_pairing_evidence,
     read_dflash_config,
     validate_pairing,
 )
@@ -9,13 +21,67 @@ from moe_infinity.spec_decode.glm_dflash import (
     glm_dflash_drafter_for,
     validate_glm_pairing,
 )
+from moe_infinity.spec_decode.protocols import (
+    BackendCapabilities,
+    CacheAdapter,
+    CacheKind,
+    CacheSnapshot,
+    DenseCacheAdapter,
+    ExecutorEvidence,
+    NativeStepTrace,
+    PairingEvidence,
+    RequestSpec,
+    RichBatchMetadata,
+    RichForwardResult,
+    SamplingContext,
+    SessionRoundResult,
+    SessionTrace,
+)
+from moe_infinity.spec_decode.session_driver import (
+    BackendProgressError,
+    CohortPlan,
+    DriverResult,
+    PhysicalCohortDriverResult,
+    SessionCleanupError,
+    SessionDriver,
+    UnsupportedRequestError,
+)
 
 __all__ = [
     "DFlashConfig",
+    "DFlashExecutionBackend",
     "DFlashSpeculator",
+    "ExecutionBackend",
+    "PhysicalCohortBackend",
+    "PhysicalCohortResult",
+    "BareHFCohortResult",
+    "BatchedBareHFBackend",
+    "BatchedRichBackend",
+    "build_pairing_evidence",
     "read_dflash_config",
     "validate_pairing",
     "glm_dflash_available",
     "glm_dflash_drafter_for",
     "validate_glm_pairing",
+    "BackendCapabilities",
+    "CacheAdapter",
+    "CacheKind",
+    "CacheSnapshot",
+    "DenseCacheAdapter",
+    "ExecutorEvidence",
+    "NativeStepTrace",
+    "PairingEvidence",
+    "RequestSpec",
+    "RichBatchMetadata",
+    "RichForwardResult",
+    "SamplingContext",
+    "SessionRoundResult",
+    "SessionTrace",
+    "CohortPlan",
+    "BackendProgressError",
+    "DriverResult",
+    "PhysicalCohortDriverResult",
+    "SessionDriver",
+    "SessionCleanupError",
+    "UnsupportedRequestError",
 ]

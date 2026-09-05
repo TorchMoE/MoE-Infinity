@@ -189,6 +189,23 @@ class Qwen3PagedAttention(Qwen3MoeAttention):
             scale=cast(float, self.scaling),
             layer_idx=int(self.layer_idx),
         )
+        try:
+            attn_output_tokens = paged_backend.forward(
+                query_tokens,
+                key_tokens,
+                value_tokens,
+                attention_metadata=attention_metadata,
+                scale=cast(float, self.scaling),
+                layer_idx=self.layer_idx,
+            )
+        except TypeError:
+            attn_output_tokens = paged_backend.forward(
+                query_tokens,
+                key_tokens,
+                value_tokens,
+                attention_metadata=attention_metadata,
+                scale=cast(float, self.scaling),
+            )
 
         if packed and attn_output_tokens is not None:
             scattered = attn_output_tokens.new_zeros(

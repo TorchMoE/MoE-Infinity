@@ -85,6 +85,62 @@ The decision-profile runner toggles `cudaProfilerStart` and `cudaProfilerStop` a
 - `sync_overhead.sync_pct_of_step` shows how much of each step disappears into synchronization.
 - `bandwidth_analysis.top_bottlenecks` from `run_all.py` ranks the worst components by share of step time.
 
+## GPU-only expert routing A/B and Nsight runbook
+
+Run both modes with the same checkout, checkpoint, offload tree, GPU visibility, cache ratio, prompt, output length, and greedy decoding:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/serving/latency.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /tmp/moe-infinity-bench/deepseek-v2-lite-chat \
+  --concurrency 1 2 4 \
+  --prompt-length 128 \
+  --max-new-tokens 64 \
+  --warmup-rounds 3 \
+  --num-rounds 30 \
+  --gpu-only-expert-routing off \
+  --output-json /tmp/gpu-routing-off.json
+
+CUDA_VISIBLE_DEVICES=0 python benchmarks/serving/latency.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /tmp/moe-infinity-bench/deepseek-v2-lite-chat \
+  --concurrency 1 2 4 \
+  --prompt-length 128 \
+  --max-new-tokens 64 \
+  --warmup-rounds 3 \
+  --num-rounds 30 \
+  --gpu-only-expert-routing on \
+  --routing-baseline-json /tmp/gpu-routing-off.json \
+  --output-json /tmp/gpu-routing-on.json
+```
+
+```bash
+MOE_INFINITY_PROFILE_IO=1 MOE_INFINITY_PROFILE_IO_SAMPLE=1.0 \
+CUDA_VISIBLE_DEVICES=0 nsys profile \
+  --trace=cuda,nvtx --sample=none --cpuctxsw=none --force-overwrite=true \
+  --output=/tmp/gpu-routing-on \
+  python benchmarks/expert_io_microbench/run_decision_profile.py \
+    --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+    --offload-dir /tmp/moe-infinity-bench/deepseek-v2-lite-chat \
+    --hardware-tag single-host --mode host-only \
+    --gpu-only-expert-routing on \
+    --warmup-iters 3 --warmup-tokens 8 --iters 3 --max-new-tokens 32 \
+    --output-json /tmp/gpu-routing-profile.json
+
+python benchmarks/expert_io_microbench/nsys_parser.py \
+  /tmp/gpu-routing-on.nsys-rep --steps 96 \
+  --profile-json /tmp/gpu-routing-profile.json \
+  > /tmp/gpu-routing-nsys-summary.json
+```
+
+- TPOT is decode elapsed time divided by generated tokens after the first token; `itl_*` remains an alias for compatibility.
+- Compare off/on runs only on the same commit, process environment, checkpoint, offload tree, visible GPUs, cache ratio, prompt/output lengths, and greedy mode.
+- KEEP requires semantic tests to pass, zero route failures, zero unexpected eager fallbacks, TPOT p50 regression <=2%, and TPOT p99 regression <=5% at concurrency 1, 2, and 4.
+- Roll back by setting `gpu_only_expert_routing=false`; do not remove eager bindings during the rollout.
+- First-release runs must keep `speculative_prefetch_overlap=false` and any `overlap_prefetch_mode` at `off`; `observe`/`enforce` combinations are configuration errors, not benchmark variants.
+- A later reconciliation may permit simultaneous enablement only after both plans share generation, active-list, completion, retirement, and failure ownership contracts.
+- Results apply to single-host personal-machine offloading only. They are not multi-node results and are not promises of DeepEP or paper-level speedups.
+
 ## Historical results
 
 This README does not pin a canonical result set. Any JSON or markdown you archive from a past run is historical, so label it with the commit, model, hardware, and date if you share it elsewhere.
