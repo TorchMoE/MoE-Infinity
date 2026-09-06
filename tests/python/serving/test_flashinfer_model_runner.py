@@ -240,3 +240,91 @@ def test_model_runner_skips_paged_context_for_non_paged_models() -> None:
 
     logits = runner.execute(_make_prefill_batch())
     assert logits.shape == (3, 16)
+
+
+def _install_fake_flashinfer(monkeypatch: pytest.MonkeyPatch) -> None:
+    from moe_infinity.runtime import (
+        attention_backend as _attention_backend_module,
+    )
+
+    class _FakeWrapper:
+        def __init__(self, workspace, layout) -> None:
+            self.plan_args = None
+
+        def plan(self, *args, **kwargs) -> None:
+            self.plan_args = (args, kwargs)
+
+        def run(self, query, kv_cache):
+            return torch.zeros_like(query)
+
+    fake_module = types.SimpleNamespace(
+        BatchPrefillWithPagedKVCacheWrapper=_FakeWrapper,
+        BatchDecodeWithPagedKVCacheWrapper=_FakeWrapper,
+    )
+    monkeypatch.setattr(
+        _attention_backend_module.flashinfer_utils, "HAS_FLASHINFER", True
+    )
+    monkeypatch.setattr(
+        _attention_backend_module.flashinfer_utils,
+        "get_flashinfer_module",
+        lambda: fake_module,
+    )
+    monkeypatch.setattr(
+        _attention_backend_module.flashinfer_utils,
+        "get_workspace",
+        lambda device: torch.empty(16, dtype=torch.uint8, device=device),
+    )
+
+
+def _make_transactional_backend(
+    block_size: int, monkeypatch: pytest.MonkeyPatch
+):
+    from moe_infinity.runtime.attention_backend import PagedAttentionBackend
+    from moe_infinity.runtime.attention_types import KVCacheSpec
+
+    _install_fake_flashinfer(monkeypatch)
+    backend = PagedAttentionBackend(
+        spec=KVCacheSpec(
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=torch.float16,
+            block_size=block_size,
+        ),
+        num_gpu_blocks=8,
+        device=torch.device("cpu"),
+    )
+    backend.create_layered_store(layer_count=1)
+    return backend
+
+
+def test_model_runner_detects_real_qwen3_paged_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import (
+        Qwen3MoeConfig,
+    )
+
+    from moe_infinity.models.qwen3_paged_attention import Qwen3PagedAttention
+
+    config = Qwen3MoeConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_hidden_layers=1,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    attention = Qwen3PagedAttention(config, layer_idx=0)
+    model = torch.nn.Module()
+    model.add_module("qwen_attention", attention)
+    model.config = config
+    backend = _make_transactional_backend(block_size=4, monkeypatch=monkeypatch)
+    runner = ModelRunner(
+        model, _MockEngine(backend), device=torch.device("cpu")
+    )
+
+    assert runner._get_paged_attention_classes() == [Qwen3PagedAttention]
+    assert runner.supports_chunked_prefill() is True

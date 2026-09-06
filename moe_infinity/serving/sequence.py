@@ -56,6 +56,33 @@ class SequenceData:
         self.num_computed_tokens = len(self.prompt_token_ids) + len(
             self.output_token_ids
         )
+        self.committed_kv_tokens = self.num_computed_tokens
+
+    @property
+    def remaining_prefill_tokens(self) -> int:
+        if self.output_token_ids:
+            return 0
+        return max(0, self.prompt_length - self.num_computed_tokens)
+
+    @property
+    def prefill_complete(self) -> bool:
+        return self.num_computed_tokens >= self.prompt_length
+
+    def advance_prefill(self, num_tokens: int) -> None:
+        if self.status is not SequenceStatus.PREFILL:
+            raise RuntimeError("advance_prefill requires prefill status")
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be > 0, got {num_tokens}")
+        new_total = self.num_computed_tokens + num_tokens
+        if new_total > self.prompt_length:
+            raise ValueError(
+                f"prefill progress {new_total} exceeds prompt length "
+                f"{self.prompt_length}"
+            )
+        if self.output_token_ids:
+            raise RuntimeError("prefill progress cannot advance after decode")
+        self.num_computed_tokens = new_total
+        self.committed_kv_tokens = new_total
 
     def _validate_transition(self, new_status: SequenceStatus) -> None:
         if self.status == new_status:
@@ -68,6 +95,7 @@ class SequenceData:
                 SequenceStatus.CANCELLED,
             },
             SequenceStatus.PREFILL: {
+                SequenceStatus.WAITING,
                 SequenceStatus.DECODE,
                 SequenceStatus.DRAFT,
                 SequenceStatus.FINISHED,

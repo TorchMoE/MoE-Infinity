@@ -1238,6 +1238,9 @@ class MoE:
         kv_cache_ratio: float = 0.25,
         max_batch_size: int = 32,
         enable_prefix_caching: bool = False,
+        enable_chunked_prefill: bool = False,
+        prefill_chunk_size: int = 512,
+        prefill_starvation_threshold_steps: int = 8,
         offload_dir: Optional[str] = None,
         speculative_draft: Optional[object] = None,
         enable_deepseek_mla_paging: bool = False,
@@ -1289,6 +1292,11 @@ class MoE:
             kv_cache_ratio=kv_cache_ratio,
             max_batch_size=max_batch_size,
             enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=enable_chunked_prefill,
+            prefill_chunk_size=prefill_chunk_size,
+            prefill_starvation_threshold_steps=(
+                prefill_starvation_threshold_steps
+            ),
             speculative_draft=serving_speculator,
             enable_deepseek_mla_paging=enable_deepseek_mla_paging,
             max_resident_paged_speculative_sessions=(

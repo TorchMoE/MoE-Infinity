@@ -449,6 +449,9 @@ class PagedAttentionBackend:
             )
         self._layer_registry = by_layer
 
+    def supports_chunked_prefill(self) -> bool:
+        return self._flashinfer_enabled()
+
     def _init_from_storage(
         self,
         storage: "PagedKVStorage",

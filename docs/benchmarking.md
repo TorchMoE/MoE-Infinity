@@ -386,6 +386,43 @@ Fill this in for every benchmark run:
 | Metrics captured | `ttft_ms, itl_p50_ms, decode_toks_per_s, peak_gpu_memory_mb` |
 | Notes | `host-only, nsys, FlashInfer on, sampled off` |
 
+### Chunked-prefill TTFT/TPOT tails
+
+Start two identical paged-attention servers: baseline without the feature and
+candidate with `--enable-chunked-prefill --prefill-chunk-size 512`. Warm both
+servers with the same requests, then run:
+
+```bash
+python benchmarks/serving/chunked_prefill_latency.py \
+  --baseline-url http://127.0.0.1:8000 \
+  --candidate-url http://127.0.0.1:8001 \
+  --tokenizer /models/the-exact-served-tokenizer \
+  --short-requests 64 --long-requests 16 \
+  --short-prompt-tokens 128 --long-prompt-tokens 8192 \
+  --max-tokens 128 --rounds 5 \
+  --output-json chunked-prefill-paired.json
+```
+
+Repeat for chunk sizes 128, 256, 512, and 1024 at fixed hardware, model,
+offload layout, tokenizer, request trace, and seed. Requests are sent as exact
+token-ID arrays produced and range-checked by that tokenizer. Report p50/p90/p99
+TTFT and TPOT, measured output tokens/second, errors, prefill-backpressure steps,
+peak KV used blocks, and peak KV utilization. Do not infer a speedup from a
+single run.
+
+Before latency canarying, the direct real-Qwen3/real-FlashInfer test must PASS
+(not skip), the valid unequal-capacity test must report
+`logical_blocks=min(memory_budget_blocks, block_store.physical_capacity)`, and
+the later-row reservation/checkpoint plus every scheduler-preflight failure test
+must restore all progress, rows, block references, and tables. Confirm that a
+server with both feature flags fails startup with the documented exact error;
+benchmark only the supported both-disabled and chunking-only configurations.
+
+Latency acceptance requires output-token parity, zero request errors, no final
+KV-block leak, non-null measured throughput and peak-KV fields, candidate p99
+TPOT no more than 5% above baseline, and candidate p99 TTFT no more than 5%
+above baseline. If any gate fails, keep the default disabled and retain the
+paired JSON for diagnosis.
 ## GPU-only expert routing A/B and Nsight runbook
 
 Run both modes with the same checkout, checkpoint, offload tree, GPU

@@ -404,3 +404,37 @@ If you need timeout debugging, use the watchdog logs and the troubleshooting gui
 - `400`: invalid `n` / `best_of` / other request validation.
 - `finish_reason="error"`: JSON-object validation failure.
 - Penalties and `logit_bias` are accepted by the request models but are not applied in sampling.
+
+### Chunked prefill (experimental)
+
+Chunked prefill is disabled by default. Enable it with
+`--enable-chunked-prefill`; tune the hard per-row bound with
+`--prefill-chunk-size` (default `512`) and prefill-only age promotion with
+`--prefill-starvation-threshold-steps` (default `8`). `max_tokens_per_step`
+remains the total decode-plus-prefill budget. Runnable decode rows consume one
+token each before prefill receives the remaining budget.
+
+Activation requires complete Qwen3 paged-layer registration, real FlashInfer,
+and the canonical production `LayeredPagedKVStore`. Logical block capacity is
+`min(memory_budget_blocks, block_store.physical_capacity)`; unequal capacities are
+valid. If any capability is unavailable,
+the engine reports `chunked_prefill_active=false` and
+an explicit `chunked_prefill_fallback_reason`, then uses the
+unchanged whole-prefill path. The first release rejects simultaneous
+`enable_chunked_prefill=true` and `enable_prefix_caching=true` at startup with
+`ValueError: enable_chunked_prefill and enable_prefix_caching cannot both be
+true in the first release`. Chunk transactions are standalone scheduler/KV
+transactions and do not import or duplicate a prefix implementation. Roll back
+by removing `--enable-chunked-prefill` (or disabling prefix caching) and
+restarting; no request or cache-format migration is required. PR #181 is design
+input for a future reconciliation only, not an implementation dependency.
+DFlash is used only for singleton prompts completed in one prefill launch;
+partially prefetched prompts stay on ordinary paged decode.
+
+Operational risks are extra scheduler launches for long prompts, page-boundary
+fragmentation, prefill backpressure under saturated decode load, model/backend
+metadata incompatibility, and latency regressions from a poorly chosen chunk
+size. Roll out first in shadow benchmarks, then a paged-backend canary, then a
+small opt-in production cohort. Roll back by removing
+`--enable-chunked-prefill`; no persisted cache or request format migration is
+required.

@@ -14,6 +14,7 @@ from moe_infinity.runtime.attention_types import DECODE_GRAPH_REASONS
 from .batch import (
     BatchBuilder,
     BatchMetadata,
+    SchedulerOutput,
     _slice_batch,
     split_prefill_decode_batch,
 )
@@ -34,6 +35,8 @@ from .spec_session_driver import (
     ServingSpecSession,
     SpecSessionDriver,
 )
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,18 @@ class SpeculativeGenerator(Protocol):
 _eviction_sync: Optional[EvictionSyncAdapter] = None
 
 _VERIFY_ADMISSION_MAX_RETRIES = 1024
+
+CHUNKED_PREFIX_INCOMPATIBLE = (
+    "enable_chunked_prefill and enable_prefix_caching cannot both be true "
+    "in the first release"
+)
+
+
+def validate_chunked_prefill_config(config: dict[str, object]) -> None:
+    if bool(config.get("enable_chunked_prefill", False)) and bool(
+        config.get("enable_prefix_caching", False)
+    ):
+        raise ValueError(CHUNKED_PREFIX_INCOMPATIBLE)
 
 
 def _debug_cleanup_reporting_failure(
@@ -130,6 +145,7 @@ class ContinuousBatchingEngine:
         speculative_draft: SpeculativeGenerator | None = None,
         decode_graph_capability_provider: object = None,
     ) -> None:
+        validate_chunked_prefill_config(dict(config))
         self.model = model
         self.engine = engine
         self.config = dict(config)
@@ -200,6 +216,13 @@ class ContinuousBatchingEngine:
             max_batch_size=self._get_int_config("max_batch_size", 32),
             max_tokens_per_step=self._get_int_config(
                 "max_tokens_per_step", 2048
+            ),
+            enable_chunked_prefill=bool(
+                self.config.get("enable_chunked_prefill", False)
+            ),
+            prefill_chunk_size=self._get_int_config("prefill_chunk_size", 512),
+            prefill_starvation_threshold_steps=self._get_int_config(
+                "prefill_starvation_threshold_steps", 8
             ),
             prefix_lease_provider=provider,
             cache_namespace=(
@@ -295,6 +318,17 @@ class ContinuousBatchingEngine:
             else None
         )
 
+        self._bind_layered_paged_kv_store()
+        paged_chunking = self.model_runner.supports_chunked_prefill()
+        self.scheduler.set_chunked_prefill_runtime_enabled(paged_chunking)
+        self._chunked_prefill_fallback_reason = (
+            None
+            if self.scheduler.chunked_prefill_enabled
+            or not self.scheduler.chunked_prefill_requested
+            else self.model_runner.chunked_prefill_unavailable_reason()
+        )
+        self._num_prefill_chunks = 0
+
         self._next_seq_id = 0
         self._shutdown = False
         self._sequences: dict[int, SequenceData] = {}
@@ -371,12 +405,45 @@ class ContinuousBatchingEngine:
                 "scheduler produced an empty batch; empty prompts are not supported"
             )
 
+        if self._can_delegate_speculative(batch, scheduler_output):
+            speculative_transaction_id = scheduler_output.prefill_transaction_id
         if self._spec_session_driver is None and self._can_delegate_speculative(
             batch
         ):
             if self._can_drive_verify_rounds():
-                return self._step_speculative_session(batch)
-            return self._step_speculative(batch)
+                return self._step_speculative_session(
+                    batch, speculative_transaction_id
+                )
+            return self._step_speculative(batch, speculative_transaction_id)
+
+        transaction_id = scheduler_output.prefill_transaction_id
+        sampled_indices = self._sampled_row_indices(batch)
+        try:
+            logits = self._execute_batch(batch)
+            sampler_output = None
+            sampled_logits = None
+            if sampled_indices:
+                sampled_logits = self._extract_last_token_logits(
+                    logits, batch, sampled_indices
+                )
+                sampled_params = [
+                    batch.sampling_params[index] for index in sampled_indices
+                ]
+                sampler_output = self.sampler.sample(
+                    sampled_logits, sampled_params
+                )
+        except BaseException:
+            if transaction_id is not None:
+                self.scheduler.rollback_prefill_step(transaction_id)
+            raise
+
+        if transaction_id is not None:
+            self.scheduler.commit_prefill_step(transaction_id)
+        self._num_prefill_chunks += len(scheduler_output.prefill_chunks)
+
+        if sampler_output is None:
+            self._num_steps += 1
+            return []
 
         logits = self._execute_and_commit(batch)
         # Compatibility limit: pre-Stage4a session doubles do not accept a
@@ -424,24 +491,30 @@ class ContinuousBatchingEngine:
     def _step_standard(self, batch: BatchMetadata) -> list[RequestOutput]:
         """Execute the ordinary serving path for a scheduler-selected subset."""
 
+        sampled_indices = self._sampled_row_indices(batch)
         logits = self._execute_batch(batch)
-        last_token_logits = self._extract_last_token_logits(logits, batch)
-        sampler_output = self.sampler.sample(
-            last_token_logits,
-            batch.sampling_params,
-        )
-        next_token_ids = sampler_output.token_ids
+        next_token_ids = None
+        if sampled_indices:
+            sampled_logits = self._extract_last_token_logits(
+                logits, batch, sampled_indices
+            )
+            sampled_params = [
+                batch.sampling_params[index] for index in sampled_indices
+            ]
+            sampler_output = self.sampler.sample(sampled_logits, sampled_params)
+            next_token_ids = sampler_output.token_ids
 
         outputs: list[RequestOutput] = []
         completed_seq_ids: list[int] = []
         new_decode_seq_ids: list[int] = []
         touched_request_ids: set[str] = set()
 
-        for index, seq_id in enumerate(batch.seq_ids):
+        for sampled_pos, index in enumerate(sampled_indices):
+            seq_id = batch.seq_ids[index]
             sequence = self._sequences[seq_id]
             request_id = self._sequence_to_request_id[seq_id]
             touched_request_ids.add(request_id)
-            token_id = int(next_token_ids[index].item())
+            token_id = int(next_token_ids[sampled_pos].item())
 
             sequence.append_output_token(token_id)
             self._request_outputs[request_id][seq_id].append(token_id)
@@ -463,12 +536,12 @@ class ContinuousBatchingEngine:
                     finished=finished,
                     finish_reason=finish_reason,
                     token_logprob=(
-                        sampler_output.token_logprobs[index]
+                        sampler_output.token_logprobs[sampled_pos]
                         if sampler_output.token_logprobs is not None
                         else None
                     ),
                     top_logprobs=(
-                        sampler_output.top_logprobs[index]
+                        sampler_output.top_logprobs[sampled_pos]
                         if sampler_output.top_logprobs is not None
                         else None
                     ),
@@ -499,6 +572,18 @@ class ContinuousBatchingEngine:
             _ = self._callbacks.pop(request_id, None)
 
         return outputs
+
+    def _sampled_row_indices(self, batch: BatchMetadata) -> list[int]:
+        indices: list[int] = []
+        for index, is_prefill in enumerate(batch.is_prefill):
+            if not is_prefill:
+                indices.append(index)
+            elif (
+                index < len(batch.prefill_is_terminal)
+                and batch.prefill_is_terminal[index]
+            ):
+                indices.append(index)
+        return indices
 
     @property
     def speculative_sessions(self) -> dict[int, ServingSpecSession]:
@@ -790,19 +875,40 @@ class ContinuousBatchingEngine:
             )
         return outputs
 
-    def _can_delegate_speculative(self, batch: BatchMetadata) -> bool:
+    def _can_delegate_speculative(
+        self,
+        batch: BatchMetadata,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> bool:
         """Whether this fresh singleton request can use the proven sync loop.
 
         DFlash owns a separate ``DynamicCache`` here. The paged serving cache is
         used only for admission accounting and freed when the delegated request
         completes. Mixed batches, resumed decode rows, sampling, penalties, and
-        logprob requests stay on the existing serving path unchanged.
+        logprob requests stay on the existing serving path unchanged. A
+        partially-prefetched chunk is never delegated to DFlash mid-prompt.
         """
         if self.speculative_draft is None or len(batch.seq_ids) != 1:
             return False
         if batch.is_prefill != [True]:
             return False
         if batch.kv_seq_lengths != batch.query_lengths:
+            return False
+
+        if scheduler_output is not None:
+            chunk = scheduler_output.prefill_chunks.get(batch.seq_ids[0])
+            if chunk is not None and (
+                chunk.start_pos != 0 or not chunk.is_terminal
+            ):
+                return False
+
+        if scheduler_output is not None:
+            chunk = scheduler_output.prefill_chunks.get(batch.seq_ids[0])
+            if chunk is not None and (
+                chunk.start_pos != 0 or not chunk.is_terminal
+            ):
+                return False
+        if batch.context_lengths != [0] or batch.prefill_is_terminal != [True]:
             return False
 
         sequence = self._sequences[batch.seq_ids[0]]
@@ -820,12 +926,18 @@ class ContinuousBatchingEngine:
             and params.logprobs <= 0
         )
 
-    def _step_speculative(self, batch: BatchMetadata) -> list[RequestOutput]:
+    def _step_speculative(
+        self,
+        batch: BatchMetadata,
+        transaction_id: int | None = None,
+    ) -> list[RequestOutput]:
         """Complete one eligible request through DFlash's own DynamicCache.
 
         ``DFlashSpeculator.generate`` is the already GPU-proven greedy loop. A
         single serving ``step`` may therefore emit several accepted tokens;
         each is still recorded and streamed as an individual ``RequestOutput``.
+        A generator failure rolls back the in-flight chunk transaction so the
+        prompt is requeued rather than stranded in ``PREFILL``.
         """
         speculator = self.speculative_draft
         if speculator is None:
@@ -851,14 +963,22 @@ class ContinuousBatchingEngine:
                 top_k=sequence.sampling_params.top_k,
                 top_p=sequence.sampling_params.top_p,
             )
+        except BaseException:
+            if transaction_id is not None:
+                self.scheduler.rollback_prefill_step(transaction_id)
+            raise
         finally:
             if owner is not None:
                 setattr(owner, "_cached_past_key_values", None)
 
         if generated.ndim != 2 or generated.shape[0] != 1:
+            if transaction_id is not None:
+                self.scheduler.rollback_prefill_step(transaction_id)
             raise RuntimeError(
                 "speculative generator must return token ids with shape [1, seq]"
             )
+        if transaction_id is not None:
+            self.scheduler.commit_prefill_step(transaction_id)
         prompt_len = sequence.prompt_length
         generated_ids = cast(
             list[int], generated[0, prompt_len:].to(device="cpu").tolist()
@@ -920,7 +1040,9 @@ class ContinuousBatchingEngine:
         )
 
     def _step_speculative_session(
-        self, batch: BatchMetadata
+        self,
+        batch: BatchMetadata,
+        transaction_id: int | None = None,
     ) -> list[RequestOutput]:
         """Drive one eligible request through the scheduled single-round seam.
 
@@ -951,6 +1073,7 @@ class ContinuousBatchingEngine:
             setattr(owner, "_cached_past_key_values", None)
 
         outputs: list[RequestOutput] = []
+        committed_transaction = False
         try:
             session = speculator.begin_session(
                 prompt,
@@ -961,6 +1084,9 @@ class ContinuousBatchingEngine:
                 top_p=params.top_p,
                 collect_route_union=True,
             )
+            if transaction_id is not None and not committed_transaction:
+                self.scheduler.commit_prefill_step(transaction_id)
+                committed_transaction = True
             sequence.set_status(SequenceStatus.DRAFT)
 
             streamed = 0
@@ -988,6 +1114,10 @@ class ContinuousBatchingEngine:
                 streamed = len(session.emitted)
                 if self._output_finished(outputs):
                     break
+        except BaseException:
+            if transaction_id is not None and not committed_transaction:
+                self.scheduler.rollback_prefill_step(transaction_id)
+            raise
         finally:
             if owner is not None:
                 setattr(owner, "_cached_past_key_values", None)
@@ -1083,8 +1213,9 @@ class ContinuousBatchingEngine:
 
     def run_until_done(self) -> dict[str, list[int] | list[list[int]]]:
         while self.has_pending_requests():
+            steps_before = self._num_steps
             outputs = self.step()
-            if outputs:
+            if outputs or self._num_steps > steps_before:
                 continue
 
             pending_request_ids = self._pending_request_ids()
@@ -1349,6 +1480,20 @@ class ContinuousBatchingEngine:
                 else None
             ),
             "memory": self.memory_manager.report(),
+            "num_prefill_chunks": getattr(self, "_num_prefill_chunks", 0),
+            "chunked_prefill_requested": getattr(
+                getattr(self, "scheduler", None),
+                "chunked_prefill_requested",
+                False,
+            ),
+            "chunked_prefill_active": getattr(
+                getattr(self, "scheduler", None),
+                "chunked_prefill_enabled",
+                False,
+            ),
+            "chunked_prefill_fallback_reason": getattr(
+                self, "_chunked_prefill_fallback_reason", None
+            ),
             "cuda_graph": cuda_graph_stats,
         }
         stats.update(self._prefix_cache_stats())
@@ -1414,6 +1559,52 @@ class ContinuousBatchingEngine:
     def _fallback_num_blocks(self, block_size: int) -> int:
         max_tokens_per_step = self._get_int_config("max_tokens_per_step", 1)
         return max(1, ceil(max_tokens_per_step / max(1, block_size)))
+
+    def _bind_layered_paged_kv_store(self) -> None:
+        from moe_infinity.runtime.attention_backend import (
+            LayerRegistration,
+            PagedAttentionBackend,
+        )
+
+        backend = self.model_runner.get_attention_backend()
+        if not isinstance(backend, PagedAttentionBackend):
+            return
+        try:
+            modules = self.model_runner._get_qwen3_paged_attention_modules()
+            backend.register_layers(
+                [
+                    LayerRegistration(int(module.layer_idx), id(module))
+                    for module in modules
+                ]
+            )
+            store = backend.block_store
+            physical_capacity = min(
+                int(backend.num_gpu_blocks),
+                int(store.num_blocks),
+            )
+            if physical_capacity <= 0:
+                logger.warning(
+                    "layered paged KV store not bound: physical capacity "
+                    "is %d (num_gpu_blocks=%d, store_capacity=%d)",
+                    physical_capacity,
+                    backend.num_gpu_blocks,
+                    store.num_blocks,
+                )
+                return
+            if self.kv_cache.num_blocks > physical_capacity:
+                logger.warning(
+                    "capping logical KV blocks %d -> %d to fit physical "
+                    "paged store (num_gpu_blocks=%d, store_capacity=%d)",
+                    self.kv_cache.num_blocks,
+                    physical_capacity,
+                    backend.num_gpu_blocks,
+                    store.num_blocks,
+                )
+                self.kv_cache.resize_num_blocks(physical_capacity)
+            self.kv_cache.set_block_store(store, owner=backend)
+        except (ValueError, RuntimeError) as exc:
+            logger.warning("failed to bind layered paged KV store: %r", exc)
+            return
 
     def _execute_batch(self, batch: BatchMetadata) -> torch.Tensor:
         has_prefill = any(batch.is_prefill)
@@ -1485,8 +1676,16 @@ class ContinuousBatchingEngine:
     def _extract_last_token_logits(
         logits: torch.Tensor,
         batch: BatchMetadata,
+        row_indices: list[int] | None = None,
     ) -> torch.Tensor:
+        selected = (
+            list(range(len(batch.seq_lengths)))
+            if row_indices is None
+            else row_indices
+        )
         last_token_indices: list[int] = []
+        for index in selected:
+            seq_length = batch.seq_lengths[index]
         query_offsets = batch.query_offsets
         for index, seq_length in enumerate(batch.query_lengths):
             if seq_length <= 0:

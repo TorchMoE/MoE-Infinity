@@ -3,7 +3,10 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
+
+from moe_infinity.runtime.attention_types import PagedBatchLengths
 
 ROOT = Path(__file__).resolve().parents[3]
 ROOT_STR = str(ROOT)
@@ -53,6 +56,48 @@ PagedKVCache = _KV_CACHE_MODULE.PagedKVCache
 BatchBuilder = _BATCH_MODULE.BatchBuilder
 BatchMetadata = _BATCH_MODULE.BatchMetadata
 SchedulerOutput = _BATCH_MODULE.SchedulerOutput
+PrefillChunk = _BATCH_MODULE.PrefillChunk
+
+
+def test_batch_builder_slices_exact_prefill_chunk() -> None:
+    cache = _make_cache()
+    sequence = _make_sequence(
+        40,
+        [10, 11, 12, 13, 14, 15],
+        status=SequenceStatus.PREFILL,
+        num_computed_tokens=2,
+    )
+    cache.allocate_sequence(40, num_tokens=5)
+    output = SchedulerOutput(
+        prefill_seq_ids=[40],
+        prefill_chunks={
+            40: PrefillChunk(start_pos=2, num_tokens=3, is_terminal=False)
+        },
+        num_prefill_tokens=3,
+        prefill_transaction_id=0,
+    )
+
+    metadata = BatchBuilder.from_scheduler_output(output, {40: sequence}, cache)
+
+    assert metadata.input_token_ids == [12, 13, 14]
+    assert metadata.lengths == PagedBatchLengths(
+        query_lengths=[3],
+        query_offsets=[0, 3],
+        context_lengths=[2],
+        kv_seq_lengths=[5],
+    )
+    assert metadata.prefill_is_terminal == [False]
+
+
+def test_scheduler_output_rejects_mismatched_chunk_ids() -> None:
+    with pytest.raises(ValueError, match="prefill_chunks keys"):
+        SchedulerOutput(
+            prefill_seq_ids=[1],
+            prefill_chunks={
+                2: PrefillChunk(start_pos=0, num_tokens=1, is_terminal=True)
+            },
+            prefill_transaction_id=0,
+        )
 
 
 def _make_sequence(

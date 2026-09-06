@@ -53,6 +53,10 @@ SamplingParams = _SEQUENCE_MODULE.SamplingParams
 BatchMetadata = _BATCH_MODULE.BatchMetadata
 ModelRunner = _MODEL_RUNNER_MODULE.ModelRunner
 
+from moe_infinity.runtime.attention_types import (  # noqa: E402
+    PagedBatchLengths,
+)
+
 
 class _MockOutput:
     logits: torch.Tensor
@@ -210,6 +214,32 @@ def test_execute_empty_batch_skips_forward() -> None:
     logits = runner.execute(batch)
 
     assert logits.shape == (0, 7)
+
+
+def test_runtime_metadata_maps_partial_prefill_slots() -> None:
+    engine = MockOffloadEngine()
+    engine.kv_cache = types.SimpleNamespace(block_size=4)
+    runner = ModelRunner(MockModel(), engine, device=torch.device("cpu"))
+    batch = BatchMetadata(
+        seq_ids=[7],
+        input_token_ids=[30, 31, 32],
+        seq_lengths=[3],
+        context_lengths=[5],
+        is_prefill=[True],
+        prefill_is_terminal=[False],
+        block_tables=[[4, 9]],
+        token_offsets=[0, 3],
+        sampling_params=[SamplingParams()],
+    )
+
+    metadata = runner._build_runtime_attention_metadata(batch)
+
+    assert metadata.lengths.kv_seq_lengths.tolist() == [8]
+    assert metadata.lengths.query_lengths.tolist() == [3]
+    assert metadata.lengths.query_offsets.tolist() == [0, 3]
+    assert metadata.num_prefill_tokens == 3
+    assert metadata.num_decode_tokens == 0
+    assert metadata.slot_mapping.tolist() == [9 * 4 + 1, 9 * 4 + 2, 9 * 4 + 3]
 
 
 from transformers.models.qwen3_moe.configuration_qwen3_moe import (  # noqa: E402

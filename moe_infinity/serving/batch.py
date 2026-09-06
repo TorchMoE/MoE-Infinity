@@ -12,6 +12,19 @@ from .kv_cache import PagedKVCache
 from .sequence import SamplingParams, SequenceData
 
 
+@dataclass(frozen=True)
+class PrefillChunk:
+    start_pos: int
+    num_tokens: int
+    is_terminal: bool
+
+    def __post_init__(self) -> None:
+        if self.start_pos < 0:
+            raise ValueError("start_pos must be >= 0")
+        if self.num_tokens <= 0:
+            raise ValueError("num_tokens must be > 0")
+
+
 @dataclass
 class SchedulerOutput:
     prefill_seq_ids: list[int] = field(default_factory=list)
@@ -23,6 +36,8 @@ class SchedulerOutput:
     verify_seq_ids: list[int] = field(default_factory=list)
     num_verify_tokens: int = 0
     num_verify_expert_bytes: int = 0
+    prefill_chunks: dict[int, PrefillChunk] = field(default_factory=dict)
+    prefill_transaction_id: int | None = None
 
     def __post_init__(self) -> None:
         self.prefill_seq_ids = list(self.prefill_seq_ids)
@@ -30,6 +45,17 @@ class SchedulerOutput:
         self.preempted_seq_ids = list(self.preempted_seq_ids)
         self.draft_seq_ids = list(self.draft_seq_ids)
         self.verify_seq_ids = list(self.verify_seq_ids)
+        self.prefill_chunks = dict(self.prefill_chunks)
+        if self.prefill_chunks:
+            if set(self.prefill_chunks) != set(self.prefill_seq_ids):
+                raise ValueError(
+                    "prefill_chunks keys must match prefill_seq_ids"
+                )
+            if self.prefill_transaction_id is None:
+                raise ValueError(
+                    "prefill_transaction_id is required when prefill_chunks "
+                    "is non-empty"
+                )
 
 
 @dataclass
@@ -40,6 +66,7 @@ class BatchMetadata:
     is_prefill: list[bool]
     block_tables: list[list[int]]
     sampling_params: list[SamplingParams]
+    prefill_is_terminal: list[bool] = field(default_factory=list)
 
     def __init__(
         self,
@@ -52,10 +79,12 @@ class BatchMetadata:
         seq_lengths: list[int] | None = None,
         context_lengths: list[int] | None = None,
         token_offsets: list[int] | None = None,
+        prefill_is_terminal: list[bool] | None = None,
     ) -> None:
         self.seq_ids = seq_ids
         self.input_token_ids = input_token_ids
         self.is_prefill = list(is_prefill or [])
+        self.prefill_is_terminal = list(prefill_is_terminal or [])
         self.block_tables = list(block_tables or [])
         self.sampling_params = list(sampling_params or [])
         if lengths is None:
@@ -110,6 +139,16 @@ class BatchMetadata:
         if query_offsets[-1] != len(self.input_token_ids):
             raise ValueError(
                 "query_lengths must sum to the number of packed input tokens"
+            )
+
+        if not self.prefill_is_terminal:
+            self.prefill_is_terminal = [
+                bool(is_prefill) for is_prefill in self.is_prefill
+            ]
+        if len(self.prefill_is_terminal) != expected:
+            raise ValueError(
+                f"prefill_is_terminal must have length {expected}, "
+                f"got {len(self.prefill_is_terminal)}"
             )
 
     @property
@@ -233,6 +272,7 @@ def _slice_batch(batch: BatchMetadata, seq_indices: list[int]) -> BatchMetadata:
     is_prefill = [batch.is_prefill[i] for i in seq_indices]
     block_tables = [batch.block_tables[i] for i in seq_indices]
     sampling_params = [batch.sampling_params[i] for i in seq_indices]
+    prefill_is_terminal = [batch.prefill_is_terminal[i] for i in seq_indices]
 
     src_offsets = batch.query_offsets
     input_token_ids: list[int] = []
@@ -256,6 +296,7 @@ def _slice_batch(batch: BatchMetadata, seq_indices: list[int]) -> BatchMetadata:
         is_prefill=is_prefill,
         block_tables=block_tables,
         sampling_params=sampling_params,
+        prefill_is_terminal=prefill_is_terminal,
     )
 
 
@@ -301,14 +342,27 @@ class BatchBuilder:
         is_prefill: list[bool] = []
         block_tables: list[list[int]] = []
         sampling_params: list[SamplingParams] = []
+        prefill_is_terminal: list[bool] = []
 
         for seq_id in scheduler_output.prefill_seq_ids:
             sequence = sequences[seq_id]
-            tokens = sequence.prompt_token_ids[sequence.num_computed_tokens :]
+            chunk = scheduler_output.prefill_chunks.get(seq_id)
+            if chunk is None:
+                start = sequence.num_computed_tokens
+                end = sequence.prompt_length
+                terminal = True
+            else:
+                start = chunk.start_pos
+                end = start + chunk.num_tokens
+                terminal = chunk.is_terminal
+            tokens = sequence.prompt_token_ids[start:end]
+            if len(tokens) != end - start:
+                raise ValueError(f"invalid prefill chunk for seq_id={seq_id}")
             input_token_ids.extend(tokens)
             query_lengths.append(len(tokens))
-            context_lengths.append(sequence.num_computed_tokens)
+            context_lengths.append(start)
             is_prefill.append(True)
+            prefill_is_terminal.append(terminal)
             block_tables.append(kv_cache.get_block_table(seq_id))
             sampling_params.append(sequence.sampling_params)
 
@@ -323,6 +377,7 @@ class BatchBuilder:
             query_lengths.append(len(token))
             context_lengths.append(sequence.num_computed_tokens)
             is_prefill.append(False)
+            prefill_is_terminal.append(False)
             block_tables.append(kv_cache.get_block_table(seq_id))
             sampling_params.append(sequence.sampling_params)
 
@@ -346,12 +401,14 @@ class BatchBuilder:
             is_prefill=is_prefill,
             block_tables=block_tables,
             sampling_params=sampling_params,
+            prefill_is_terminal=prefill_is_terminal,
         )
 
 
 __all__ = [
     "BatchBuilder",
     "BatchMetadata",
+    "PrefillChunk",
     "SchedulerOutput",
     "SplitBatchMetadata",
     "split_prefill_decode_batch",

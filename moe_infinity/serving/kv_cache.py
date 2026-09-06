@@ -18,6 +18,15 @@ if TYPE_CHECKING:
     )
 
 if TYPE_CHECKING:
+    from moe_infinity.runtime.attention_backend import (
+        LayeredPagedKVCheckpoint,
+        LayeredPagedKVStore,
+    )
+
+
+@dataclass(frozen=True)
+class _WritableRange:
+    new_block_ids: tuple[int, ...]
     from moe_infinity.runtime.paged_kv_storage import PagedKVStorage
 
 
@@ -174,6 +183,22 @@ class BlockTable:
     def num_computed_tokens(self) -> int:
         return self._num_tokens
 
+    def ensure_num_tokens(self, total_tokens: int) -> None:
+        if total_tokens < self._num_tokens:
+            raise ValueError(
+                f"cannot shrink reservation from {self._num_tokens} "
+                f"to {total_tokens}"
+            )
+        current_blocks = len(self._block_ids)
+        required_blocks = (
+            total_tokens + self.block_size - 1
+        ) // self.block_size
+        new_ids = self.block_allocator.allocate(
+            required_blocks - current_blocks
+        )
+        self._block_ids.extend(new_ids)
+        self._num_tokens = total_tokens
+
     def has_blocks(self) -> bool:
         return bool(self._block_ids)
 
@@ -217,6 +242,9 @@ class PagedKVCache:
         field(init=False, default_factory=dict)
     )
     _swapped_num_tokens: dict[int, int] = field(
+        init=False, default_factory=dict
+    )
+    _swapped_store_checkpoints: dict[int, "LayeredPagedKVCheckpoint"] = field(
         init=False, default_factory=dict
     )
     _swapped_out_sequences: set[int] = field(init=False, default_factory=set)
@@ -298,6 +326,48 @@ class PagedKVCache:
                     self._fi_workspace = None
                     self._fi_prefill = None
                     self._fi_decode = None
+
+    def resize_num_blocks(self, new_num_blocks: int) -> None:
+        """Shrink the logical block budget to fit the physical paged store.
+
+        Only shrinks, and only before any sequence is allocated: it rebuilds
+        the allocator and logical KV tensor, which would invalidate live block
+        ids. See :meth:`set_block_store`, which requires logical <= physical.
+        """
+        if new_num_blocks <= 0:
+            raise ValueError(
+                f"new_num_blocks must be > 0, got {new_num_blocks}"
+            )
+        if self._sequence_tables:
+            raise RuntimeError(
+                "cannot resize KV blocks while sequences are allocated"
+            )
+        if new_num_blocks == self.num_blocks:
+            return
+        if new_num_blocks > self.num_blocks:
+            raise ValueError(
+                "resize_num_blocks only shrinks the logical budget "
+                f"({new_num_blocks} > {self.num_blocks})"
+            )
+
+        self.num_blocks = int(new_num_blocks)
+        self.block_allocator = BlockAllocator(
+            num_blocks=self.num_blocks,
+            block_size=self.block_size,
+            device=self.device,
+        )
+        self._kv_cache = torch.zeros(
+            (
+                self.num_layers,
+                self.num_blocks,
+                2,
+                self.block_size,
+                self.num_heads,
+                self.head_dim,
+            ),
+            dtype=self.dtype,
+            device=self.device,
+        )
 
     @property
     def block_store(self) -> "LayeredPagedKVStore":
@@ -523,8 +593,7 @@ class PagedKVCache:
             raise ValueError(f"num_tokens must be >= 0, got {num_tokens}")
 
         block_table = BlockTable(block_allocator=self.block_allocator)
-        for _ in range(num_tokens):
-            block_table.append_token()
+        block_table.ensure_num_tokens(num_tokens)
         self._sequence_tables[seq_id] = block_table
 
         if self._cp_kv_manager is not None:
@@ -536,6 +605,68 @@ class PagedKVCache:
                 )
             except Exception:
                 pass
+
+    def ensure_sequence_capacity(self, seq_id: int, total_tokens: int) -> None:
+        if total_tokens < 0:
+            raise ValueError(f"total_tokens must be >= 0, got {total_tokens}")
+        block_table = self._sequence_tables.get(seq_id)
+        if block_table is None:
+            block_table = BlockTable(block_allocator=self.block_allocator)
+            block_table.ensure_num_tokens(total_tokens)
+            self._sequence_tables[seq_id] = block_table
+            return
+        block_table.ensure_num_tokens(total_tokens)
+
+    def get_num_reserved_tokens(self, seq_id: int) -> int:
+        block_table = self._sequence_tables.get(seq_id)
+        if block_table is None:
+            return 0
+        return block_table.num_computed_tokens()
+
+    def ensure_writable_range(
+        self, seq_id: int, start: int, end: int
+    ) -> "_WritableRange":
+        if not 0 <= start <= end:
+            raise ValueError("invalid writable range")
+        self.ensure_sequence_capacity(seq_id, end)
+        return _WritableRange(new_block_ids=())
+
+    def has_sequence(self, seq_id: int) -> bool:
+        return seq_id in self._sequence_tables
+
+    def get_block_ids_for_range(
+        self, seq_id: int, start: int, end: int
+    ) -> list[int]:
+        if not 0 <= start <= end <= self.get_num_reserved_tokens(seq_id):
+            raise ValueError("range is outside reserved sequence capacity")
+        table = self.get_block_table(seq_id)
+        first = start // self.block_size
+        last = (end + self.block_size - 1) // self.block_size
+        return list(dict.fromkeys(table[first:last]))
+
+    def rollback_sequence_reservation(
+        self,
+        *,
+        seq_id: int,
+        prior_table_existed: bool,
+        prior_block_ids: tuple[int, ...],
+        prior_reserved_tokens: int,
+        cow_block_ids: tuple[int, ...],
+    ) -> None:
+        table = self._require_sequence(seq_id)
+        current_ids = tuple(table.get_block_ids())
+        prior_set = set(prior_block_ids)
+        current_set = set(current_ids)
+        private_new_ids = tuple(
+            block_id for block_id in current_ids if block_id not in prior_set
+        )
+        table.restore_blocks(list(prior_block_ids), prior_reserved_tokens)
+        if private_new_ids:
+            self.block_allocator.free(list(private_new_ids))
+        _ = cow_block_ids
+        _ = current_set
+        if not prior_table_existed:
+            self._sequence_tables.pop(seq_id, None)
 
     def append_tokens(self, seq_id: int, num_new_tokens: int) -> None:
         if num_new_tokens < 0:
@@ -718,6 +849,24 @@ class PagedKVCache:
 
         cpu_buffer = self._swapped_cpu_buffers.pop(seq_id, None)
         saved_num_tokens = self._swapped_num_tokens.pop(seq_id, 0)
+        if self._block_store is not None:
+            checkpoint = self._swapped_store_checkpoints.pop(seq_id, None)
+            if checkpoint is not None:
+                num_blocks_needed = len(checkpoint.source_block_ids)
+                if not block_table.has_blocks():
+                    restored_block_ids = self.block_allocator.allocate(
+                        num_blocks_needed,
+                    )
+                    block_table.restore_blocks(
+                        restored_block_ids,
+                        num_tokens=saved_num_tokens,
+                    )
+                block_ids = block_table.get_block_ids()
+                if block_ids:
+                    self._block_store.restore(block_ids, checkpoint)
+            self._swapped_out_sequences.discard(seq_id)
+            return
+
         if self.storage is not None:
             storage_buffer = self._swapped_storage_buffers.pop(seq_id, None)
             if storage_buffer is not None:
@@ -733,6 +882,7 @@ class PagedKVCache:
                     )
                 block_ids = block_table.get_block_ids()
                 if block_ids:
+                    self._block_store.restore(block_ids, checkpoint)
                     self.storage.key_cache[:, block_ids, ...] = key_buffer.to(
                         device=self.storage.key_cache.device,
                         dtype=self.storage.key_cache.dtype,
