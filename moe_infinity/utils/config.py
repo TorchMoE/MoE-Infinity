@@ -86,6 +86,12 @@ class ArcherConfig:
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
         },
     )
+    phase_specific_expert_policy: bool = field(
+        default=False,
+        metadata={
+            "help": "Master gate for phase-specific expert admission, prefetch, and eviction policy (PR #179 substrate). Default False keeps legacy behavior. Adaptive precision does not require this to be True; when False the adaptive path still uses ExpertResidencyManager with neutral, legacy-equivalent phase utility."
+        },
+    )
     adaptive_expert_precision: bool = field(
         default=False,
         metadata={
