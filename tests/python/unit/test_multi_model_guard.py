@@ -1,8 +1,14 @@
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
 from moe_infinity import _store
+
+pytestmark = pytest.mark.skipif(
+    isinstance(_store, MagicMock),
+    reason="requires the compiled _store extension (stubbed on CPU-only CI)",
+)
 
 
 def _prefix(name: str) -> str:
