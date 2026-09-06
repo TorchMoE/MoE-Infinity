@@ -94,3 +94,42 @@ Repo evidence:
 - `moe_infinity/distributed/expert_executor.py`
 - `moe_infinity/memory/expert_prefetcher.py`
 - `moe_infinity/runtime/attention_backend.py`
+
+## Asynchronous hierarchical KV swap
+
+Serving accepts the same six values through `ArcherConfig`, `MoE.serve()`, and
+the OpenAI server CLI:
+
+| Field | Default | Validation and behavior |
+| --- | ---: | --- |
+| `kv_swap_mode` | `"sync"` | Exactly `"sync"` or `"async"`. Async requires CUDA and sufficient locked/pinned host memory. |
+| `kv_swap_host_memory_bytes` | `536870912` (512 MiB) | Positive hard cap for async pinned host leases. Inactive in effective sync mode. |
+| `kv_swap_max_inflight_bytes` | `268435456` (256 MiB) | Positive async in-flight DMA cap and no greater than the host cap. Inactive in effective sync mode. |
+| `kv_swap_checksum` | `False` | Enables CRC32 validation of the full padded host payload before restore. |
+| `kv_swap_max_retries` | `2` | Non-negative restore retry count. |
+| `kv_swap_allow_sync_fallback` | `True` | Initialization may fall back to sync when CUDA or pinned allocation is unavailable. Corrupt bytes never fall back. |
+
+Example:
+
+```python
+model = MoE(checkpoint, {
+    "offload_path": offload_path,
+    "kv_swap_mode": "async",
+    "kv_swap_host_memory_bytes": 2 * 1024**3,
+    "kv_swap_max_inflight_bytes": 1024**3,
+    "kv_swap_checksum": False,
+    "kv_swap_max_retries": 2,
+    "kv_swap_allow_sync_fallback": True,
+})
+```
+
+The default `kv_swap_mode="sync"` deliberately retains blocking pageable
+`.detach().to("cpu").clone()` and blocking restore semantics. Each host copy is
+owned directly by a `PageableCPUBufferRecord`; sync mode never constructs,
+acquires, releases, or accounts a pinned pool. Consequently sync reports zero
+pinned capacity and in-use bytes even while pageable host copies exist.
+
+Async mode uses bounded `PinnedBufferLease` ownership only. Pool or in-flight
+cap exhaustion returns backpressure before transfer state or block ownership
+changes. To roll back, drain/restart the engine with `kv_swap_mode="sync"`;
+never switch transfer backends while tickets are in flight.

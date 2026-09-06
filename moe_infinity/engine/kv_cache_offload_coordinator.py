@@ -5,12 +5,12 @@ from typing import Protocol, Union, cast
 
 import torch
 
-from moe_infinity.engine.transfer_types import TransferRequest, TransferType
-from moe_infinity.utils.async_transfer import (
-    async_d2h,
-    async_h2d,
-    wait_transfer,
+from moe_infinity.engine.kv_transfer import (
+    CopyTicket,
+    KVTransferBackend,
+    SyncKVTransferBackend,
 )
+from moe_infinity.engine.transfer_types import TransferRequest, TransferType
 
 KVTensors = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
@@ -27,10 +27,12 @@ class KVCacheOffloadCoordinator:
         kv_tensors: KVTensors | None,
         block_pool: object,
         config: Mapping[str, object] | object | None,
+        transfer_backend: KVTransferBackend | None = None,
     ) -> None:
         self._kv_tensors: KVTensors | None = kv_tensors
         self._block_pool: object = block_pool
         self._config: Mapping[str, object] | object | None = config
+        self._transfer_backend = transfer_backend or SyncKVTransferBackend()
         self._transfer_scheduler: _SchedulerLike | None = None
         self._cpu_cache: dict[str, KVTensors] = {}
 
@@ -46,81 +48,103 @@ class KVCacheOffloadCoordinator:
         )
         scheduler.register_handler(TransferType.KV_SWAP_IN, self.handle_swap_in)
 
-    def handle_swap_out(self, request: TransferRequest) -> None:
+    def handle_swap_out(self, request: TransferRequest) -> int:
         if self._kv_tensors is None:
-            return
+            raise RuntimeError("KV tensors are not initialized")
 
         block_ids = list(request.block_ids)
-        stream = self._make_cuda_stream_if_needed()
+        tickets: list[CopyTicket] = []
 
         if isinstance(self._kv_tensors, tuple):
             k_cache, v_cache = self._kv_tensors
-            k_blocks = k_cache[block_ids, ...].clone()
-            v_blocks = v_cache[block_ids, ...].clone()
-            if stream is not None and k_blocks.is_cuda and v_blocks.is_cuda:
-                cpu_data: KVTensors = (
-                    async_d2h(k_blocks, stream),
-                    async_d2h(v_blocks, stream),
+            k_blocks = self._make_host_destination(k_cache, block_ids, 0)
+            v_blocks = self._make_host_destination(v_cache, block_ids, 0)
+            cpu_data: KVTensors = (k_blocks, v_blocks)
+            try:
+                tickets.append(
+                    self._transfer_backend.submit_d2h(
+                        k_cache, k_blocks, block_ids=block_ids, block_dim=0
+                    )
                 )
-            else:
-                cpu_data = (
-                    k_blocks.to("cpu", non_blocking=True),
-                    v_blocks.to("cpu", non_blocking=True),
+                tickets.append(
+                    self._transfer_backend.submit_d2h(
+                        v_cache, v_blocks, block_ids=block_ids, block_dim=0
+                    )
                 )
+            except Exception:
+                self._retire_tickets(tickets)
+                raise
         else:
-            selected = self._kv_tensors[:, block_ids, ...].clone()
-            if stream is not None and selected.is_cuda:
-                cpu_data = async_d2h(selected, stream)
-            else:
-                cpu_data = selected.to("cpu", non_blocking=True)
+            cpu_data = self._make_host_destination(
+                self._kv_tensors, block_ids, 1
+            )
+            tickets.append(
+                self._transfer_backend.submit_d2h(
+                    self._kv_tensors,
+                    cpu_data,
+                    block_ids=block_ids,
+                    block_dim=1,
+                )
+            )
 
-        if stream is not None:
-            wait_transfer(stream)
-
+        bytes_transferred = self._retire_tickets(tickets)
         self._cpu_cache[request.transfer_id] = cpu_data
+        return bytes_transferred
 
-    def handle_swap_in(self, request: TransferRequest) -> None:
+    def handle_swap_in(self, request: TransferRequest) -> int:
         if self._kv_tensors is None:
-            return
+            raise RuntimeError("KV tensors are not initialized")
 
-        cpu_data = self._cpu_cache.pop(request.transfer_id, None)
+        cpu_data = self._cpu_cache.get(request.transfer_id)
         if cpu_data is None:
-            return
+            raise RuntimeError(
+                f"missing host KV for transfer {request.transfer_id}"
+            )
 
         block_ids = list(request.block_ids)
-        target_device = torch.device(request.target_device)
-        stream = (
-            torch.cuda.Stream(device=target_device)
-            if target_device.type == "cuda" and torch.cuda.is_available()
-            else None
-        )
+        tickets: list[CopyTicket] = []
 
         if isinstance(cpu_data, tuple):
             if not isinstance(self._kv_tensors, tuple):
-                return
+                raise RuntimeError("host and device KV layouts do not match")
             k_blocks_cpu, v_blocks_cpu = cpu_data
             k_cache, v_cache = self._kv_tensors
-            if stream is not None:
-                k_blocks = async_h2d(k_blocks_cpu, target_device, stream)
-                v_blocks = async_h2d(v_blocks_cpu, target_device, stream)
-            else:
-                k_blocks = k_blocks_cpu.to(target_device, non_blocking=True)
-                v_blocks = v_blocks_cpu.to(target_device, non_blocking=True)
-            if stream is not None:
-                wait_transfer(stream)
-            k_cache[block_ids, ...] = k_blocks
-            v_cache[block_ids, ...] = v_blocks
-            return
-
-        if isinstance(self._kv_tensors, tuple):
-            return
-
-        if stream is not None:
-            gpu_data = async_h2d(cpu_data, target_device, stream)
-            wait_transfer(stream)
+            try:
+                tickets.append(
+                    self._transfer_backend.submit_h2d(
+                        k_blocks_cpu,
+                        k_cache,
+                        block_ids=block_ids,
+                        block_dim=0,
+                    )
+                )
+                tickets.append(
+                    self._transfer_backend.submit_h2d(
+                        v_blocks_cpu,
+                        v_cache,
+                        block_ids=block_ids,
+                        block_dim=0,
+                    )
+                )
+            except Exception:
+                self._retire_tickets(tickets)
+                raise
         else:
-            gpu_data = cpu_data.to(target_device, non_blocking=True)
-        self._kv_tensors[:, block_ids, ...] = gpu_data
+            if isinstance(self._kv_tensors, tuple):
+                raise RuntimeError("host and device KV layouts do not match")
+
+            tickets.append(
+                self._transfer_backend.submit_h2d(
+                    cpu_data,
+                    self._kv_tensors,
+                    block_ids=block_ids,
+                    block_dim=1,
+                )
+            )
+
+        bytes_transferred = self._retire_tickets(tickets)
+        del self._cpu_cache[request.transfer_id]
+        return bytes_transferred
 
     def _is_enabled(self) -> bool:
         if isinstance(self._config, Mapping):
@@ -128,22 +152,24 @@ class KVCacheOffloadCoordinator:
             return bool(config_map.get("enable_kv_cache_offload", False))
         return bool(getattr(self._config, "enable_kv_cache_offload", False))
 
-    def _make_cuda_stream_if_needed(self) -> object | None:
-        if not torch.cuda.is_available():
-            return None
-        if self._kv_tensors is None:
-            return None
-        if isinstance(self._kv_tensors, tuple):
-            return torch.cuda.Stream() if self._kv_tensors[0].is_cuda else None
-        return torch.cuda.Stream() if self._kv_tensors.is_cuda else None
+    def _make_host_destination(
+        self, source: torch.Tensor, block_ids: list[int], block_dim: int
+    ) -> torch.Tensor:
+        shape = list(source.shape)
+        shape[block_dim] = len(block_ids)
+        return torch.empty(
+            tuple(shape),
+            dtype=source.dtype,
+            device="cpu",
+            pin_memory=self._transfer_backend.asynchronous,
+        )
 
-    def _select_block_tensors(self, block_ids: list[int]) -> KVTensors:
-        if self._kv_tensors is None:
-            raise RuntimeError("KV tensors are not initialized")
-        if isinstance(self._kv_tensors, tuple):
-            k_cache, v_cache = self._kv_tensors
-            return k_cache[block_ids, ...], v_cache[block_ids, ...]
-        return self._kv_tensors[:, block_ids, ...]
+    @staticmethod
+    def _retire_tickets(tickets: list[CopyTicket]) -> int:
+        for ticket in tickets:
+            if not ticket.retire(synchronize=True):
+                raise RuntimeError("KV copy ticket did not retire")
+        return sum(ticket.nbytes for ticket in tickets)
 
 
 __all__ = ["KVCacheOffloadCoordinator"]

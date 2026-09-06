@@ -34,3 +34,5 @@ class TransferResult:
     transfer_id: str
     status: str
     duration_ms: float
+    bytes_transferred: int = 0
+    error: Optional[str] = None

@@ -11,6 +11,12 @@ import torch
 from moe_infinity.runtime.attention_backend import PagedAttentionBackend
 from moe_infinity.runtime.attention_types import DECODE_GRAPH_REASONS
 
+from ..engine.kv_transfer import (
+    CudaKVTransferBackend,
+    KVTransferBackend,
+    PinnedBufferPool,
+    SyncKVTransferBackend,
+)
 from .batch import (
     BatchBuilder,
     BatchMetadata,
@@ -62,6 +68,60 @@ class SpeculativeGenerator(Protocol):
 _eviction_sync: Optional[EvictionSyncAdapter] = None
 
 _VERIFY_ADMISSION_MAX_RETRIES = 1024
+
+_logger = logging.getLogger(__name__)
+
+
+class KVSwapConfig(Protocol):
+    kv_swap_mode: str
+    kv_swap_host_memory_bytes: int
+    kv_swap_max_inflight_bytes: int
+    kv_swap_checksum: bool
+    kv_swap_max_retries: int
+    kv_swap_allow_sync_fallback: bool
+
+
+@dataclass(frozen=True)
+class _EngineKVSwapSettings:
+    kv_swap_mode: str
+    kv_swap_host_memory_bytes: int
+    kv_swap_max_inflight_bytes: int
+    kv_swap_checksum: bool
+    kv_swap_max_retries: int
+    kv_swap_allow_sync_fallback: bool
+
+
+def build_kv_transfer_resources(
+    config: KVSwapConfig,
+    device: torch.device,
+    *,
+    pool_factory: Callable[[int], object] = PinnedBufferPool,
+    backend_factory: Callable[
+        [torch.device], KVTransferBackend
+    ] = CudaKVTransferBackend,
+) -> tuple[KVTransferBackend, Optional[object], Optional[str]]:
+    if config.kv_swap_mode == "sync":
+        return SyncKVTransferBackend(), None, None
+
+    pool: Optional[object] = None
+    try:
+        pool = pool_factory(config.kv_swap_host_memory_bytes)
+        backend = backend_factory(device)
+    except Exception as exc:
+        if pool is not None:
+            close = getattr(pool, "close", None)
+            if callable(close):
+                close()
+        if not config.kv_swap_allow_sync_fallback:
+            raise
+        fallback_reason = (
+            f"async KV transfer unavailable ({type(exc).__name__}: {exc}); "
+            "falling back to sync"
+        )
+        return SyncKVTransferBackend(), None, fallback_reason
+
+    return backend, pool, None
+
 
 CHUNKED_PREFIX_INCOMPATIBLE = (
     "enable_chunked_prefill and enable_prefix_caching cannot both be true "
@@ -176,6 +236,19 @@ class ContinuousBatchingEngine:
             head_dim=head_dim,
         )
 
+        swap_settings = self._resolve_kv_swap_settings()
+        backend, pool, fallback_reason = build_kv_transfer_resources(
+            swap_settings,
+            self.device,
+        )
+        self._kv_swap_mode = (
+            "sync"
+            if fallback_reason is not None
+            else swap_settings.kv_swap_mode
+        )
+        self._kv_swap_fallback_reason = fallback_reason
+        if fallback_reason is not None:
+            _logger.warning("%s", fallback_reason)
         self.model_runner = ModelRunner(model, engine, device=self.device)
 
         self.prefix_cache: PrefixCache | None = None
@@ -206,6 +279,11 @@ class ContinuousBatchingEngine:
             head_dim=head_dim,
             dtype=self.dtype,
             device=self.device,
+            transfer_backend=backend,
+            pinned_pool=cast(Optional[PinnedBufferPool], pool),
+            host_pool_bytes=swap_settings.kv_swap_host_memory_bytes,
+            max_inflight_bytes=swap_settings.kv_swap_max_inflight_bytes,
+            checksum=swap_settings.kv_swap_checksum,
             storage=backend_storage,
         )
 
@@ -240,6 +318,7 @@ class ContinuousBatchingEngine:
             verify_expert_byte_deficit_cap=self._get_optional_int_config(
                 "verify_expert_byte_deficit_cap"
             ),
+            kv_swap_max_retries=swap_settings.kv_swap_max_retries,
         )
         from moe_infinity.models.paged_attention_registry import (
             PagedAttentionLayerRegistry,
@@ -341,6 +420,23 @@ class ContinuousBatchingEngine:
         self._request_failures: dict[str, dict[str, str]] = {}
         self._num_steps = 0
         self._total_generated_tokens = 0
+        self._is_shutdown = False
+
+    def _resolve_kv_swap_settings(self) -> KVSwapConfig:
+        return _EngineKVSwapSettings(
+            kv_swap_mode=self._get_str_config("kv_swap_mode", "sync"),
+            kv_swap_host_memory_bytes=self._get_int_config(
+                "kv_swap_host_memory_bytes", 512 * 1024 * 1024
+            ),
+            kv_swap_max_inflight_bytes=self._get_int_config(
+                "kv_swap_max_inflight_bytes", 256 * 1024 * 1024
+            ),
+            kv_swap_checksum=self._get_bool_config("kv_swap_checksum", False),
+            kv_swap_max_retries=self._get_int_config("kv_swap_max_retries", 2),
+            kv_swap_allow_sync_fallback=self._get_bool_config(
+                "kv_swap_allow_sync_fallback", True
+            ),
+        )
 
     def add_request(
         self,
@@ -1218,6 +1314,13 @@ class ContinuousBatchingEngine:
             if outputs or self._num_steps > steps_before:
                 continue
 
+            if self.kv_cache.has_pending_transfers():
+                progressed = self.kv_cache.wait_for_transfer_progress(
+                    timeout_ms=100.0
+                )
+                if progressed:
+                    continue
+
             pending_request_ids = self._pending_request_ids()
             raise RuntimeError(
                 f"engine made no progress with pending requests: {pending_request_ids}"
@@ -1227,6 +1330,25 @@ class ContinuousBatchingEngine:
             request_id: self._format_request_outputs(request_id)
             for request_id in self._request_outputs
         }
+
+    def shutdown(self, timeout_ms: float = 5000.0) -> None:
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
+        graph_runner = getattr(self, "cuda_graph_runner", None)
+        if graph_runner is not None:
+            graph_runner.close()
+
+        for request_id in list(self._request_to_seq_ids.keys()):
+            self.abort_request(request_id)
+
+        if self.kv_cache.has_pending_transfers():
+            _logger.warning(
+                "engine shutdown with pending KV transfers; synchronizing "
+                "before reclaiming DMA-owned resources"
+            )
+
+        self.kv_cache.shutdown(timeout_ms=timeout_ms)
 
     def get_request_n_outputs(self, request_id: str) -> list[list[int]]:
         if request_id not in self._request_outputs:
@@ -1388,17 +1510,17 @@ class ContinuousBatchingEngine:
     def invalidate_cuda_graphs(self, reason: str) -> None:
         self.cuda_graph_runner.invalidate(reason)
 
-    def shutdown(self) -> None:
-        if self._shutdown:
-            return
-        self.cuda_graph_runner.close()
-        self._shutdown = True
-
     def get_stats(self) -> dict[str, object]:
         status_counts = {status.value: 0 for status in SequenceStatus}
         for sequence in self._sequences.values():
             status_counts[sequence.status.value] += 1
 
+        swap_stats_fn = getattr(self.kv_cache, "get_swap_stats", None)
+        kv_swap = dict(swap_stats_fn()) if callable(swap_stats_fn) else {}
+        kv_swap["mode"] = getattr(self, "_kv_swap_mode", "sync")
+        kv_swap["fallback_reason"] = getattr(
+            self, "_kv_swap_fallback_reason", None
+        )
         graph_runner = getattr(self, "cuda_graph_runner", None)
         cuda_graph_stats = graph_runner.stats() if graph_runner else {}
         storage = getattr(self.kv_cache, "storage", None)
@@ -1459,7 +1581,7 @@ class ContinuousBatchingEngine:
             "pending_requests": len(self._pending_request_ids()),
             "completed_requests": len(self._completed_request_ids),
             "cancelled_requests": len(self._cancelled_request_ids),
-            "failed_requests": len(self._request_failures),
+            "failed_requests": len(getattr(self, "_request_failures", {})),
             "num_steps": self._num_steps,
             "total_generated_tokens": self._total_generated_tokens,
             "kv_cache_num_blocks": self.kv_cache.num_blocks,
@@ -1467,19 +1589,20 @@ class ContinuousBatchingEngine:
             "sequence_status_counts": status_counts,
             "speculative_execution_context": (
                 self._spec_session_driver.execution_context_mode
-                if self._spec_session_driver is not None
+                if getattr(self, "_spec_session_driver", None) is not None
                 else None
             ),
             "speculative_sessions": [
                 record.diagnostics()
-                for record in self.speculative_sessions.values()
+                for record in getattr(self, "speculative_sessions", {}).values()
             ],
             "paged_mla_admission": (
                 self._spec_session_driver.admission_stats
-                if self._spec_session_driver is not None
+                if getattr(self, "_spec_session_driver", None) is not None
                 else None
             ),
             "memory": self.memory_manager.report(),
+            "kv_swap": kv_swap,
             "num_prefill_chunks": getattr(self, "_num_prefill_chunks", 0),
             "chunked_prefill_requested": getattr(
                 getattr(self, "scheduler", None),
@@ -1496,7 +1619,9 @@ class ContinuousBatchingEngine:
             ),
             "cuda_graph": cuda_graph_stats,
         }
-        stats.update(self._prefix_cache_stats())
+        prefix_stats = getattr(self, "_prefix_cache_stats", None)
+        if callable(prefix_stats):
+            stats.update(prefix_stats())
         return stats
 
     def get_request_failure(self, request_id: str) -> dict[str, str]:
@@ -1962,11 +2087,11 @@ class ContinuousBatchingEngine:
             raise ValueError(f"{key} must be an integer value")
         return value
 
-    def _get_bool_config(self, key: str, default: bool = False) -> bool:
+    def _get_str_config(self, key: str, default: str) -> str:
         value = self.config.get(key, default)
-        if not isinstance(value, bool):
-            raise ValueError(f"{key} must be a boolean value")
-        return bool(value)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} must be a string value")
+        return value
 
     def _get_bool_config(self, key: str, default: bool) -> bool:
         value = self.config.get(key, default)
@@ -1995,5 +2120,6 @@ class ContinuousBatchingEngine:
 __all__ = [
     "ContinuousBatchingEngine",
     "RequestOutput",
+    "build_kv_transfer_resources",
     "set_eviction_sync",
 ]

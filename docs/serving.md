@@ -405,6 +405,76 @@ If you need timeout debugging, use the watchdog logs and the troubleshooting gui
 - `finish_reason="error"`: JSON-object validation failure.
 - Penalties and `logit_bias` are accepted by the request models but are not applied in sampling.
 
+## KV swap lifecycle and recovery
+
+KV transfer state is independent from request `SequenceStatus`:
+
+```text
+GPU_RESIDENT -> SWAP_OUT_IN_FLIGHT -> HOST_RESIDENT
+HOST_RESIDENT -> SWAP_IN_IN_FLIGHT -> GPU_RESIDENT
+SWAP_OUT_IN_FLIGHT / SWAP_IN_IN_FLIGHT -> CANCEL_PENDING -> CANCELLED
+HOST_RESIDENT / SWAP_IN_IN_FLIGHT -> FAILED -> reprefill recovery
+```
+
+The scheduler calls `poll_transfers()` once at the start of a scheduling pass
+and aggregates all members of a request group before changing queues. Group
+phases are `OUT_IN_FLIGHT`, `HOST_RESIDENT`, `IN_IN_FLIGHT`,
+`ROLLBACK_IN_FLIGHT`, and `REPREFILL_PENDING`. Partial completion never makes a
+member runnable. Successful H2D restores each member's prior status; terminal
+metadata, checksum, or retry failure first removes cache transfer records and
+then separately moves the group from `SequenceStatus.SWAPPED` to
+`SequenceStatus.WAITING` for reprefill.
+
+The producer stream happens-before the transfer stream, and an early consumer
+waits on the completion event. A ticket retains its stream, event, and staging
+tensors until `retire` succeeds. Cancellation removes scheduler visibility but
+keeps a generation-keyed tombstone, EVICTING/RESTORING blocks, host lease, and
+ticket until DMA retires. Shutdown stops admission, synchronizes every event,
+retires tickets, finalizes blocks and leases, closes transfer streams, and only
+then releases the pool. Exceeding the shutdown warning deadline does not permit
+unsafe reclamation.
+
+`/v1/reload` reloads Python modules; it does not migrate live KV state. Drain
+and replace/restart the old engine for model changes.
+
+### KV swap telemetry
+
+`/admin/stats` exposes the `kv_swap` object and `/metrics` exports:
+
+- `moe_kv_swap_inflight`, `moe_kv_swap_inflight_bytes`
+- `moe_kv_swap_retiring_records`, `moe_kv_swap_host_resident`
+- `moe_kv_swap_host_bytes`, `moe_kv_swap_host_capacity_bytes`
+- `moe_kv_swap_backpressure_total`
+- `moe_kv_swap_out_completed_total`, `moe_kv_swap_in_completed_total`
+- `moe_kv_swap_failures_total{direction="out|in"}`
+- `moe_kv_swap_bytes_total{direction="d2h|h2d"}`
+- `moe_kv_swap_duration_seconds_sum{direction="d2h|h2d"}`
+
+Durations are observed completion latency from monotonic submission to event
+observation, not pure PCIe time. Metrics contain no sequence IDs, request IDs,
+tokens, or checksums.
+
+### External tier and non-goals
+
+`ExternalKVStore` is a future pinned-host-to-external seam. This release has no
+external-store implementation, distributed storage, SSD/RDMA/object-store
+backend, multi-node protocol, or KV quantization. The
+[Mooncake paper](https://arxiv.org/abs/2407.00079) motivates decoupling transfer
+control from storage tiers; it is not a dependency or performance claim.
+In short, there is no external store implementation in this change.
+In short, there is no external storage implementation in this change.
+
+### Rollout and rollback
+
+1. **Stage 0:** keep default sync; land CPU/CUDA correctness tests and telemetry.
+2. **Stage 1:** enable async on one canary; alert on failures, checksum failures,
+   backpressure, pinned utilization, and p99 swap latency.
+3. **Stage 2:** expand async opt-in only after workload-specific A/B review;
+   retain immediate restart/drain rollback to sync.
+4. **Stage 3:** consider changing defaults only in a separate change backed by
+   production data.
+Rollback requires draining/restarting with `kv_swap_mode="sync"`; never change
+the backend while transfers are in flight.
 ### Chunked prefill (experimental)
 
 Chunked prefill is disabled by default. Enable it with

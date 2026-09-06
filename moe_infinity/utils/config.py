@@ -113,6 +113,42 @@ class ArcherConfig:
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
         },
     )
+    kv_swap_mode: str = field(
+        default="sync",
+        metadata={
+            "help": "Serving KV swap backend: 'sync' (blocking pageable copies, default) or 'async' (bounded event-driven pinned transfers)."
+        },
+    )
+    kv_swap_host_memory_bytes: int = field(
+        default=512 * 1024 * 1024,
+        metadata={
+            "help": "Hard cap on pinned host memory for async KV swap. Accepted but inactive in sync mode."
+        },
+    )
+    kv_swap_max_inflight_bytes: int = field(
+        default=256 * 1024 * 1024,
+        metadata={
+            "help": "Hard cap on in-flight (incomplete-event) async KV transfer bytes. Accepted but inactive in sync mode."
+        },
+    )
+    kv_swap_checksum: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable opt-in CRC32 validation of swapped KV payloads before H2D submission."
+        },
+    )
+    kv_swap_max_retries: int = field(
+        default=2,
+        metadata={
+            "help": "Maximum async swap-in retries before terminal reprefill."
+        },
+    )
+    kv_swap_allow_sync_fallback: bool = field(
+        default=True,
+        metadata={
+            "help": "When async is requested but CUDA/pinned allocation is unavailable at init, fall back to sync instead of raising."
+        },
+    )
 
     @staticmethod
     def _validate_gpu_routing_overlap(
@@ -208,6 +244,27 @@ class ArcherConfig:
         if self.device_memory_ratio + self.kv_cache_memory_ratio > 1.0:
             raise ValueError(
                 f"device_memory_ratio ({self.device_memory_ratio}) + kv_cache_memory_ratio ({self.kv_cache_memory_ratio}) > 1.0"
+            )
+
+        if self.kv_swap_mode not in ("sync", "async"):
+            raise ValueError(
+                f"kv_swap_mode must be 'sync' or 'async', got {self.kv_swap_mode!r}"
+            )
+        if self.kv_swap_host_memory_bytes <= 0:
+            raise ValueError(
+                f"kv_swap_host_memory_bytes must be > 0, got {self.kv_swap_host_memory_bytes}"
+            )
+        if self.kv_swap_max_inflight_bytes <= 0:
+            raise ValueError(
+                f"kv_swap_max_inflight_bytes must be > 0, got {self.kv_swap_max_inflight_bytes}"
+            )
+        if self.kv_swap_max_inflight_bytes > self.kv_swap_host_memory_bytes:
+            raise ValueError(
+                f"kv_swap_max_inflight_bytes ({self.kv_swap_max_inflight_bytes}) must not exceed kv_swap_host_memory_bytes ({self.kv_swap_host_memory_bytes})"
+            )
+        if self.kv_swap_max_retries < 0:
+            raise ValueError(
+                f"kv_swap_max_retries must be >= 0, got {self.kv_swap_max_retries}"
             )
         if (
             type(self.max_resident_paged_speculative_sessions) is not int
