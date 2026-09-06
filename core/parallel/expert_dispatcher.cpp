@@ -130,8 +130,9 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
     threads_.emplace_back(new base::Thread(thread_func, thread_name));
     threads_.back()->start();
 
-    auto cache_limit =
-        kTopologyHandle->GetSparseCacheLimit(torch::Device(torch::kCUDA, i));
+    auto cache_limit = kTopologyHandle ? kTopologyHandle->GetSparseCacheLimit(
+                                             torch::Device(torch::kCUDA, i))
+                                       : static_cast<std::int64_t>(-1);
     cache_sizes_.push_back(cache_limit);
   }
 

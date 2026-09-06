@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--trace-output", default=None)
+    parser.add_argument("--_arm", choices=("fixed", "adaptive"), default=None)
     return parser.parse_args()
 
 
@@ -171,7 +172,8 @@ def load_model_and_tokenizer(
     config = {
         "offload_path": offload_dir,
         "device_memory_ratio": arm.device_memory_ratio,
-        "kv_cache_ratio": arm.kv_cache_ratio,
+        "kv_cache_memory_ratio": arm.kv_cache_ratio,
+        "enable_kv_cache_offload": arm.kv_cache_ratio > 0,
         "adaptive_memory_enabled": arm.adaptive_memory_enabled,
     }
     model = moe_class(model_name, config)
@@ -423,7 +425,7 @@ def run_memory_benchmark(
     )
 
     prompt_token_ids = build_prompt_token_ids(tokenizer, prompt_length)
-    sampling_params = SamplingParams(max_tokens=max_new_tokens)
+    sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
     for index in range(batch_size):
         cb_engine.add_request(
             request_id=f"memory-req-{index}",
@@ -500,8 +502,61 @@ def run_arm(arm: ArmConfig, args: argparse.Namespace) -> dict[str, Any]:
 def compare_arms(
     arms: list[ArmConfig], args: argparse.Namespace
 ) -> dict[str, Any]:
+    import os
+    import subprocess
+    import sys
+
     ordered = list(reversed(arms)) if int(args.seed) % 2 == 0 else list(arms)
-    results = [run_arm(arm, args) for arm in ordered]
+    runner = [sys.executable]
+    wt_root = os.environ.get("MOE_WT_ROOT")
+    if wt_root:
+        runner.append(
+            os.path.join(os.path.dirname(wt_root.rstrip("/")), "_runwt.py")
+        )
+    results: list[dict[str, Any]] = []
+    for arm in ordered:
+        arm_out = f"{args.output_json}.{arm.arm}.json"
+        arm_offload = os.path.join(args.offload_dir, arm.arm)
+        os.makedirs(arm_offload, exist_ok=True)
+        cmd = runner + [
+            os.path.abspath(__file__),
+            "--model",
+            args.model,
+            "--offload-dir",
+            arm_offload,
+            "--batch-size",
+            str(args.batch_size),
+            "--prompt-length",
+            str(args.prompt_length),
+            "--max-new-tokens",
+            str(args.max_new_tokens),
+            "--device-memory-ratio",
+            str(args.device_memory_ratio),
+            "--kv-cache-ratio",
+            str(args.kv_cache_ratio),
+            "--warmup-runs",
+            str(args.warmup_runs),
+            "--repetitions",
+            str(args.repetitions),
+            "--seed",
+            str(args.seed),
+            "--output-json",
+            arm_out,
+            "--_arm",
+            arm.arm,
+        ]
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            results.append(
+                {
+                    "arm": arm.arm,
+                    "status": "BLOCKED",
+                    "reason": f"arm subprocess exit {proc.returncode}",
+                }
+            )
+            continue
+        with open(arm_out, "r", encoding="utf-8") as handle:
+            results.append(json.load(handle)["result"])
     return {
         "seed": int(args.seed),
         "arm_order": [arm.arm for arm in ordered],
@@ -576,6 +631,20 @@ def main() -> int:
             "batch_size": args.batch_size,
         }
         write_json(output_path, payload)
+        return 0
+
+    if args._arm is not None:
+        arm = ArmConfig(
+            args._arm,
+            args.device_memory_ratio,
+            args.kv_cache_ratio,
+            args._arm == "adaptive",
+        )
+        result = run_arm(arm, args)
+        write_json(
+            output_path,
+            {"arm": args._arm, "result": result, "environment": env},
+        )
         return 0
 
     if args.adaptive_memory:
