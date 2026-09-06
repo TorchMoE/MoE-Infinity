@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import torch
@@ -47,6 +47,45 @@ class DecodeGraphCapabilityProvider(Protocol):
     def decode_graph_capability(self) -> DecodeGraphCapability: ...
 
 
+@dataclass(frozen=True)
+class PagedBatchLengths:
+    query_lengths: list[int] | torch.Tensor
+    query_offsets: list[int] | torch.Tensor
+    context_lengths: list[int] | torch.Tensor
+    kv_seq_lengths: list[int] | torch.Tensor
+
+    def __post_init__(self) -> None:
+        def values(value: list[int] | torch.Tensor) -> list[int]:
+            if isinstance(value, torch.Tensor):
+                if value.ndim != 1:
+                    raise ValueError("paged batch lengths must be rank one")
+                return [int(item) for item in value.detach().cpu().tolist()]
+            return list(value)
+
+        query_lengths = values(self.query_lengths)
+        query_offsets = values(self.query_offsets)
+        context_lengths = values(self.context_lengths)
+        kv_seq_lengths = values(self.kv_seq_lengths)
+        batch_size = len(query_lengths)
+        if len(query_offsets) != batch_size + 1:
+            raise ValueError("query_offsets must have batch_size + 1 entries")
+        if len(context_lengths) != batch_size:
+            raise ValueError("context_lengths must match query_lengths")
+        if len(kv_seq_lengths) != batch_size:
+            raise ValueError("kv_seq_lengths must match query_lengths")
+        if query_offsets[:1] != [0]:
+            raise ValueError("query_offsets must start at zero")
+        running = 0
+        for index, query_length in enumerate(query_lengths):
+            if query_length <= 0 or context_lengths[index] < 0:
+                raise ValueError("paged batch lengths must be non-negative")
+            running += query_length
+            if query_offsets[index + 1] != running:
+                raise ValueError("query_offsets must sum query_lengths")
+            if kv_seq_lengths[index] != context_lengths[index] + query_length:
+                raise ValueError("kv_seq_lengths must equal context plus query")
+
+
 @dataclass
 class KVCacheSpec:
     num_kv_heads: int
@@ -64,14 +103,86 @@ class KVCacheSpec:
         )
 
 
+@dataclass(frozen=True)
+class PagedBatchLengths:
+    query_lengths: torch.Tensor | list[int]
+    query_offsets: torch.Tensor | list[int]
+    context_lengths: torch.Tensor | list[int]
+    kv_seq_lengths: torch.Tensor | list[int]
+
+    def validate(self) -> None:
+        query = [int(value) for value in self.query_lengths]
+        offsets = [int(value) for value in self.query_offsets]
+        context = [int(value) for value in self.context_lengths]
+        kv = [int(value) for value in self.kv_seq_lengths]
+        if len(context) != len(query) or len(kv) != len(query):
+            raise ValueError("paged length vectors must have equal batch size")
+        expected_offsets = [0]
+        for length in query:
+            if length < 0:
+                raise ValueError("query lengths must be non-negative")
+            expected_offsets.append(expected_offsets[-1] + length)
+        if offsets != expected_offsets:
+            raise ValueError(
+                "query_offsets must be the prefix sum of query_lengths"
+            )
+        if any(prior < 0 for prior in context):
+            raise ValueError("context lengths must be non-negative")
+        if any(
+            total != prior + current
+            for total, prior, current in zip(kv, context, query)
+        ):
+            raise ValueError(
+                "kv_seq_lengths must equal context_lengths + query_lengths"
+            )
+
+
 @dataclass
 class AttentionMetadata:
     block_tables: torch.Tensor
-    seq_lens: torch.Tensor
     max_seq_len: int
     num_prefill_tokens: int
     num_decode_tokens: int
     slot_mapping: torch.Tensor
     is_prefill: bool
+    seq_lens: torch.Tensor | None = None
+    lengths: PagedBatchLengths | None = field(default=None)
     kv_storage_owner_id: str | None = None
     seq_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.lengths is not None and self.seq_lens is None:
+            self.seq_lens = torch.tensor(
+                [int(v) for v in _as_int_list(self.lengths.kv_seq_lengths)],
+                dtype=torch.int32,
+            )
+        if self.seq_lens is None:
+            raise ValueError("AttentionMetadata requires seq_lens or lengths")
+
+
+def _as_int_list(value: list[int] | torch.Tensor) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.detach().cpu().tolist()]
+    return list(value)
+    lengths: PagedBatchLengths | None = None
+    max_seq_len: int = 0
+    num_prefill_tokens: int = 0
+    num_decode_tokens: int = 0
+    slot_mapping: torch.Tensor | None = None
+    is_prefill: bool = False
+    seq_lens: torch.Tensor | None = None
+    kv_storage_owner_id: str | None = None
+    seq_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.lengths is None and self.seq_lens is None:
+            raise ValueError(
+                "AttentionMetadata requires either lengths or seq_lens"
+            )
+
+
+@dataclass(frozen=True)
+class FlashInferPlanMetadata:
+    lengths: PagedBatchLengths
+    kv_indptr: torch.Tensor
+    kv_last_page_len: torch.Tensor

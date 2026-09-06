@@ -172,3 +172,40 @@ def test_ordinary_decode_cannot_enter_verify() -> None:
 
     with pytest.raises(ValueError, match="invalid transition"):
         sequence.set_status(SequenceStatus.VERIFY)
+
+
+def test_prefill_progress_advances_without_creating_output() -> None:
+    sequence = SequenceData(
+        seq_id=200,
+        prompt_token_ids=[10, 11, 12, 13, 14],
+        sampling_params=SamplingParams(),
+    )
+    sequence.set_status(SequenceStatus.PREFILL)
+
+    sequence.advance_prefill(2)
+    assert sequence.num_computed_tokens == 2
+    assert sequence.committed_kv_tokens == 2
+    assert sequence.remaining_prefill_tokens == 3
+    assert sequence.prefill_complete is False
+    assert sequence.output_token_ids == []
+
+    sequence.advance_prefill(3)
+    assert sequence.num_computed_tokens == 5
+    assert sequence.remaining_prefill_tokens == 0
+    assert sequence.prefill_complete is True
+
+
+def test_prefill_progress_rejects_overrun_and_non_prefill_state() -> None:
+    sequence = SequenceData(
+        seq_id=201,
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(),
+    )
+    with pytest.raises(RuntimeError, match="requires prefill status"):
+        sequence.advance_prefill(1)
+
+    sequence.set_status(SequenceStatus.PREFILL)
+    with pytest.raises(ValueError, match="exceeds prompt length"):
+        sequence.advance_prefill(4)
+    with pytest.raises(ValueError, match="must be > 0"):
+        sequence.advance_prefill(0)

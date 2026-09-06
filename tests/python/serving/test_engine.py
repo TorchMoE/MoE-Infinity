@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Optional, Union
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -68,8 +69,12 @@ _ = _load_module(
     ROOT / "moe_infinity" / "serving" / "engine.py",
 )
 
+from moe_infinity.runtime.attention_backend import (  # type: ignore[reportMissingImports]
+    PagedAttentionBackend,
+)
 from moe_infinity.runtime.attention_types import (  # type: ignore[reportMissingImports]
     DecodeGraphCapability,
+    KVCacheSpec,
 )
 from moe_infinity.serving.batch import (  # type: ignore[reportMissingImports]
     BatchMetadata,
@@ -78,12 +83,69 @@ from moe_infinity.serving.engine import (  # type: ignore[reportMissingImports]
     ContinuousBatchingEngine,
     RequestOutput,
 )
+from moe_infinity.serving.kv_cache import (  # type: ignore[reportMissingImports]
+    PagedKVCache,
+)
 from moe_infinity.serving.sampler import (  # type: ignore[reportMissingImports]
     SamplerOutput,
 )
 from moe_infinity.serving.sequence import (  # type: ignore[reportMissingImports]
     SamplingParams,
 )
+
+
+def make_flashinfer_backend(
+    num_blocks: int,
+    num_layers: int,
+    device: torch.device | None = None,
+) -> PagedAttentionBackend:
+    backend = PagedAttentionBackend(
+        spec=KVCacheSpec(
+            num_kv_heads=2, head_dim=8, dtype=torch.float16, block_size=4
+        ),
+        num_gpu_blocks=num_blocks,
+        device=device if device is not None else torch.device("cpu"),
+    )
+    backend.create_layered_store(layer_count=num_layers)
+    return backend
+
+
+def make_serving_cache(num_blocks: int, num_layers: int) -> PagedKVCache:
+    return PagedKVCache(
+        num_blocks=num_blocks,
+        block_size=4,
+        num_layers=num_layers,
+        num_heads=2,
+        head_dim=8,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+
+
+def _make_chunk_engine(
+    prompt: list[int], chunk_size: int
+) -> ContinuousBatchingEngine:
+    config = _make_config()
+    config.update(
+        enable_chunked_prefill=True,
+        prefill_chunk_size=chunk_size,
+        max_tokens_per_step=chunk_size,
+        num_kv_blocks=16,
+    )
+    engine = ContinuousBatchingEngine(
+        model=MockModel(), engine=MockOffloadEngine(), config=config
+    )
+    backend = make_flashinfer_backend(
+        num_blocks=engine.kv_cache.num_blocks,
+        num_layers=1,
+        device=engine.kv_cache.device,
+    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
+    engine.scheduler.set_chunked_prefill_runtime_enabled(True)
+    engine.add_request(
+        "long", prompt, SamplingParams(temperature=0.0, max_tokens=1)
+    )
+    return engine
 
 
 @dataclass
@@ -534,6 +596,270 @@ def test_engine_n_finished_when_all_complete() -> None:
     )
     assert engine.has_pending_requests() is True
     assert "req-n" not in engine._completed_request_ids
+
+
+def test_set_block_store_rejects_oversized_logical_capacity() -> None:
+    backend = make_flashinfer_backend(num_blocks=4, num_layers=1)
+    cache = make_serving_cache(num_blocks=6, num_layers=1)
+    with pytest.raises(ValueError, match="logical cache exceeds"):
+        cache.set_block_store(backend.block_store, owner=backend)
+    cache.resize_num_blocks(4)
+    cache.set_block_store(backend.block_store, owner=backend)
+    assert cache.num_blocks == 4
+    assert cache.block_store.num_blocks == 4
+
+
+def test_engine_rejects_chunked_prefill_with_prefix_caching() -> None:
+    config = _make_config()
+    config.update(
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "enable_chunked_prefill and enable_prefix_caching cannot both "
+            "be true in the first release"
+        ),
+    ):
+        ContinuousBatchingEngine(
+            model=MockModel(), engine=MockOffloadEngine(), config=config
+        )
+
+
+def test_partial_prefill_step_commits_progress_without_emitting_token() -> None:
+    config = _make_config()
+    config.update(
+        enable_chunked_prefill=True,
+        prefill_chunk_size=2,
+        max_tokens_per_step=2,
+        num_kv_blocks=16,
+    )
+    engine = ContinuousBatchingEngine(
+        model=MockModel(), engine=MockOffloadEngine(), config=config
+    )
+    backend = make_flashinfer_backend(
+        num_blocks=engine.kv_cache.num_blocks,
+        num_layers=1,
+        device=engine.kv_cache.device,
+    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
+    engine.scheduler.set_chunked_prefill_runtime_enabled(True)
+    engine.add_request(
+        "long",
+        [10, 11, 12, 13, 14],
+        SamplingParams(temperature=0.0, max_tokens=1),
+    )
+
+    assert engine.step() == []
+    sequence = engine._sequences[0]
+    assert sequence.num_computed_tokens == 2
+    assert sequence.output_token_ids == []
+    assert engine.has_pending_requests()
+
+
+def test_terminal_prefill_is_the_only_prefill_chunk_sampled() -> None:
+    config = _make_config()
+    config.update(
+        enable_chunked_prefill=True,
+        prefill_chunk_size=2,
+        max_tokens_per_step=2,
+        num_kv_blocks=16,
+    )
+    engine = ContinuousBatchingEngine(
+        model=MockModel(), engine=MockOffloadEngine(), config=config
+    )
+    backend = make_flashinfer_backend(
+        num_blocks=engine.kv_cache.num_blocks,
+        num_layers=1,
+        device=engine.kv_cache.device,
+    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
+    engine.scheduler.set_chunked_prefill_runtime_enabled(True)
+    engine.add_request(
+        "long",
+        [10, 11, 12, 13, 14],
+        SamplingParams(temperature=0.0, max_tokens=1),
+    )
+
+    outputs = engine.run_until_done()
+
+    assert outputs == {"long": [15]}
+    assert engine.get_stats()["num_prefill_chunks"] == 3
+
+
+def test_eager_model_disables_requested_chunking() -> None:
+    config = _make_config()
+    config.update(
+        enable_chunked_prefill=True, prefill_chunk_size=2, num_kv_blocks=16
+    )
+    engine = ContinuousBatchingEngine(
+        model=MockModel(), engine=MockOffloadEngine(), config=config
+    )
+
+    assert engine.scheduler.chunked_prefill_enabled is False
+    assert engine.get_stats()["chunked_prefill_active"] is False
+    assert engine.get_stats()["chunked_prefill_fallback_reason"] == (
+        "incomplete_qwen3_paged_layer_registry"
+    )
+
+
+def test_dflash_is_not_delegated_after_partial_prefill() -> None:
+    speculator = MockSpeculator()
+    config = _make_config()
+    config.update(
+        enable_chunked_prefill=True,
+        prefill_chunk_size=2,
+        max_tokens_per_step=2,
+        num_kv_blocks=16,
+    )
+    engine = ContinuousBatchingEngine(
+        model=MockModel(),
+        engine=MockOffloadEngine(),
+        config=config,
+        speculative_draft=speculator,
+    )
+    backend = make_flashinfer_backend(
+        num_blocks=engine.kv_cache.num_blocks,
+        num_layers=1,
+        device=engine.kv_cache.device,
+    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
+    engine.scheduler.set_chunked_prefill_runtime_enabled(True)
+    engine.add_request(
+        "long",
+        [10, 11, 12, 13, 14],
+        SamplingParams(temperature=0.0, max_tokens=1),
+    )
+
+    _ = engine.run_until_done()
+
+    assert speculator.calls == 0
+
+
+def test_execution_exception_rolls_back_and_requeues_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _make_chunk_engine(prompt=[10, 11, 12, 13], chunk_size=2)
+    monkeypatch.setattr(
+        engine,
+        "_execute_batch",
+        lambda batch: (_ for _ in ()).throw(RuntimeError("forward failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        engine.step()
+
+    sequence = engine._sequences[0]
+    assert sequence.num_computed_tokens == 0
+    assert engine.scheduler.inflight_prefill_seq_ids == []
+    assert engine.scheduler.schedule().prefill_chunks[0].start_pos == 0
+
+
+def test_terminal_sampling_exception_rolls_back_and_requeues_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _make_chunk_engine(prompt=[10, 11], chunk_size=2)
+    monkeypatch.setattr(
+        engine.sampler,
+        "sample",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("sampling failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="sampling failed"):
+        engine.step()
+
+    sequence = engine._sequences[0]
+    assert sequence.num_computed_tokens == 0
+    assert sequence.output_token_ids == []
+    assert engine.kv_cache.get_num_reserved_tokens(0) == 0
+    assert engine.scheduler.inflight_prefill_seq_ids == []
+
+
+def test_chunked_prefill_defaults_disabled() -> None:
+    engine = _make_engine()
+    assert engine.scheduler.chunked_prefill_requested is False
+    assert engine.get_config().get("enable_chunked_prefill", False) is False
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("prefill_chunk_size", 0), ("prefill_starvation_threshold_steps", 0)],
+)
+def test_chunked_prefill_config_requires_positive_integers(
+    key: str, value: int
+) -> None:
+    config = _make_config()
+    config["enable_chunked_prefill"] = True
+    config[key] = value
+    with pytest.raises(ValueError, match=key):
+        ContinuousBatchingEngine(
+            model=MockModel(), engine=MockOffloadEngine(), config=config
+        )
+
+
+def test_execution_exception_on_disabled_path_surfaces_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _make_engine()
+    engine.add_request(
+        "req",
+        [10, 11],
+        SamplingParams(temperature=0.0, max_tokens=2),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_execute_batch",
+        lambda batch: (_ for _ in ()).throw(RuntimeError("forward boom")),
+    )
+
+    with pytest.raises(RuntimeError, match="forward boom"):
+        engine.step()
+
+
+def test_dflash_generate_failure_rolls_back_chunk_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FailingSpeculator:
+        calls = 0
+
+        def generate(self, *args: object, **kwargs: object) -> object:
+            self.calls += 1
+            raise RuntimeError("dflash generate boom")
+
+    config = _make_config()
+    config.update(
+        enable_chunked_prefill=True,
+        prefill_chunk_size=4,
+        max_tokens_per_step=4,
+        num_kv_blocks=16,
+    )
+    engine = ContinuousBatchingEngine(
+        model=MockModel(),
+        engine=MockOffloadEngine(),
+        config=config,
+        speculative_draft=_FailingSpeculator(),
+    )
+    backend = make_flashinfer_backend(
+        num_blocks=engine.kv_cache.num_blocks,
+        num_layers=1,
+        device=engine.kv_cache.device,
+    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
+    engine.scheduler.set_chunked_prefill_runtime_enabled(True)
+    engine.add_request(
+        "long", [10, 11], SamplingParams(temperature=0.0, max_tokens=1)
+    )
+
+    with pytest.raises(RuntimeError, match="dflash generate boom"):
+        engine.step()
+
+    assert engine.scheduler.inflight_prefill_seq_ids == []
+    assert engine._sequences[0].num_computed_tokens == 0
+    assert engine.scheduler.schedule().prefill_chunks[0].start_pos == 0
 
 
 def _decode_batch_for_engine(
