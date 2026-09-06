@@ -868,6 +868,8 @@ def test_dflash_generate_failure_rolls_back_chunk_transaction(
     assert engine.scheduler.inflight_prefill_seq_ids == []
     assert engine._sequences[0].num_computed_tokens == 0
     assert engine.scheduler.schedule().prefill_chunks[0].start_pos == 0
+
+
 def _decode_batch_for_engine(
     token_ids: list[int],
     *,

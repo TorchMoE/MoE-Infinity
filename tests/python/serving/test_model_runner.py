@@ -229,6 +229,8 @@ def test_runtime_metadata_maps_partial_prefill_slots() -> None:
     assert metadata.num_prefill_tokens == 3
     assert metadata.num_decode_tokens == 0
     assert metadata.slot_mapping.tolist() == [9 * 4 + 1, 9 * 4 + 2, 9 * 4 + 3]
+
+
 from transformers.models.qwen3_moe.configuration_qwen3_moe import (  # noqa: E402
     Qwen3MoeConfig,
 )

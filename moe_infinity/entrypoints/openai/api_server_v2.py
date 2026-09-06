@@ -87,13 +87,12 @@ except Exception:
     uvicorn = SimpleNamespace(run=lambda *args, **kwargs: None)
 
 import moe_infinity.serving.watchdog as watchdog_module
+from moe_infinity.serving.cuda_graph import FALLBACK_REASONS
 from moe_infinity.serving.engine import (
     ContinuousBatchingEngine,
     RequestOutput,
     validate_chunked_prefill_config,
 )
-from moe_infinity.serving.cuda_graph import FALLBACK_REASONS
-from moe_infinity.serving.engine import ContinuousBatchingEngine, RequestOutput
 from moe_infinity.serving.health import ServerHealthState
 from moe_infinity.serving.sequence import SamplingParams
 from moe_infinity.serving.stream import StreamManager

@@ -8,18 +8,13 @@ from typing import Callable, Optional, Protocol, cast
 
 import torch
 
-from .batch import (
-    BatchBuilder,
-    BatchMetadata,
-    SchedulerOutput,
-    split_prefill_decode_batch,
-)
 from moe_infinity.runtime.attention_backend import PagedAttentionBackend
 from moe_infinity.runtime.attention_types import DECODE_GRAPH_REASONS
 
 from .batch import (
     BatchBuilder,
     BatchMetadata,
+    SchedulerOutput,
     _slice_batch,
     split_prefill_decode_batch,
 )
@@ -477,9 +472,7 @@ class ContinuousBatchingEngine:
             sampled_params = [
                 batch.sampling_params[index] for index in sampled_indices
             ]
-            sampler_output = self.sampler.sample(
-                sampled_logits, sampled_params
-            )
+            sampler_output = self.sampler.sample(sampled_logits, sampled_params)
             next_token_ids = sampler_output.token_ids
 
         outputs: list[RequestOutput] = []
@@ -1347,13 +1340,19 @@ class ContinuousBatchingEngine:
                 else None
             ),
             "memory": self.memory_manager.report(),
-            "num_prefill_chunks": self._num_prefill_chunks,
-            "chunked_prefill_requested": (
-                self.scheduler.chunked_prefill_requested
+            "num_prefill_chunks": getattr(self, "_num_prefill_chunks", 0),
+            "chunked_prefill_requested": getattr(
+                getattr(self, "scheduler", None),
+                "chunked_prefill_requested",
+                False,
             ),
-            "chunked_prefill_active": self.scheduler.chunked_prefill_enabled,
-            "chunked_prefill_fallback_reason": (
-                self._chunked_prefill_fallback_reason
+            "chunked_prefill_active": getattr(
+                getattr(self, "scheduler", None),
+                "chunked_prefill_enabled",
+                False,
+            ),
+            "chunked_prefill_fallback_reason": getattr(
+                self, "_chunked_prefill_fallback_reason", None
             ),
             "cuda_graph": cuda_graph_stats,
         }

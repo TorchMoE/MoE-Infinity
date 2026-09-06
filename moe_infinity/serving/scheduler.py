@@ -795,9 +795,13 @@ class Scheduler:
                 )
                 try:
                     self.kv_cache.append_tokens(seq_id, num_new_tokens=num_new)
-                    self.kv_cache.ensure_sequence_capacity(
-                        seq_id, sequence.num_computed_tokens + 1
-                    )
+                    target_tokens = sequence.num_computed_tokens + 1
+                    if target_tokens > self.kv_cache.get_num_reserved_tokens(
+                        seq_id
+                    ):
+                        self.kv_cache.ensure_sequence_capacity(
+                            seq_id, target_tokens
+                        )
                 except KeyError:
                     pass
 

@@ -382,8 +382,8 @@ class PagedAttentionBackend:
 
     @_fi_kv_cache.setter
     def _fi_kv_cache(self, value: Optional[torch.Tensor]) -> None:
-        if value is None and getattr(self, "_block_store", None) is not None:
-            self._block_store.fi_kv_cache = None
+        if value is None and getattr(self, "block_store", None) is not None:
+            self.block_store.fi_kv_cache = None
 
     def _init_from_storage(
         self,
@@ -397,6 +397,7 @@ class PagedAttentionBackend:
                 "FlashInfer; the FlashInfer plan path is graph-ineligible"
             )
         self.storage = storage
+        self.block_store = None
         self._layer_idx = layer_idx
         self.spec = KVCacheSpec(
             num_kv_heads=storage.num_kv_heads,
@@ -552,6 +553,7 @@ class PagedAttentionBackend:
         graph_mode: bool = False,
     ) -> torch.Tensor:
         _ = (kv_cache, graph_mode)
+        layer_idx = 0 if layer_idx is None else int(layer_idx)
         metadata = (
             attention_metadata
             if attention_metadata is not None
@@ -623,9 +625,10 @@ class PagedAttentionBackend:
                 "prefill query/key/value must have shape [num_tokens, num_heads, head_dim]"
             )
 
+        store = getattr(self, "block_store", None)
         fi_layer_cache = (
-            self.block_store.fi_kv_cache[layer_idx]
-            if self.block_store.fi_kv_cache is not None
+            store.fi_kv_cache[layer_idx]
+            if store is not None and store.fi_kv_cache is not None
             else None
         )
         if self._flashinfer_enabled():
@@ -722,9 +725,10 @@ class PagedAttentionBackend:
                 "decode query must have shape [batch_size, num_heads, head_dim]"
             )
 
+        store = getattr(self, "block_store", None)
         fi_layer_cache = (
-            self.block_store.fi_kv_cache[layer_idx]
-            if self.block_store.fi_kv_cache is not None
+            store.fi_kv_cache[layer_idx]
+            if store is not None and store.fi_kv_cache is not None
             else None
         )
         if self._flashinfer_enabled():
@@ -760,10 +764,20 @@ class PagedAttentionBackend:
             else 1.0 / math.sqrt(float(self.spec.head_dim))
         )
 
+        if self.block_store is not None:
+            key_cache = self.block_store.k_cache[layer_idx]
+            value_cache = self.block_store.v_cache[layer_idx]
+        else:
+            resolved_layer = (
+                self._layer_idx if self._layer_idx is not None else layer_idx
+            )
+            key_cache = self.storage.key_cache[resolved_layer]
+            value_cache = self.storage.value_cache[resolved_layer]
+
         return paged_attention_fwd(
             query=query.to(self.device, dtype=self.spec.dtype),
-            key_cache=self.block_store.k_cache[layer_idx],
-            value_cache=self.block_store.v_cache[layer_idx],
+            key_cache=key_cache,
+            value_cache=value_cache,
             block_tables=block_tables.to(self.device),
             seq_lens=seq_lens.to(self.device),
             scale=attn_scale,

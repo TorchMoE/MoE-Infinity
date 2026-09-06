@@ -306,6 +306,7 @@ class PagedKVCache:
             dtype=self.dtype,
             device=self.device,
         )
+
     def _bind_storage(self, storage: "PagedKVStorage") -> None:
         from moe_infinity.runtime.paged_kv_storage import canonical_device
 
