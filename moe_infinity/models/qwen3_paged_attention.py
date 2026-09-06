@@ -35,6 +35,7 @@ class _SupportsPagedAttention(Protocol):
         attention_metadata: Optional[
             Union[AttentionMetadata, RuntimeAttentionMetadata]
         ] = None,
+        layer_idx: int = 0,
     ) -> Optional[torch.Tensor]: ...
 
 
@@ -57,6 +58,31 @@ class Qwen3PagedAttention(Qwen3MoeAttention):
     def clear_paged_context(cls) -> None:
         cls._paged_backend = None
         cls._attention_metadata = None
+
+    @staticmethod
+    def _valid_token_index(
+        metadata: object,
+        bsz: int,
+        q_len: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        lengths = getattr(metadata, "lengths", None)
+        query_lengths = (
+            getattr(lengths, "query_lengths", None)
+            if lengths is not None
+            else None
+        )
+        if query_lengths is None:
+            return None
+        per_seq = [int(v) for v in query_lengths.reshape(-1).tolist()]
+        if len(per_seq) != bsz or all(length == q_len for length in per_seq):
+            return None
+        indices = [
+            row * q_len + col
+            for row, length in enumerate(per_seq)
+            for col in range(length)
+        ]
+        return torch.tensor(indices, dtype=torch.long, device=device)
 
     @deprecate_kwarg(
         "past_key_value", new_name="past_key_values", version="4.58"
@@ -146,6 +172,23 @@ class Qwen3PagedAttention(Qwen3MoeAttention):
             .view(-1, num_key_value_heads, self.head_dim)
         )
 
+        valid_index = self._valid_token_index(
+            attention_metadata, bsz, q_len, query_tokens.device
+        )
+        packed = valid_index is not None
+        if packed:
+            query_tokens = query_tokens.index_select(0, valid_index)
+            key_tokens = key_tokens.index_select(0, valid_index)
+            value_tokens = value_tokens.index_select(0, valid_index)
+
+        attn_output_tokens = paged_backend.forward(
+            query_tokens,
+            key_tokens,
+            value_tokens,
+            attention_metadata=attention_metadata,
+            scale=cast(float, self.scaling),
+            layer_idx=int(self.layer_idx),
+        )
         try:
             attn_output_tokens = paged_backend.forward(
                 query_tokens,
@@ -163,6 +206,15 @@ class Qwen3PagedAttention(Qwen3MoeAttention):
                 attention_metadata=attention_metadata,
                 scale=cast(float, self.scaling),
             )
+
+        if packed and attn_output_tokens is not None:
+            scattered = attn_output_tokens.new_zeros(
+                bsz * q_len,
+                attn_output_tokens.shape[1],
+                attn_output_tokens.shape[2],
+            )
+            scattered.index_copy_(0, valid_index, attn_output_tokens)
+            attn_output_tokens = scattered
 
         if attn_output_tokens is None or attn_output_tokens.ndim != 3:
             raise ValueError(

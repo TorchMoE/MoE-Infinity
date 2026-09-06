@@ -53,6 +53,8 @@ Stable options from `api_server_v2.py`:
 | `--rate-limit` | `0` | Requests/minute/key; `0` disables |
 | `--max-waiting-requests` | `0` | Queue depth backpressure threshold; `0` disables |
 | `--max-n` | `16` | Cap for parallel sampling `n` / `best_of` |
+| `--enable-prefix-caching` | off | Enable correctness-preserving prefix KV reuse (Qwen3 + FlashInfer) |
+| `--prefix-cache-max-entries` | 1000 | Max prefix-index entries (startup-only, >= 1) |
 | `--enable-prefix-caching` | off | Enable prefix-cache bookkeeping flag |
 | `--enable-decode-cuda-graphs` | off | Permit decode graph qualification; unsafe runtimes still run eagerly |
 | `--decode-cuda-graph-batch-sizes` | `1 2 4 8 16 32` | Positive capture/replay batch buckets |
@@ -88,7 +90,7 @@ Binding the Python startup path to `0.0.0.0` has the same exposure and auth
 implications as the CLI. Configure `api_key` or `MOE_API_KEYS` before using a
 non-loopback bind on an untrusted network.
 
-`MoE.serve()` accepts the same serving knobs as the CLI for host, port, memory ratios, batch sizing, the prefix-cache feature flag, offload path, and DFlash drafter setup. The flag currently enables scaffolding only; it does not activate request-path reuse.
+`MoE.serve()` accepts the same serving knobs as the CLI for host, port, memory ratios, batch sizing, the prefix-cache flag, offload path, and DFlash drafter setup. With `--enable-prefix-caching` on a supported Qwen3 + FlashInfer runtime the flag activates request-path prefix KV reuse; otherwise the cold path runs unchanged.
 
 ## Decode CUDA graphs (experimental, opt-in)
 
@@ -253,12 +255,49 @@ Accepted but currently no-op:
 
 ## Prefix Caching
 
-- `--enable-prefix-caching` toggles the feature flag.
-- The cache implementation is hash-based LRU with `block_size=16` and `max_entries=1000` by default.
-- Current serving code does not wire the cache into request execution, so there is no active reuse path yet.
-- Observability is internal (`hit_rate`, lookup/insert bookkeeping), not a public endpoint.
+Prefix KV reuse is opt-in and default off. It reuses the physical KV of an exact
+shared prompt prefix so a warm request only recomputes its divergent suffix,
+with cold/warm equivalence.
 
-The prefix-cache scaffold does not change expert ownership; the multi-GPU guide covers that layout separately.
+- `--enable-prefix-caching` enables reuse; `--prefix-cache-max-entries` (default
+  `1000`, minimum `1`, startup-only) bounds the prefix index.
+- **Supported scope.** Reuse activates only on the Qwen3 paged-attention path
+  with a complete per-layer registry, matching KV geometry, and real FlashInfer
+  prefill/decode. Any other runtime keeps the existing cold path and reports a
+  stable `prefix_cache_disabled_reason` (for example
+  `prefix-aware-prefill-unavailable`, `incomplete-paged-layer-registry`, or
+  `kv-store-binding-mismatch`).
+- **Exact identity.** A hit requires exact compatibility namespace (model,
+  tokenizer, adapter, dtype, KV geometry, attention backend/layout, position
+  config, runtime epoch), exact parent-entry path, and exact token blocks.
+  SHA-256 is only a bucket accelerator and never substitutes for token equality.
+- **Layer completeness.** One physical block names K/V for every layer in a
+  single validated layered store; export/import, checkpoint/restore, copy-on-
+  write, publication, and eviction operate across all layers or fail closed.
+- **Atomic pinned admission.** All sequences in a request group (including
+  `n>1`) are pinned with leases before any eviction, then admitted together or
+  not at all; failed admission restores tables, free count, refcounts, statuses,
+  and open-lease count.
+- **Committed-range publication.** Only fully committed, block-complete prompt
+  ranges are published after a successful forward; failed or partial chunks and
+  DFlash verify tails are never published.
+- **Copy-on-write.** Indexed blocks are immutable; any write to a shared partial
+  tail first copies every layer to a private block.
+- **Reload and rollback.** `/v1/reload` invalidates the prefix cache once after a
+  successful module reload. Rollback is removing `--enable-prefix-caching`,
+  restarting, and confirming `moe_prefix_cache_active 0`; there is no persisted
+  state to migrate.
+- **DFlash exclusion.** Reused-prefix and non-cold requests use ordinary paged
+  execution and are excluded from DFlash delegation.
+- **Observability.** `/admin/stats` and zero-safe `moe_prefix_cache_*`
+  Prometheus metrics expose enabled/active/disabled-reason, entries, open leases,
+  hits, matched tokens, and invalidations.
+
+Motivated by SGLang RadixAttention
+(<https://lmsys.org/blog/2024-01-17-sglang/>) and vLLM automatic prefix caching
+(<https://docs.vllm.ai/en/stable/examples/features/automatic_prefix_caching>);
+no universal speedup is claimed. Prefix reuse does not change expert ownership;
+the multi-GPU guide covers that layout separately.
 
 ## DFlash Serving
 
@@ -436,3 +475,36 @@ In short, there is no external storage implementation in this change.
    production data.
 Rollback requires draining/restarting with `kv_swap_mode="sync"`; never change
 the backend while transfers are in flight.
+### Chunked prefill (experimental)
+
+Chunked prefill is disabled by default. Enable it with
+`--enable-chunked-prefill`; tune the hard per-row bound with
+`--prefill-chunk-size` (default `512`) and prefill-only age promotion with
+`--prefill-starvation-threshold-steps` (default `8`). `max_tokens_per_step`
+remains the total decode-plus-prefill budget. Runnable decode rows consume one
+token each before prefill receives the remaining budget.
+
+Activation requires complete Qwen3 paged-layer registration, real FlashInfer,
+and the canonical production `LayeredPagedKVStore`. Logical block capacity is
+`min(memory_budget_blocks, block_store.physical_capacity)`; unequal capacities are
+valid. If any capability is unavailable,
+the engine reports `chunked_prefill_active=false` and
+an explicit `chunked_prefill_fallback_reason`, then uses the
+unchanged whole-prefill path. The first release rejects simultaneous
+`enable_chunked_prefill=true` and `enable_prefix_caching=true` at startup with
+`ValueError: enable_chunked_prefill and enable_prefix_caching cannot both be
+true in the first release`. Chunk transactions are standalone scheduler/KV
+transactions and do not import or duplicate a prefix implementation. Roll back
+by removing `--enable-chunked-prefill` (or disabling prefix caching) and
+restarting; no request or cache-format migration is required. PR #181 is design
+input for a future reconciliation only, not an implementation dependency.
+DFlash is used only for singleton prompts completed in one prefill launch;
+partially prefetched prompts stay on ordinary paged decode.
+
+Operational risks are extra scheduler launches for long prompts, page-boundary
+fragmentation, prefill backpressure under saturated decode load, model/backend
+metadata incompatibility, and latency regressions from a poorly chosen chunk
+size. Roll out first in shadow benchmarks, then a paged-backend canary, then a
+small opt-in production cohort. Roll back by removing
+`--enable-chunked-prefill`; no persisted cache or request format migration is
+required.

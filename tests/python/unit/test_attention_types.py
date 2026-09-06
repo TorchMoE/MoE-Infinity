@@ -1,6 +1,10 @@
 import torch
 
-from moe_infinity.runtime.attention_types import AttentionMetadata, KVCacheSpec
+from moe_infinity.runtime.attention_types import (
+    AttentionMetadata,
+    KVCacheSpec,
+    PagedBatchLengths,
+)
 
 
 def test_page_size_bytes_mha():
@@ -37,12 +41,16 @@ def test_page_size_bytes_bf16_matches_fp16():
 
 def test_attention_metadata_creation():
     block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
-    seq_lens = torch.tensor([16, 8], dtype=torch.int32)
     slot_mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
 
     metadata = AttentionMetadata(
         block_tables=block_tables,
-        seq_lens=seq_lens,
+        lengths=PagedBatchLengths(
+            query_lengths=torch.tensor([3, 1], dtype=torch.int32),
+            query_offsets=torch.tensor([0, 3, 4], dtype=torch.int32),
+            context_lengths=torch.tensor([13, 7], dtype=torch.int32),
+            kv_seq_lengths=torch.tensor([16, 8], dtype=torch.int32),
+        ),
         max_seq_len=16,
         num_prefill_tokens=3,
         num_decode_tokens=1,
@@ -51,6 +59,6 @@ def test_attention_metadata_creation():
     )
 
     assert metadata.block_tables.dtype == torch.int32
-    assert metadata.seq_lens.dtype == torch.int32
+    assert metadata.lengths.kv_seq_lengths.dtype == torch.int32
     assert metadata.slot_mapping.dtype == torch.int64
     assert metadata.is_prefill is True

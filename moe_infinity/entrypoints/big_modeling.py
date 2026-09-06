@@ -233,6 +233,7 @@ class MoE:
                 or arch == "deepseek_v3"
                 or arch == "nllb"
                 or arch == "gptoss"
+                or arch == "qwen3"
                 or arch == "qwen3_5"
             ):
                 is_flash_attn_available = False
@@ -1247,6 +1248,9 @@ class MoE:
         kv_cache_ratio: float = 0.25,
         max_batch_size: int = 32,
         enable_prefix_caching: bool = False,
+        enable_chunked_prefill: bool = False,
+        prefill_chunk_size: int = 512,
+        prefill_starvation_threshold_steps: int = 8,
         offload_dir: Optional[str] = None,
         speculative_draft: Optional[object] = None,
         kv_swap_mode: Optional[str] = None,
@@ -1340,6 +1344,11 @@ class MoE:
             kv_swap_checksum=resolved_kv_swap_checksum,
             kv_swap_max_retries=resolved_kv_swap_max_retries,
             kv_swap_allow_sync_fallback=resolved_kv_swap_allow_sync_fallback,
+            enable_chunked_prefill=enable_chunked_prefill,
+            prefill_chunk_size=prefill_chunk_size,
+            prefill_starvation_threshold_steps=(
+                prefill_starvation_threshold_steps
+            ),
             speculative_draft=serving_speculator,
             enable_deepseek_mla_paging=enable_deepseek_mla_paging,
             max_resident_paged_speculative_sessions=(

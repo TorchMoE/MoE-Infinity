@@ -155,14 +155,6 @@ def test_request_id_present_in_sequence() -> None:
     assert group.get_sequence(1) is sequence
 
 
-@pytest.mark.xfail(
-    reason=(
-        "pre-existing at the #188 fold (d419b68): the can_append decode "
-        "guard makes resumption impossible in this 2-block toy geometry; "
-        "needs author arbitration between #188 semantics and this fixture"
-    ),
-    strict=True,
-)
 def test_request_id_stable_through_swap() -> None:
     cache = _make_cache(num_blocks=2)
     scheduler = Scheduler(cache, max_batch_size=8, max_tokens_per_step=128)

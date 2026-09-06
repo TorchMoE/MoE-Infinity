@@ -88,7 +88,11 @@ except Exception:
 
 import moe_infinity.serving.watchdog as watchdog_module
 from moe_infinity.serving.cuda_graph import FALLBACK_REASONS
-from moe_infinity.serving.engine import ContinuousBatchingEngine, RequestOutput
+from moe_infinity.serving.engine import (
+    ContinuousBatchingEngine,
+    RequestOutput,
+    validate_chunked_prefill_config,
+)
 from moe_infinity.serving.health import ServerHealthState
 from moe_infinity.serving.sequence import SamplingParams
 from moe_infinity.serving.stream import StreamManager
@@ -490,6 +494,9 @@ def initialize_with_model(
     kv_swap_checksum: bool = False,
     kv_swap_max_retries: int = 2,
     kv_swap_allow_sync_fallback: bool = True,
+    enable_chunked_prefill: bool = False,
+    prefill_chunk_size: int = 512,
+    prefill_starvation_threshold_steps: int = 8,
     speculative_draft: Optional[Any] = None,
     enable_decode_cuda_graphs: bool = False,
     decode_cuda_graph_batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
@@ -531,6 +538,9 @@ def initialize_with_model(
         kv_swap_checksum=kv_swap_checksum,
         kv_swap_max_retries=kv_swap_max_retries,
         kv_swap_allow_sync_fallback=kv_swap_allow_sync_fallback,
+        enable_chunked_prefill=enable_chunked_prefill,
+        prefill_chunk_size=prefill_chunk_size,
+        prefill_starvation_threshold_steps=(prefill_starvation_threshold_steps),
         enable_decode_cuda_graphs=enable_decode_cuda_graphs,
         decode_cuda_graph_batch_sizes=decode_cuda_graph_batch_sizes,
         decode_cuda_graph_context_sizes=decode_cuda_graph_context_sizes,
@@ -1038,17 +1048,25 @@ async def _completion_event_generator(
     raw_request: Request,
 ) -> Any:
     runtime_engine, _ = _ensure_runtime_ready()
+    pending: Optional["asyncio.Future[Optional[str]]"] = None
     while True:
         if await raw_request.is_disconnected():
             runtime_engine.abort_request(request_id)
+            if pending is not None:
+                _ = pending.cancel()
             return
+        if pending is None:
+            pending = asyncio.ensure_future(
+                asyncio.to_thread(_next_stream_event, stream)
+            )
         try:
             event = await asyncio.wait_for(
-                asyncio.to_thread(_next_stream_event, stream),
+                asyncio.shield(pending),
                 timeout=0.1,
             )
         except asyncio.TimeoutError:
             continue
+        pending = None
 
         if event is None:
             return
@@ -1082,17 +1100,25 @@ async def _chat_event_generator(
     *, request_id: str, stream: Any, raw_request: Request
 ) -> Any:
     runtime_engine, _ = _ensure_runtime_ready()
+    pending: Optional["asyncio.Future[Optional[str]]"] = None
     while True:
         if await raw_request.is_disconnected():
             runtime_engine.abort_request(request_id)
+            if pending is not None:
+                _ = pending.cancel()
             return
+        if pending is None:
+            pending = asyncio.ensure_future(
+                asyncio.to_thread(_next_stream_event, stream)
+            )
         try:
             event = await asyncio.wait_for(
-                asyncio.to_thread(_next_stream_event, stream),
+                asyncio.shield(pending),
                 timeout=0.1,
             )
         except asyncio.TimeoutError:
             continue
+        pending = None
 
         if event is None:
             return
@@ -1118,6 +1144,7 @@ def _replace_engine(new_engine: ContinuousBatchingEngine) -> None:
 
 
 async def _engine_loop() -> None:
+    _logger.info("engine loop started")
     while (
         _engine_shutdown_event is not None
         and not _engine_shutdown_event.is_set()
@@ -1128,25 +1155,24 @@ async def _engine_loop() -> None:
             await asyncio.sleep(0.01)
             continue
 
-        with _engine_lifecycle_lock:
-            current_engine = engine
-            has_pending_requests = (
-                current_engine is not None
-                and current_engine.has_pending_requests()
-            )
+        try:
+            with _engine_lifecycle_lock:
+                has_pending_requests = current_engine.has_pending_requests()
             if has_pending_requests:
                 if _decode_watchdog is not None:
                     _decode_watchdog.activate()
                 _ = current_engine.step()
                 if _decode_watchdog is not None:
                     _decode_watchdog.feed()
-        if has_pending_requests:
-            await asyncio.sleep(0)
-            continue
-
-        if _decode_watchdog is not None:
-            _decode_watchdog.deactivate()
-        await asyncio.sleep(0.005)
+                await asyncio.sleep(0)
+                continue
+            if _decode_watchdog is not None:
+                _decode_watchdog.deactivate()
+            await asyncio.sleep(0.005)
+        except Exception as exc:
+            _logger.exception("engine loop step failed")
+            _health_state.set_unhealthy(f"engine loop failed: {exc}")
+            return
 
 
 def _ensure_engine_loop_running() -> None:
@@ -1903,6 +1929,10 @@ async def reload_modules(payload: dict[str, Any]) -> JSONResponse:
             except Exception as e:
                 errors.append({"module": module_name, "error": str(e)})
     status = "ok" if not errors else "partial"
+    if reloaded and engine is not None:
+        invalidate = getattr(engine, "invalidate_prefix_cache", None)
+        if callable(invalidate):
+            invalidate("module-reload")
     return JSONResponse(
         content={"status": status, "reloaded": reloaded, "errors": errors}
     )
@@ -2071,6 +2101,17 @@ def _build_engine_config(
     }
     if eos_token_id is not None:
         config["eos_token_id"] = eos_token_id
+    config["enable_chunked_prefill"] = bool(
+        getattr(args, "enable_chunked_prefill", False)
+    )
+    config["enable_prefix_caching"] = bool(
+        getattr(args, "enable_prefix_caching", False)
+    )
+    config["prefill_chunk_size"] = int(getattr(args, "prefill_chunk_size", 512))
+    config["prefill_starvation_threshold_steps"] = int(
+        getattr(args, "prefill_starvation_threshold_steps", 8)
+    )
+    validate_chunked_prefill_config(config)
     if args.enable_prefix_caching:
         config["enable_prefix_caching"] = True
 
@@ -2086,6 +2127,11 @@ def _build_engine_config(
     config["kv_swap_allow_sync_fallback"] = getattr(
         args, "kv_swap_allow_sync_fallback", True
     )
+    prefix_cache_max_entries = getattr(args, "prefix_cache_max_entries", None)
+    if prefix_cache_max_entries is not None:
+        if prefix_cache_max_entries < 1:
+            raise ValueError("--prefix-cache-max-entries must be >= 1")
+        config["prefix_cache_max_entries"] = prefix_cache_max_entries
     return config
 
 
@@ -2133,6 +2179,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-waiting-requests", type=int, default=0)
     parser.add_argument("--max-n", type=int, default=16)
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--enable-chunked-prefill", action="store_true")
+    parser.add_argument("--prefill-chunk-size", type=int, default=512)
+    parser.add_argument(
+        "--prefill-starvation-threshold-steps", type=int, default=8
+    )
+    parser.add_argument(
+        "--prefix-cache-max-entries",
+        type=int,
+        default=1000,
+        help="maximum number of prefix cache entries (startup-only, >= 1)",
+    )
     parser.add_argument(
         "--kv-swap-mode",
         type=str,
