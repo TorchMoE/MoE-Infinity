@@ -33,6 +33,9 @@ route_ahead_prefetcher: contextvars.ContextVar[Optional[Any]] = (
 route_ahead_stats: contextvars.ContextVar[Optional[Any]] = (
     contextvars.ContextVar("dflash_route_ahead_stats", default=None)
 )
+route_ahead_row_offsets: contextvars.ContextVar[tuple[int, ...]] = (
+    contextvars.ContextVar("dflash_route_ahead_row_offsets", default=())
+)
 
 
 def is_active() -> bool:
@@ -47,9 +50,15 @@ def current_stats() -> Optional[Any]:
     return route_ahead_stats.get()
 
 
+def current_row_offsets() -> tuple[int, ...]:
+    return route_ahead_row_offsets.get()
+
+
 @contextmanager
 def route_ahead_context(
-    prefetcher: Optional[Any] = None, stats: Optional[Any] = None
+    prefetcher: Optional[Any] = None,
+    stats: Optional[Any] = None,
+    row_offsets: tuple[int, ...] = (),
 ) -> Iterator[None]:
     """Activate the route-ahead context; token-reset in ``finally``.
 
@@ -61,9 +70,11 @@ def route_ahead_context(
     active_token = route_ahead_active.set(True)
     prefetcher_token = route_ahead_prefetcher.set(prefetcher)
     stats_token = route_ahead_stats.set(stats)
+    offsets_token = route_ahead_row_offsets.set(tuple(row_offsets))
     try:
         yield
     finally:
+        route_ahead_row_offsets.reset(offsets_token)
         route_ahead_stats.reset(stats_token)
         route_ahead_prefetcher.reset(prefetcher_token)
         route_ahead_active.reset(active_token)
@@ -76,5 +87,6 @@ __all__ = [
     "is_active",
     "current_prefetcher",
     "current_stats",
+    "current_row_offsets",
     "route_ahead_context",
 ]

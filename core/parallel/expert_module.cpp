@@ -15,7 +15,7 @@ extern void fp8_dequant_blockwise_cuda(const void* weight, const void* scale,
                                        void* out, int N, int K,
                                        cudaStream_t stream);
 
-static const int64_t kMaxTokens = 256;
+static const int64_t kMaxTokens = 8192;
 
 void ExpertNode::SetTensorsFromBlob(const torch::Device& device) {
   auto expert_type = static_cast<ExpertType>(this->expert_type);
@@ -199,20 +199,17 @@ torch::Tensor MoEMLP::forward(torch::Tensor hidden_states,
   TORCH_CHECK(hidden_states.scalar_type() == input_.scalar_type(),
               "hidden_states dtype must match expert input dtype");
 
-  // Use async copy with the provided execution stream
-  cudaMemcpyAsync(input_.data_ptr(), hidden_states.data_ptr(),
-                  hidden_states.numel() * hidden_states.element_size(),
-                  cudaMemcpyDeviceToDevice, stream);
+  CUDA_CHECK(
+      cudaMemcpyAsync(input_.data_ptr(), hidden_states.data_ptr(),
+                      hidden_states.numel() * hidden_states.element_size(),
+                      cudaMemcpyDeviceToDevice, stream));
 
-  // Dynamically reshape buffers to match actual batch_size, avoiding
-  // computation on padded rows. The underlying memory is unchanged.
   for (auto& buffer : buffer_) {
     auto shape_vec = buffer.sizes().vec();
     if (shape_vec.size() != 2) continue;
     int64_t row = buffer.size(0);
     int64_t col = buffer.size(1);
     auto dtype = buffer.dtype();
-
     if (row == kMaxTokens) {
       buffer.set_data(torch::from_blob(
           buffer.data_ptr(), {batch_size, col}, DoNothingDeleter<void>{},
@@ -220,12 +217,9 @@ torch::Tensor MoEMLP::forward(torch::Tensor hidden_states,
               CUDA_DEVICE(at::cuda::current_device()))));
     }
   }
-  cudaStreamSynchronize(stream);
 
   ForwardHelper(stream);
   param_set_ = false;
-  cudaStreamSynchronize(stream);
-
   auto output = output_.clone();
 
   // Restore buffers to kMaxTokens shape for next invocation

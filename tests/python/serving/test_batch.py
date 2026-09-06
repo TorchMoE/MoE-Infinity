@@ -3,7 +3,10 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
+
+from moe_infinity.runtime.attention_types import PagedBatchLengths
 
 ROOT = Path(__file__).resolve().parents[3]
 ROOT_STR = str(ROOT)
@@ -46,6 +49,8 @@ _BATCH_MODULE = _load_module(
     ROOT / "moe_infinity" / "serving" / "batch.py",
 )
 
+from moe_infinity.runtime.attention_types import PagedBatchLengths  # noqa: E402
+
 SamplingParams = _SEQUENCE_MODULE.SamplingParams
 SequenceData = _SEQUENCE_MODULE.SequenceData
 SequenceStatus = _SEQUENCE_MODULE.SequenceStatus
@@ -53,6 +58,48 @@ PagedKVCache = _KV_CACHE_MODULE.PagedKVCache
 BatchBuilder = _BATCH_MODULE.BatchBuilder
 BatchMetadata = _BATCH_MODULE.BatchMetadata
 SchedulerOutput = _BATCH_MODULE.SchedulerOutput
+PrefillChunk = _BATCH_MODULE.PrefillChunk
+
+
+def test_batch_builder_slices_exact_prefill_chunk() -> None:
+    cache = _make_cache()
+    sequence = _make_sequence(
+        40,
+        [10, 11, 12, 13, 14, 15],
+        status=SequenceStatus.PREFILL,
+        num_computed_tokens=2,
+    )
+    cache.allocate_sequence(40, num_tokens=5)
+    output = SchedulerOutput(
+        prefill_seq_ids=[40],
+        prefill_chunks={
+            40: PrefillChunk(start_pos=2, num_tokens=3, is_terminal=False)
+        },
+        num_prefill_tokens=3,
+        prefill_transaction_id=0,
+    )
+
+    metadata = BatchBuilder.from_scheduler_output(output, {40: sequence}, cache)
+
+    assert metadata.input_token_ids == [12, 13, 14]
+    assert metadata.lengths == PagedBatchLengths(
+        query_lengths=[3],
+        query_offsets=[0, 3],
+        context_lengths=[2],
+        kv_seq_lengths=[5],
+    )
+    assert metadata.prefill_is_terminal == [False]
+
+
+def test_scheduler_output_rejects_mismatched_chunk_ids() -> None:
+    with pytest.raises(ValueError, match="prefill_chunks keys"):
+        SchedulerOutput(
+            prefill_seq_ids=[1],
+            prefill_chunks={
+                2: PrefillChunk(start_pos=0, num_tokens=1, is_terminal=True)
+            },
+            prefill_transaction_id=0,
+        )
 
 
 def _make_sequence(
@@ -150,11 +197,12 @@ def test_batch_builder_prefill_only() -> None:
 
     assert metadata.seq_ids == [10, 11]
     assert metadata.input_token_ids == [11, 12, 13, 21, 22]
-    assert metadata.seq_lengths == [3, 2]
+    assert metadata.query_lengths == [3, 2]
     assert metadata.context_lengths == [0, 0]
+    assert metadata.kv_seq_lengths == [3, 2]
     assert metadata.is_prefill == [True, True]
     assert metadata.block_tables == [[0], [1]]
-    assert metadata.token_offsets == [0, 3, 5]
+    assert metadata.query_offsets == [0, 3, 5]
 
 
 def test_batch_builder_decode_only() -> None:
@@ -182,11 +230,12 @@ def test_batch_builder_decode_only() -> None:
 
     assert metadata.seq_ids == [20, 21, 22]
     assert metadata.input_token_ids == [3, 5, 6]
-    assert metadata.seq_lengths == [1, 1, 1]
+    assert metadata.query_lengths == [1, 1, 1]
     assert metadata.context_lengths == [3, 2, 1]
+    assert metadata.kv_seq_lengths == [4, 3, 2]
     assert metadata.is_prefill == [False, False, False]
     assert metadata.block_tables == [[0], [1], [2]]
-    assert metadata.token_offsets == [0, 1, 2, 3]
+    assert metadata.query_offsets == [0, 1, 2, 3]
 
 
 def test_batch_builder_mixed() -> None:
@@ -214,23 +263,27 @@ def test_batch_builder_mixed() -> None:
 
     assert metadata.seq_ids == [30, 31, 32]
     assert metadata.input_token_ids == [7, 8, 3, 4]
-    assert metadata.seq_lengths == [2, 1, 1]
+    assert metadata.query_lengths == [2, 1, 1]
     assert metadata.context_lengths == [0, 3, 1]
+    assert metadata.kv_seq_lengths == [2, 4, 2]
     assert metadata.is_prefill == [True, False, False]
-    assert metadata.token_offsets == [0, 2, 3, 4]
+    assert metadata.query_offsets == [0, 2, 3, 4]
 
 
-def test_token_offsets_correct() -> None:
+def test_query_offsets_correct() -> None:
     metadata = BatchMetadata(
         seq_ids=[1, 2, 3],
         input_token_ids=[10, 11, 12, 13, 14, 15],
-        seq_lengths=[2, 1, 3],
-        context_lengths=[0, 2, 5],
+        lengths=PagedBatchLengths(
+            query_lengths=[2, 1, 3],
+            query_offsets=[0, 2, 3, 6],
+            context_lengths=[0, 2, 5],
+            kv_seq_lengths=[2, 3, 8],
+        ),
         is_prefill=[True, False, False],
         block_tables=[[0], [1], [2]],
-        token_offsets=[0, 2, 3, 6],
         sampling_params=[SamplingParams(), SamplingParams(), SamplingParams()],
     )
 
     assert metadata.total_tokens == 6
-    assert metadata.token_offsets[-1] == metadata.total_tokens
+    assert metadata.query_offsets[-1] == metadata.total_tokens

@@ -219,7 +219,7 @@ class ServingMemoryResizer:
             )
 
         try:
-            self._kv.resize_num_blocks(targets.kv_blocks)
+            self._kv.resize_physical_num_blocks(targets.kv_blocks)
         except (torch.OutOfMemoryError, RuntimeError):
             return ResizeResult(
                 device_id=device_id,
@@ -411,7 +411,7 @@ class TransactionalServingMemoryResizer:
                 targets.kv_supported,
             )
         try:
-            self.kv_cache.resize_num_blocks(targets.kv_blocks, receipt)
+            self.kv_cache.resize_physical_num_blocks(targets.kv_blocks, receipt)
         except Exception as error:
             return ResizeResult(
                 self.device_id,
@@ -439,7 +439,7 @@ class TransactionalServingMemoryResizer:
         current_kv_blocks: int,
     ) -> ResizeResult:
         try:
-            self.kv_cache.resize_num_blocks(targets.kv_blocks, receipt)
+            self.kv_cache.resize_physical_num_blocks(targets.kv_blocks, receipt)
         except Exception as error:
             return ResizeResult(
                 self.device_id,
@@ -457,7 +457,9 @@ class TransactionalServingMemoryResizer:
                 completion_events=receipt.completion_events,
                 admissions_paused=True,
             )
-            self.kv_cache.resize_num_blocks(current_kv_blocks, rollback)
+            self.kv_cache.resize_physical_num_blocks(
+                current_kv_blocks, rollback
+            )
             return ResizeResult(
                 self.device_id,
                 ResizeOutcome.ROLLED_BACK,

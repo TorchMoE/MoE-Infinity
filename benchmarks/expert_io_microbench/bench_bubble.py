@@ -307,6 +307,8 @@ def _empty_step_decomposition() -> dict[str, float | None]:
     return {
         "step_total_ns": None,
         "expert_wait_ns": None,
+        "route_submit_ns": None,
+        "completion_handoff_ns": None,
         "non_wait_ns": None,
         "bubble_ratio": None,
         "step_total_p50_ns": None,
@@ -345,15 +347,23 @@ def run_one_iteration(
 
     events = _snapshot_profiler_events(profiler)
     expert_wait_ns = 0
+    route_submit_ns = 0
+    completion_handoff_ns = 0
     layer_wait_ns: dict[int, int] = {}
     sync_event_count = 0
 
     for event in events:
         stage = event.get("stage")
+        dur_ns = max(_safe_int(event.get("dur_ns")), 0)
+        if stage in ("gpu_route_submit", "gpu_route_fallback"):
+            route_submit_ns += dur_ns
+            continue
+        if stage == "expert_completion_handoff":
+            completion_handoff_ns += dur_ns
+            continue
         if stage != SYNC_STAGE:
             continue
 
-        dur_ns = max(_safe_int(event.get("dur_ns")), 0)
         expert_wait_ns += dur_ns
         sync_event_count += 1
 
@@ -370,6 +380,8 @@ def run_one_iteration(
     return {
         "step_total_ns": int(step_total_ns),
         "expert_wait_ns": int(expert_wait_ns),
+        "route_submit_ns": int(route_submit_ns),
+        "completion_handoff_ns": int(completion_handoff_ns),
         "bubble_ratio": ratio,
         "layer_wait_ns": layer_wait_ns,
         "sync_event_count": sync_event_count,
@@ -392,6 +404,16 @@ def summarize_iterations(iterations: list[dict[str, Any]]) -> dict[str, Any]:
         float(item["bubble_ratio"])
         for item in iterations
         if isinstance(item.get("bubble_ratio"), (int, float))
+    ]
+    route_submit_ns_values = [
+        int(item["route_submit_ns"])
+        for item in iterations
+        if isinstance(item.get("route_submit_ns"), int)
+    ]
+    completion_handoff_ns_values = [
+        int(item["completion_handoff_ns"])
+        for item in iterations
+        if isinstance(item.get("completion_handoff_ns"), int)
     ]
 
     if not step_total_ns_values:
@@ -422,6 +444,8 @@ def summarize_iterations(iterations: list[dict[str, Any]]) -> dict[str, Any]:
     step_decomposition_mean = {
         "step_total_ns": _mean(step_total_ns_values),
         "expert_wait_ns": _mean(expert_wait_ns_values),
+        "route_submit_ns": _mean(route_submit_ns_values),
+        "completion_handoff_ns": _mean(completion_handoff_ns_values),
         "non_wait_ns": _mean(non_wait_ns_values),
         "bubble_ratio": _mean_float(bubble_ratio_values),
         "step_total_p50_ns": _percentile(step_total_ns_values, 50),

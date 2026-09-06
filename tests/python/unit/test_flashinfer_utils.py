@@ -50,14 +50,15 @@ def _load_flashinfer_utils_with_blocked_import() -> ModuleType:
 
 def test_has_flashinfer_flag_matches_import() -> None:
     importable = _import_flashinfer_available()
-    importlib.reload(flashinfer_utils)
-    assert flashinfer_utils.HAS_FLASHINFER is importable
+    module = importlib.import_module("moe_infinity.runtime.flashinfer_utils")
+    importlib.reload(module)
+    assert module.HAS_FLASHINFER is importable
 
 
 def test_get_workspace_returns_correct_shape_and_dtype() -> None:
     ws = flashinfer_utils.get_workspace(torch.device("cpu"))
     assert ws.dtype == torch.uint8
-    assert ws.numel() == 128 * 1024 * 1024
+    assert ws.numel() == flashinfer_utils._WORKSPACE_SIZE_BYTES
     assert ws.device.type == "cpu"
 
 
@@ -85,4 +86,4 @@ def test_graceful_when_flashinfer_missing() -> None:
     assert getattr(module, "HAS_FLASHINFER") is False
     ws = module.get_workspace(torch.device("cpu"))
     assert ws.dtype == torch.uint8
-    assert ws.numel() == 128 * 1024 * 1024
+    assert ws.numel() == flashinfer_utils._WORKSPACE_SIZE_BYTES

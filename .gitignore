@@ -244,3 +244,6 @@ benchmarks/expert_io_microbench/results/
 benchmarks/eval/__pycache__/
 *.nsys-rep
 *.sqlite
+
+# setuptools-scm generated version file (regenerated on every build)
+moe_infinity/_version.py

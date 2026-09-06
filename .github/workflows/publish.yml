@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -47,6 +48,8 @@ jobs:
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - name: Free Disk Space
         run: |
@@ -71,7 +74,7 @@ jobs:
       - name: Install Python build dependencies (torch matched to CUDA)
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install "setuptools>=78.1.1,<82" wheel ninja py-cpuinfo build
+          python3 -m pip install "setuptools>=78.1.1,<82" "setuptools-scm>=8" wheel ninja py-cpuinfo build
           python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 
       - name: Fetch CUTLASS headers
@@ -120,12 +123,12 @@ jobs:
       # Only the sdist is published to PyPI. Prebuilt CUDA wheels are ABI-locked to a
       # specific torch/CUDA, which PyPI wheel tags cannot express; they are attached to
       # the GitHub Release instead. pip installs the sdist and compiles it locally.
+      # Auth via PyPI Trusted Publishing (OIDC) — no username/password needed;
+      # requires id-token: write (above) and a publisher registered on PyPI for
+      # this repo + workflow file. See RELEASE.md.
       - name: Publish sdist to PyPI
         if: ${{ matrix.python-version == '3.10' }}
         uses: pypa/gh-action-pypi-publish@release/v1.8
         with:
           skip-existing: true
           packages-dir: sdist_only
-        env:
-          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
-          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}

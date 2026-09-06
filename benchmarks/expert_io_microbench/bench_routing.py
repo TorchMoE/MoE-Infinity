@@ -257,6 +257,50 @@ def _empty_stage_stats() -> dict[str, float | int | None]:
     }
 
 
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = (q / 100.0) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return float(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction)
+
+
+def summarize_gpu_routing(
+    events: list[Mapping[str, Any]], native_stats: Mapping[str, Any]
+) -> dict[str, Any]:
+    submit_values = [
+        float(event["dur_ns"])
+        for event in events
+        if event.get("stage") == "gpu_route_submit"
+    ]
+    fallback_values = [
+        float(event["dur_ns"])
+        for event in events
+        if event.get("stage") == "gpu_route_fallback"
+    ]
+    return {
+        "submit_p50_ns": _percentile(submit_values, 50),
+        "submit_p99_ns": _percentile(submit_values, 99),
+        "fallback_count": len(fallback_values),
+        "fallback_p50_ns": _percentile(fallback_values, 50),
+        "native": {
+            key: int(native_stats.get(key, 0))
+            for key in (
+                "route_batches",
+                "route_failures",
+                "last_active_experts",
+                "last_route_handoff_us",
+                "completion_events_retired",
+            )
+        },
+    }
+
+
 def _cache_summary(
     cache_lookup_stats: Mapping[str, float | int | None],
     transfer_events_count: int,

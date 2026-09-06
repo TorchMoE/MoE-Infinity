@@ -2,6 +2,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Optional, Protocol, Union, cast
 
 import pytest
@@ -13,6 +14,7 @@ if ROOT not in sys.path:
 MEMORY_MANAGER_PATH = (
     Path(ROOT) / "moe_infinity" / "serving" / "memory_manager.py"
 )
+_MISSING_MODULE = object()
 
 
 class MemoryBudgetProtocol(Protocol):
@@ -60,6 +62,10 @@ class MemoryManagerProtocol(Protocol):
 
     def get_expert_cache_ratio(self) -> float: ...
 
+    def set_cuda_graph_usage(
+        self, *, graph_pool_bytes: int, scratch_kv_bytes: int
+    ) -> None: ...
+
     def report(self) -> dict[str, Union[str, int, float]]: ...
 
 
@@ -76,8 +82,15 @@ def _load_classes() -> (
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load module from {MEMORY_MANAGER_PATH}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    previous_module = sys.modules.get(module_name, _MISSING_MODULE)
+    try:
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    finally:
+        if previous_module is _MISSING_MODULE:
+            _ = sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = cast(ModuleType, previous_module)
     return (
         cast(type[MemoryBudgetProtocol], getattr(module, "MemoryBudget")),
         cast(type[MemoryManagerProtocol], getattr(module, "MemoryManager")),
@@ -196,3 +209,34 @@ def test_static_call_keeps_existing_ratio_result() -> None:
     )
     manager.total_gpu_memory_bytes = 8 * 1024**3
     assert manager.compute_budget(0).expert_cache_ratio == pytest.approx(0.6)
+
+
+def test_report_includes_graph_pool_and_reserved_scratch_bytes() -> None:
+    _, MemoryManager = _load_classes()
+    manager = MemoryManager(device=torch.device("cpu"))
+    manager.set_cuda_graph_usage(
+        graph_pool_bytes=4096,
+        scratch_kv_bytes=2048,
+    )
+
+    report = manager.report()
+
+    assert report["cuda_graph_pool_bytes"] == 4096
+    assert report["cuda_graph_scratch_kv_bytes"] == 2048
+    assert report["cuda_graph_total_bytes"] == 6144
+
+
+def test_cuda_graph_usage_rejects_negative_values() -> None:
+    _, MemoryManager = _load_classes()
+    manager = MemoryManager(device=torch.device("cpu"))
+
+    for graph_pool_bytes, scratch_kv_bytes in ((-1, 0), (0, -1)):
+        try:
+            manager.set_cuda_graph_usage(
+                graph_pool_bytes=graph_pool_bytes,
+                scratch_kv_bytes=scratch_kv_bytes,
+            )
+        except ValueError as exc:
+            assert "non-negative" in str(exc)
+        else:
+            raise AssertionError("negative CUDA graph usage was accepted")

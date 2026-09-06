@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Protocol, cast
 
 import pytest
@@ -10,6 +11,7 @@ ROOT = str(Path(__file__).resolve().parents[3])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 KV_CACHE_PATH = Path(ROOT) / "moe_infinity" / "serving" / "kv_cache.py"
+_MISSING_MODULE = object()
 
 
 class BlockAllocatorProtocol(Protocol):
@@ -67,8 +69,15 @@ def _load_classes() -> (
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load module from {KV_CACHE_PATH}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    previous_module = sys.modules.get(module_name, _MISSING_MODULE)
+    try:
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    finally:
+        if previous_module is _MISSING_MODULE:
+            _ = sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = cast(ModuleType, previous_module)
     return (
         cast(type[BlockAllocatorProtocol], getattr(module, "BlockAllocator")),
         cast(type[PagedKVCacheProtocol], getattr(module, "PagedKVCache")),
@@ -218,3 +227,84 @@ def test_swap_out_free_gpu_blocks_swap_in_round_trip():
     cache.free_sequence(1)
     cache.free_sequence(2)
     assert cache.block_allocator.num_free_blocks == 4
+
+
+from moe_infinity.runtime.attention_backend import (  # noqa: E402
+    KVCacheSpec,
+    PagedAttentionBackend,
+)
+from tests.python.serving.prefix_cache_test_utils import (  # noqa: E402
+    RecordingLayeredPagedKVStore,
+    make_cache,
+)
+
+
+def test_partial_tail_cow_copies_all_layers() -> None:
+    recording_layered_store = RecordingLayeredPagedKVStore(num_layers=3)
+    cache = make_cache(store=recording_layered_store, num_blocks=4)
+    cache.allocate_sequence(1, 3)
+    old = cache.get_block_table(1)[0]
+    cache.block_allocator.retain([old])
+    cache.append_tokens(1, 1)
+    new = cache.get_block_table(1)[0]
+    assert recording_layered_store.copies == [(old, new, (0, 1, 2))]
+    assert cache.block_allocator.ref_count(old) == 1
+
+
+def test_swap_restore_preserves_every_layer_and_references() -> None:
+    recording_layered_store = RecordingLayeredPagedKVStore(num_layers=3)
+    cache = make_cache(store=recording_layered_store, num_blocks=6)
+    cache.allocate_sequence(7, 8)
+    before = recording_layered_store.layer_values(cache.get_block_table(7))
+    cache.swap_out(7)
+    cache.free_gpu_blocks(7)
+    cache.swap_in(7)
+    assert (
+        recording_layered_store.layer_values(cache.get_block_table(7)) == before
+    )
+    assert all(
+        cache.block_allocator.ref_count(i) == 1
+        for i in cache.get_block_table(7)
+    )
+
+
+def test_binding_uses_one_owner_and_disables_independent_storage() -> None:
+    backend = PagedAttentionBackend(
+        KVCacheSpec(2, 8, torch.float32, 4),
+        num_gpu_blocks=8,
+        device=torch.device("cpu"),
+    )
+    store = backend.create_layered_store(layer_count=3)
+    cache = make_cache(num_blocks=6)
+    cache.set_block_store(store, owner=backend)
+    assert cache.block_store is backend.block_store
+    assert cache.block_store.owner is backend
+    assert cache.num_blocks == 6 < store.num_blocks == 8
+    assert cache._kv_cache is None
+    assert cache._fi_prefill is None and cache._fi_decode is None
+
+
+def test_binding_rejects_wrong_owner_rebind_and_active_tables() -> None:
+    backend = PagedAttentionBackend(
+        KVCacheSpec(2, 8, torch.float32, 4),
+        num_gpu_blocks=8,
+        device=torch.device("cpu"),
+    )
+    store = backend.create_layered_store(layer_count=3)
+    cache = make_cache(num_blocks=6)
+    with pytest.raises(ValueError, match="owner"):
+        cache.set_block_store(store, owner=object())
+    cache.allocate_sequence(1, 1)
+    with pytest.raises(RuntimeError, match="before allocation"):
+        cache.set_block_store(store, owner=backend)
+
+
+def test_binding_rejects_logical_capacity_larger_than_physical() -> None:
+    backend = PagedAttentionBackend(
+        KVCacheSpec(2, 8, torch.float32, 4),
+        num_gpu_blocks=4,
+        device=torch.device("cpu"),
+    )
+    store = backend.create_layered_store(layer_count=3)
+    with pytest.raises(ValueError, match="logical cache exceeds"):
+        make_cache(num_blocks=6).set_block_store(store, owner=backend)

@@ -182,7 +182,7 @@ def test_resize_rejects_live_block_tables() -> None:
     cache = make_cache(num_blocks=8)
     cache.allocate_sequence(1, num_tokens=4)
     with pytest.raises(RuntimeError, match="referenced KV blocks"):
-        cache.resize_num_blocks(4, completed_receipt(device_id=0))
+        cache.resize_physical_num_blocks(4, completed_receipt(device_id=0))
 
 
 def test_scheduler_drain_resize_restore_preserves_tokens() -> None:
@@ -191,7 +191,7 @@ def test_scheduler_drain_resize_restore_preserves_tokens() -> None:
     assert scheduler.admissions_paused is True
     assert cache.block_allocator.num_free_blocks == 8
     assert all(event.query() for event in receipt.completion_events)
-    cache.resize_num_blocks(6, receipt)
+    cache.resize_physical_num_blocks(6, receipt)
     scheduler.restore_after_kv_resize(receipt)
     assert scheduler.admissions_paused is False
     assert scheduler.get_running_seq_ids() == [1]
@@ -212,7 +212,7 @@ def test_receiver_growth_is_not_called_when_donor_shrink_fails() -> None:
     )
     assert result.device_id == 0
     assert result.outcome is ResizeOutcome.REJECTED
-    kv.resize_num_blocks.assert_not_called()
+    kv.resize_physical_num_blocks.assert_not_called()
 
 
 def test_old_storage_is_retained_until_cuda_completion_event(
@@ -243,7 +243,9 @@ def test_expert_eviction_then_kv_growth_failure_reports_partial_commit() -> (
     None
 ):
     expert = FakeExpertPool(device_id=0, resident_bytes=1024)
-    kv = Mock(resize_num_blocks=Mock(side_effect=torch.OutOfMemoryError()))
+    kv = Mock(
+        resize_physical_num_blocks=Mock(side_effect=torch.OutOfMemoryError())
+    )
     resizer = ServingMemoryResizer(expert, kv, reserve_probe=lambda _: 2**40)
     result = resizer.apply(
         0,
@@ -268,7 +270,7 @@ def test_serving_flashinfer_wrappers_rebuild_independently_and_old_bundle_lives(
     assert old_prefill is not old_decode
     post_publish = FakeEvent(complete=False)
     receipt = completed_receipt(device_id=0, post_publish_event=post_publish)
-    cache.resize_num_blocks(4, receipt)
+    cache.resize_physical_num_blocks(4, receipt)
     assert cache._kv_cache.shape[1] == 4
     assert cache._fi_prefill is not old_prefill
     assert cache._fi_decode is not old_decode
@@ -302,7 +304,7 @@ def test_serving_first_replan_failure_restores_complete_old_bundle(
     )
     receipt = completed_receipt(device_id=0)
     with pytest.raises(RuntimeError, match="stale page plan"):
-        cache.resize_num_blocks(4, receipt)
+        cache.resize_physical_num_blocks(4, receipt)
         cache._compute_attention(*prefill_inputs(num_pages=4))
     assert cache._kv_cache is old[0]
     assert cache.block_allocator is old[1]
@@ -323,7 +325,7 @@ def test_transactional_resizer_quiesces_and_publishes_effective_targets() -> (
         restore_after_kv_resize=Mock(),
     )
     expert = Mock(resize_cache=Mock(return_value={"resident_bytes": 512}))
-    kv = Mock(num_blocks=4, resize_num_blocks=Mock())
+    kv = Mock(num_blocks=4, resize_physical_num_blocks=Mock())
     resizer = TransactionalServingMemoryResizer(
         device_id=0,
         scheduler=scheduler,
@@ -341,5 +343,5 @@ def test_transactional_resizer_quiesces_and_publishes_effective_targets() -> (
     )
     assert result.outcome is ResizeOutcome.COMMITTED
     expert.resize_cache.assert_called_once_with(0, 512)
-    kv.resize_num_blocks.assert_called_once_with(8, receipt)
+    kv.resize_physical_num_blocks.assert_called_once_with(8, receipt)
     scheduler.restore_after_kv_resize.assert_called_once_with(receipt)

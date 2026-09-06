@@ -53,7 +53,14 @@ Stable options from `api_server_v2.py`:
 | `--rate-limit` | `0` | Requests/minute/key; `0` disables |
 | `--max-waiting-requests` | `0` | Queue depth backpressure threshold; `0` disables |
 | `--max-n` | `16` | Cap for parallel sampling `n` / `best_of` |
+| `--enable-prefix-caching` | off | Enable correctness-preserving prefix KV reuse (Qwen3 + FlashInfer) |
+| `--prefix-cache-max-entries` | 1000 | Max prefix-index entries (startup-only, >= 1) |
 | `--enable-prefix-caching` | off | Enable prefix-cache bookkeeping flag |
+| `--enable-decode-cuda-graphs` | off | Permit decode graph qualification; unsafe runtimes still run eagerly |
+| `--decode-cuda-graph-batch-sizes` | `1 2 4 8 16 32` | Positive capture/replay batch buckets |
+| `--decode-cuda-graph-context-sizes` | `128 256 512 1024 2048 4096` | Positive native-paged context buckets |
+| `--decode-cuda-graph-warmup-iters` | `2` | Warmup iterations before each lazy capture |
+| `--decode-cuda-graph-max-memory-bytes` | `0` | Graph private-pool byte limit; `0` is unlimited |
 | `--startup-timeout` | none | Startup watchdog timeout, seconds |
 | `--decode-step-timeout` | none | Decode watchdog timeout, seconds |
 | `--enable-pyspy-dump` | off | Scaffolded flag; currently accepted and stored, but no py-spy dump is triggered |
@@ -83,7 +90,106 @@ Binding the Python startup path to `0.0.0.0` has the same exposure and auth
 implications as the CLI. Configure `api_key` or `MOE_API_KEYS` before using a
 non-loopback bind on an untrusted network.
 
-`MoE.serve()` accepts the same serving knobs as the CLI for host, port, memory ratios, batch sizing, the prefix-cache feature flag, offload path, and DFlash drafter setup. The flag currently enables scaffolding only; it does not activate request-path reuse.
+`MoE.serve()` accepts the same serving knobs as the CLI for host, port, memory ratios, batch sizing, the prefix-cache flag, offload path, and DFlash drafter setup. With `--enable-prefix-caching` on a supported Qwen3 + FlashInfer runtime the flag activates request-path prefix KV reuse; otherwise the cold path runs unchanged.
+
+## Decode CUDA graphs (experimental, opt-in)
+
+Decode CUDA graphs are disabled by default. Enabling the flag permits the
+runtime to evaluate graph safety; it does not override any safety rejection.
+The first rollout is deliberately limited to CUDA-resident models using the
+native paged-attention backend and exact ordinary-GQA
+`moe_infinity.models.qwen3_paged_attention.Qwen3PagedAttention` layers.
+
+An eligible batch must be pure single-token decode, fit a configured batch and
+context bucket, and have an explicit `eligible` runtime capability. The
+scheduler cache and native backend must share one `PagedKVStorage` object,
+allocator, owner ID, block count, and per-layer tensor pointers. Storage,
+`ModelRunner`, every graph buffer, and the stable output must resolve to the
+same indexed CUDA device. Every Qwen3 layer must have a unique in-range integer
+`layer_idx`; registration creates a distinct layer-bound subclass and requires
+an allocation-free `paged_kv_write_` proof that writes the current token to the
+authoritative `slot_mapping` before attention reads that layer's cache.
+
+The following always execute eagerly:
+
+- prefill, mixed unsupported execution, and speculative verification;
+- sampling and request callbacks (sampling is never captured);
+- non-paged models (`native_paged_required`);
+- FlashInfer planning/run paths (`flashinfer_plan_path`);
+- exact `DeepseekV2PagedAttention` and `DeepseekV3PagedAttention` MLA classes
+  (`mla_layout_unsupported`);
+- active model hooks, Archer begin/end callbacks, transfer schedulers, expert
+  dispatch, expert/KV offload, or dynamic allocation paths;
+- mismatched storage ownership/device, unknown paged classes, invalid
+  `layer_idx`, or incomplete per-layer write proofs;
+- batches outside configured buckets, capture failures, and quarantined keys.
+
+Graph keys are `(batch_bucket, context_bucket)`. Real rows retain scheduler
+order and current sequence metadata. Padding rows are compute-only and use
+unique scratch pages reserved from the same authoritative allocator; they do
+not enter scheduler accounting, sampling, callbacks, or token counts. Capture
+is lazy and may increase the first eligible step's latency. Denser bucket sets
+reduce padding but consume more graph private-pool memory and scratch KV
+capacity.
+
+Reload invalidates graph states before Python modules reload. Hot replacement
+waits for the active engine step and closes the old graph runner before
+returning. Application shutdown stops and awaits the engine task before closing
+the current runner. The sole lock order is application
+`_engine_lifecycle_lock` → engine step ownership → `CudaGraphRunner._lock`;
+shutdown never awaits a task while holding these locks. Close is idempotent and
+returns scratch blocks to the authoritative allocator.
+
+### Monitoring and rollback
+
+`/admin/stats` reports `capability_safe`, bounded `capability_reason`, storage
+owner ID, registered/proved layer counts, captures, replays, failures, replay
+fallbacks, graph private-pool bytes, and scratch KV bytes. Prometheus exports:
+
+- `moe_cuda_graph_captures_total`
+- `moe_cuda_graph_replays_total`
+- `moe_cuda_graph_capture_failures_total`
+- `moe_cuda_graph_instances`
+- `moe_cuda_graph_pool_bytes`
+- `moe_cuda_graph_scratch_kv_bytes`
+- `moe_cuda_graph_fallback_total{reason="..."}` over the fixed reason set
+
+Never use request IDs, model IDs, graph keys, exception text, owner IDs, or
+class names as metric labels.
+
+Emergency rollback is immediate: set `MOE_DISABLE_CUDA_GRAPHS=1`. The gate
+reads it for every batch, so replays stop without process restart. Confirm that
+the replay counter stops and the eager fallback counter increases. Call
+`engine.invalidate_cuda_graphs("operator_rollback")` to discard captured states,
+or restart without the enable flag when graph memory must be reclaimed
+immediately. `shutdown()` is reserved for replacement or process shutdown and
+also releases scratch reservations.
+
+### Staged rollout
+
+1. **Shadow qualification:** keep production disabled. Require exact
+   ordinary-GQA Qwen3, `capability_reason=eligible`, complete
+   `(class_fqn, layer_idx, writer)` proof coverage, allocator/backend identity,
+   exact device equality, per-layer persistence, two-step CUDA equivalence,
+   cleanup tests, and paired fixture/model evidence for each
+   model/GPU/dtype/bucket set.
+2. **Canary:** enable one resident native-paged replica. Alert on any capture
+   failure, post-capture non-`eligible` capability, request error, owner
+   mismatch, memory-budget breach, or replay coverage below the workload
+   target.
+3. **Limited rollout:** expand only while output parity stays clean, old-engine
+   scratch returns after replacement/shutdown, and observed p50/p99 ITL,
+   throughput, memory, and concurrency remain acceptable.
+4. **General opt-in:** retain a kill switch and per-model allowlist. DeepSeek
+   MLA, non-paged, FlashInfer, and offloaded MoE remain unsupported regardless
+   of benchmark results.
+5. **Rollback:** set `MOE_DISABLE_CUDA_GRAPHS=1`, verify counters, then restart
+   without the enable flag if immediate memory reclamation is required.
+
+This feature makes no speedup guarantee. Its utility boundary is resident,
+native-paged ordinary-GQA Qwen3 with complete write proofs. Supporting
+offloaded MoE requires a separate piecewise design with explicit eager
+attention, routing, dispatch, and transfer boundaries.
 
 ## Request Fields and Streaming
 
@@ -149,12 +255,49 @@ Accepted but currently no-op:
 
 ## Prefix Caching
 
-- `--enable-prefix-caching` toggles the feature flag.
-- The cache implementation is hash-based LRU with `block_size=16` and `max_entries=1000` by default.
-- Current serving code does not wire the cache into request execution, so there is no active reuse path yet.
-- Observability is internal (`hit_rate`, lookup/insert bookkeeping), not a public endpoint.
+Prefix KV reuse is opt-in and default off. It reuses the physical KV of an exact
+shared prompt prefix so a warm request only recomputes its divergent suffix,
+with cold/warm equivalence.
 
-The prefix-cache scaffold does not change expert ownership; the multi-GPU guide covers that layout separately.
+- `--enable-prefix-caching` enables reuse; `--prefix-cache-max-entries` (default
+  `1000`, minimum `1`, startup-only) bounds the prefix index.
+- **Supported scope.** Reuse activates only on the Qwen3 paged-attention path
+  with a complete per-layer registry, matching KV geometry, and real FlashInfer
+  prefill/decode. Any other runtime keeps the existing cold path and reports a
+  stable `prefix_cache_disabled_reason` (for example
+  `prefix-aware-prefill-unavailable`, `incomplete-paged-layer-registry`, or
+  `kv-store-binding-mismatch`).
+- **Exact identity.** A hit requires exact compatibility namespace (model,
+  tokenizer, adapter, dtype, KV geometry, attention backend/layout, position
+  config, runtime epoch), exact parent-entry path, and exact token blocks.
+  SHA-256 is only a bucket accelerator and never substitutes for token equality.
+- **Layer completeness.** One physical block names K/V for every layer in a
+  single validated layered store; export/import, checkpoint/restore, copy-on-
+  write, publication, and eviction operate across all layers or fail closed.
+- **Atomic pinned admission.** All sequences in a request group (including
+  `n>1`) are pinned with leases before any eviction, then admitted together or
+  not at all; failed admission restores tables, free count, refcounts, statuses,
+  and open-lease count.
+- **Committed-range publication.** Only fully committed, block-complete prompt
+  ranges are published after a successful forward; failed or partial chunks and
+  DFlash verify tails are never published.
+- **Copy-on-write.** Indexed blocks are immutable; any write to a shared partial
+  tail first copies every layer to a private block.
+- **Reload and rollback.** `/v1/reload` invalidates the prefix cache once after a
+  successful module reload. Rollback is removing `--enable-prefix-caching`,
+  restarting, and confirming `moe_prefix_cache_active 0`; there is no persisted
+  state to migrate.
+- **DFlash exclusion.** Reused-prefix and non-cold requests use ordinary paged
+  execution and are excluded from DFlash delegation.
+- **Observability.** `/admin/stats` and zero-safe `moe_prefix_cache_*`
+  Prometheus metrics expose enabled/active/disabled-reason, entries, open leases,
+  hits, matched tokens, and invalidations.
+
+Motivated by SGLang RadixAttention
+(<https://lmsys.org/blog/2024-01-17-sglang/>) and vLLM automatic prefix caching
+(<https://docs.vllm.ai/en/stable/examples/features/automatic_prefix_caching>);
+no universal speedup is claimed. Prefix reuse does not change expert ownership;
+the multi-GPU guide covers that layout separately.
 
 ## DFlash Serving
 
@@ -167,24 +310,63 @@ python -m moe_infinity.entrypoints.openai.api_server_v2 \
     --speculative-draft z-lab/gpt-oss-20b-DFlash
 ```
 
-Startup validates the drafter/target pair: hidden size, vocab size, mask-token bounds, target layer IDs, and drafter `fc` shape.
+Startup validates structural pairing (hidden size, vocabulary, mask-token
+bounds, target layers, block constraints, and drafter shape) separately from
+executor/route-ahead reachability.
 
-Delegation is server-wide and only applies when a request is:
+The persistent path creates one canonical session per eligible sequence. It
+preserves the request's temperature, top-k, top-p, budget, EOS set, and
+request-scoped generator. It does not silently turn sampled requests into
+greedy requests. Unsupported grammar/guided/logit-bias metadata, penalties,
+logprobs, or stop strings use the standard serving fallback before drafting.
+That fallback is not evidence of sampled serving.
 
-- a fresh singleton prefill request
-- greedy (`temperature=0`, no sampling)
-- `top_k <= 0`
-- `top_p >= 1.0`
-- `repetition_penalty == 1.0`
-- `logprobs <= 0`
-- no stop strings
-- within the current step token budget
+Two cache execution contexts are observable in `/admin/stats`:
 
-The exact gate is implemented in [`moe_infinity/serving/engine.py`](../moe_infinity/serving/engine.py) and also requires batch==1, no prior output tokens, and `max_tokens <= scheduler.max_tokens_per_step`.
+- `temporary_dynamic` is the Stage 4a compatibility mode. It keeps a temporary
+  private DynamicCache while the engine owns scheduling, callbacks,
+  cancellation, and request accounting. Sampled sessions and ineligible model
+  layouts remain here; this is not sampled paged-MLA serving.
+- `paged_mla` is the Stage 4b default-off target enabled by
+  `enable_deepseek_mla_paging=True`. It is restricted to eligible greedy
+  batch-1 DeepSeek V2/V3 MLA sessions. The engine owns packed latent/rope target
+  pages; the draft cache is separate. Admission is bounded by
+  `max_resident_paged_speculative_sessions` (default `1`) and must leave at
+  least `min_free_mla_blocks_after_admission` free blocks (default `1`) after
+  reserving the block-rounded peak for the full declared
+  `prompt + max_tokens` budget plus up to `DFlash block_size - 1` transient
+  verify tokens. Active sessions' committed and transient headroom that is not
+  yet allocated is included. A rejected eligible request immediately uses
+  `temporary_dynamic`; it does not wait for a paged seat, and its sampling
+  parameters are unchanged. That dense Stage 4a fallback owns a private target
+  cache and can therefore increase total GPU memory use even though it consumes
+  no MLA pages.
 
-The delegated path runs the speculative loop and emits tokens normally through SSE.
+Paged MLA is currently resident-only and has no preemption/swap implementation.
+The scheduler does not preempt DRAFT/VERIFY sessions. Qwen and hybrid layouts
+fall back to Stage 4a; hybrid paged rollback is not claimed. Cancellation after
+an in-flight backend call releases session resources, and per-sequence page
+ownership prevents one cancellation or rollback from truncating another row.
+Completion/cancellation frees ownership, so a later request can be admitted.
+`/admin/stats` reports active paged sessions, current free blocks, configured
+limits, and counters for `admitted`, `session_cap`, `free_block_reserve`, and
+`ineligible` decisions. `begin_failed` is recorded only when adapter/session
+construction fails; `admitted` increments only after construction succeeds.
 
-Route-ahead is internal to the DFlash verify path and is used only when speculative delegation is active.
+The guard is block-based admission control, not a general fairness proof. It
+does not preempt or swap admitted sessions. External cache consumers can still
+invalidate reserved headroom; such allocator failures clean up the affected
+request and are currently re-raised by the engine step.
+
+There is no real DeepSeek DFlash target/drafter pair validation in the repo.
+Stage 4b's tiny/local DeepSeek adapter tests establish ownership and attention
+metadata only. GPT-OSS has named valid pairs, but its resident expert path has
+no executor route-ahead. Qwen evidence is tiny-fixture only.
+
+Route-ahead is observer-only. Pairing evidence, executor reachability,
+prefetch-fired evidence, and cache ownership are reported as separate facts.
+See [DFlash unified execution](dflash.md) for direct batching, RNG caveats,
+benchmarks, and exact CPU/GPU gates.
 
 ## Operational Endpoints
 
@@ -270,3 +452,37 @@ Per-device Prometheus metrics use a bounded `device="<index>"` label:
 
 Reasons remain in `/admin/stats`, not labels. Policy knobs other than the enable
 flag require restart.
+
+### Chunked prefill (experimental)
+
+Chunked prefill is disabled by default. Enable it with
+`--enable-chunked-prefill`; tune the hard per-row bound with
+`--prefill-chunk-size` (default `512`) and prefill-only age promotion with
+`--prefill-starvation-threshold-steps` (default `8`). `max_tokens_per_step`
+remains the total decode-plus-prefill budget. Runnable decode rows consume one
+token each before prefill receives the remaining budget.
+
+Activation requires complete Qwen3 paged-layer registration, real FlashInfer,
+and the canonical production `LayeredPagedKVStore`. Logical block capacity is
+`min(memory_budget_blocks, block_store.physical_capacity)`; unequal capacities are
+valid. If any capability is unavailable,
+the engine reports `chunked_prefill_active=false` and
+an explicit `chunked_prefill_fallback_reason`, then uses the
+unchanged whole-prefill path. The first release rejects simultaneous
+`enable_chunked_prefill=true` and `enable_prefix_caching=true` at startup with
+`ValueError: enable_chunked_prefill and enable_prefix_caching cannot both be
+true in the first release`. Chunk transactions are standalone scheduler/KV
+transactions and do not import or duplicate a prefix implementation. Roll back
+by removing `--enable-chunked-prefill` (or disabling prefix caching) and
+restarting; no request or cache-format migration is required. PR #181 is design
+input for a future reconciliation only, not an implementation dependency.
+DFlash is used only for singleton prompts completed in one prefill launch;
+partially prefetched prompts stay on ordinary paged decode.
+
+Operational risks are extra scheduler launches for long prompts, page-boundary
+fragmentation, prefill backpressure under saturated decode load, model/backend
+metadata incompatibility, and latency regressions from a poorly chosen chunk
+size. Roll out first in shadow benchmarks, then a paged-backend canary, then a
+small opt-in production cohort. Roll back by removing
+`--enable-chunked-prefill`; no persisted cache or request format migration is
+required.

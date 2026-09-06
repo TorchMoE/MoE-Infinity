@@ -6,6 +6,9 @@ from pathlib import Path
 
 import torch
 
+from moe_infinity.runtime.attention_backend import PagedAttentionBackend
+from moe_infinity.runtime.attention_types import KVCacheSpec
+
 ROOT = Path(__file__).resolve().parents[3]
 ROOT_STR = str(ROOT)
 if ROOT_STR not in sys.path:
@@ -269,3 +272,40 @@ def test_no_block_leak_after_cancel() -> None:
     assert (
         engine.kv_cache.block_allocator.num_free_blocks < original_free_blocks
     )
+
+
+def _make_paged_backend(
+    num_blocks: int, device: torch.device
+) -> PagedAttentionBackend:
+    backend = PagedAttentionBackend(
+        spec=KVCacheSpec(
+            num_kv_heads=2, head_dim=8, dtype=torch.float16, block_size=4
+        ),
+        num_gpu_blocks=num_blocks,
+        device=device,
+    )
+    backend.create_layered_store(layer_count=1)
+    return backend
+
+
+def test_cancel_partial_prefill_frees_reserved_chunks() -> None:
+    engine = _make_engine(num_kv_blocks=4, max_batch_size=1)
+    backend = _make_paged_backend(num_blocks=4, device=engine.kv_cache.device)
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
+    engine.scheduler.chunked_prefill_requested = True
+    engine.scheduler.prefill_chunk_size = 4
+    engine.scheduler.max_tokens_per_step = 4
+    engine.scheduler.set_chunked_prefill_runtime_enabled(True)
+    original_free = engine.kv_cache.block_allocator.num_free_blocks
+    engine.add_request(
+        "partial",
+        list(range(10)),
+        SamplingParams(max_tokens=2, temperature=0.0),
+    )
+
+    assert engine.step() == []
+    assert engine.kv_cache.block_allocator.num_free_blocks < original_free
+    engine.abort_request("partial")
+
+    assert engine.kv_cache.block_allocator.num_free_blocks == original_free
+    assert engine.has_pending_requests() is False
