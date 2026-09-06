@@ -47,6 +47,8 @@ _MODEL_RUNNER_MODULE = _load_module(
     ROOT / "moe_infinity" / "serving" / "model_runner.py",
 )
 
+from moe_infinity.runtime.attention_types import PagedBatchLengths  # noqa: E402
+
 SamplingParams = _SEQUENCE_MODULE.SamplingParams
 BatchMetadata = _BATCH_MODULE.BatchMetadata
 ModelRunner = _MODEL_RUNNER_MODULE.ModelRunner
@@ -125,11 +127,14 @@ def _make_batch() -> BatchMetadata:
     return BatchMetadata(
         seq_ids=[10, 11],
         input_token_ids=[11, 12, 13, 21],
-        seq_lengths=[3, 1],
-        context_lengths=[0, 4],
+        lengths=PagedBatchLengths(
+            query_lengths=[3, 1],
+            query_offsets=[0, 3, 4],
+            context_lengths=[0, 4],
+            kv_seq_lengths=[3, 5],
+        ),
         is_prefill=[True, False],
         block_tables=[[0], [1]],
-        token_offsets=[0, 3, 4],
         sampling_params=[SamplingParams(), SamplingParams()],
     )
 
@@ -169,11 +174,14 @@ def test_execute_supports_rank2_logits_for_decode_batches() -> None:
     batch = BatchMetadata(
         seq_ids=[1, 2],
         input_token_ids=[30, 31],
-        seq_lengths=[1, 1],
-        context_lengths=[8, 3],
+        lengths=PagedBatchLengths(
+            query_lengths=[1, 1],
+            query_offsets=[0, 1, 2],
+            context_lengths=[8, 3],
+            kv_seq_lengths=[9, 4],
+        ),
         is_prefill=[False, False],
         block_tables=[[0], [1]],
-        token_offsets=[0, 1, 2],
         sampling_params=[SamplingParams(), SamplingParams()],
     )
 
@@ -188,11 +196,14 @@ def test_execute_empty_batch_skips_forward() -> None:
     batch = BatchMetadata(
         seq_ids=[99],
         input_token_ids=[],
-        seq_lengths=[0],
-        context_lengths=[10],
+        lengths=PagedBatchLengths(
+            query_lengths=[0],
+            query_offsets=[0, 0],
+            context_lengths=[10],
+            kv_seq_lengths=[10],
+        ),
         is_prefill=[False],
         block_tables=[[0]],
-        token_offsets=[0, 0],
         sampling_params=[SamplingParams()],
     )
 

@@ -35,6 +35,7 @@ class _SupportsPagedAttention(Protocol):
         attention_metadata: Optional[
             Union[AttentionMetadata, RuntimeAttentionMetadata]
         ] = None,
+        layer_idx: int = 0,
     ) -> Optional[torch.Tensor]: ...
 
 
@@ -146,6 +147,14 @@ class Qwen3PagedAttention(Qwen3MoeAttention):
             .view(-1, num_key_value_heads, self.head_dim)
         )
 
+        attn_output_tokens = paged_backend.forward(
+            query_tokens,
+            key_tokens,
+            value_tokens,
+            attention_metadata=attention_metadata,
+            scale=cast(float, self.scaling),
+            layer_idx=int(self.layer_idx),
+        )
         try:
             attn_output_tokens = paged_backend.forward(
                 query_tokens,

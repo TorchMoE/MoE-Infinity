@@ -7,16 +7,21 @@ import math
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 import torch
 
 from moe_infinity.runtime.attention_types import (
     AttentionMetadata as RuntimeAttentionMetadata,
 )
+from moe_infinity.runtime.attention_types import (
+    PagedBatchLengths,
+)
 
 from .batch import BatchMetadata
 
+if TYPE_CHECKING:
+    from moe_infinity.runtime.attention_backend import PrefixReuseCapability
 logger = logging.getLogger(__name__)
 
 
@@ -178,7 +183,10 @@ class ModelRunner:
 
     def prepare_inputs(self, batch: BatchMetadata) -> dict[str, torch.Tensor]:
         num_seqs = len(batch.seq_ids)
-        max_seq_len = max(batch.seq_lengths, default=0)
+        query_lengths = batch.query_lengths
+        query_offsets = batch.query_offsets
+        context_lengths = batch.context_lengths
+        max_seq_len = max(query_lengths, default=0)
 
         input_ids = torch.zeros(
             (num_seqs, max_seq_len),
@@ -189,14 +197,15 @@ class ModelRunner:
         attention_mask = torch.zeros_like(input_ids)
 
         for seq_idx in range(num_seqs):
-            start = batch.token_offsets[seq_idx]
-            end = batch.token_offsets[seq_idx + 1]
+            start = query_offsets[seq_idx]
+            end = query_offsets[seq_idx + 1]
             seq_tokens = batch.input_token_ids[start:end]
-            seq_len = batch.seq_lengths[seq_idx]
+            seq_len = query_lengths[seq_idx]
 
             if len(seq_tokens) != seq_len:
                 raise ValueError(
-                    "batch metadata is inconsistent: seq_lengths and token_offsets disagree"
+                    "batch metadata is inconsistent: query_lengths and "
+                    "query_offsets disagree"
                 )
             if seq_len == 0:
                 continue
@@ -206,7 +215,7 @@ class ModelRunner:
                 dtype=torch.long,
                 device=self.device,
             )
-            context_len = batch.context_lengths[seq_idx]
+            context_len = context_lengths[seq_idx]
             position_tensor = torch.arange(
                 context_len,
                 context_len + seq_len,
@@ -590,17 +599,11 @@ class ModelRunner:
                     device=self.device,
                 )
 
-        seq_lens_values = [
-            context_len + seq_len
-            for context_len, seq_len in zip(
-                batch.context_lengths, batch.seq_lengths
-            )
-        ]
-        seq_lens = torch.tensor(
-            seq_lens_values,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        query_lengths = batch.query_lengths
+        query_offsets = batch.query_offsets
+        context_lengths = batch.context_lengths
+        kv_seq_lengths = batch.kv_seq_lengths
+        seq_lens_values = list(kv_seq_lengths)
 
         slot_mapping = torch.tensor(
             self._build_slot_mapping(batch, block_size),
@@ -610,14 +613,27 @@ class ModelRunner:
 
         num_prefill_tokens = sum(
             seq_len
-            for seq_len, is_prefill in zip(batch.seq_lengths, batch.is_prefill)
+            for seq_len, is_prefill in zip(query_lengths, batch.is_prefill)
             if is_prefill
         )
         num_decode_tokens = batch.total_tokens - num_prefill_tokens
 
         return RuntimeAttentionMetadata(
             block_tables=block_tables,
-            seq_lens=seq_lens,
+            lengths=PagedBatchLengths(
+                query_lengths=torch.tensor(
+                    query_lengths, dtype=torch.int32, device=self.device
+                ),
+                query_offsets=torch.tensor(
+                    query_offsets, dtype=torch.int32, device=self.device
+                ),
+                context_lengths=torch.tensor(
+                    context_lengths, dtype=torch.int32, device=self.device
+                ),
+                kv_seq_lengths=torch.tensor(
+                    kv_seq_lengths, dtype=torch.int32, device=self.device
+                ),
+            ),
             max_seq_len=max(seq_lens_values, default=0),
             num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -628,9 +644,11 @@ class ModelRunner:
     @staticmethod
     def _build_slot_mapping(batch: BatchMetadata, block_size: int) -> list[int]:
         slots: list[int] = []
-        for seq_idx, seq_len in enumerate(batch.seq_lengths):
+        query_lengths = batch.query_lengths
+        context_lengths = batch.context_lengths
+        for seq_idx, seq_len in enumerate(query_lengths):
             block_table = batch.block_tables[seq_idx]
-            context_len = batch.context_lengths[seq_idx]
+            context_len = context_lengths[seq_idx]
             for token_idx in range(seq_len):
                 token_pos = context_len + token_idx
                 block_idx = token_pos // block_size
@@ -673,10 +691,87 @@ class ModelRunner:
                 return backend
         return None
 
+    def get_prefix_reuse_capability(
+        self, cache: object | None = None
+    ) -> "PrefixReuseCapability":
+        from moe_infinity.runtime.attention_backend import (
+            LayerRegistration,
+            PrefixReuseCapability,
+        )
+
+        _ = cache
+        registrations = self._collect_qwen_layer_registrations()
+        expected_layers = self._resolve_expected_layers()
+        if expected_layers is None or expected_layers <= 0:
+            return PrefixReuseCapability.disabled(
+                "incomplete-paged-layer-registry"
+            )
+
+        layer_indices = [layer_idx for layer_idx, _ in registrations]
+        if len(set(layer_indices)) != len(layer_indices) or set(
+            layer_indices
+        ) != set(range(expected_layers)):
+            return PrefixReuseCapability.disabled(
+                "incomplete-paged-layer-registry"
+            )
+
+        backend = self._get_attention_backend()
+        if backend is None:
+            return PrefixReuseCapability.disabled(
+                "prefix-aware-prefill-unavailable"
+            )
+
+        flashinfer_enabled = getattr(backend, "_flashinfer_enabled", None)
+        if not callable(flashinfer_enabled) or not flashinfer_enabled():
+            return PrefixReuseCapability.disabled(
+                "prefix-aware-prefill-unavailable"
+            )
+
+        create_store = getattr(backend, "create_layered_store", None)
+        register_layers = getattr(backend, "register_layers", None)
+        if not callable(create_store) or not callable(register_layers):
+            return PrefixReuseCapability.disabled(
+                "prefix-aware-prefill-unavailable"
+            )
+
+        store = create_store(layer_count=expected_layers)
+        register_layers(
+            [
+                LayerRegistration(layer_idx=layer_idx, module_id=module_id)
+                for layer_idx, module_id in registrations
+            ]
+        )
+        return PrefixReuseCapability.active(backend, store)
+
+    def _collect_qwen_layer_registrations(self) -> list[tuple[int, int]]:
+        registrations: list[tuple[int, int]] = []
+        modules_fn = getattr(self.model, "modules", None)
+        if not callable(modules_fn):
+            return registrations
+        modules = modules_fn()
+        if not isinstance(modules, Iterable):
+            return registrations
+        for module in modules:
+            if module.__class__.__name__ != "Qwen3PagedAttention":
+                continue
+            layer_idx = getattr(module, "layer_idx", None)
+            if not isinstance(layer_idx, int):
+                continue
+            registrations.append((layer_idx, id(module)))
+        return registrations
+
+    def _resolve_expected_layers(self) -> int | None:
+        config = getattr(self.model, "config", None)
+        num_hidden_layers = getattr(config, "num_hidden_layers", None)
+        if isinstance(num_hidden_layers, int):
+            return num_hidden_layers
+        return None
+
     def _get_paged_attention_classes(self) -> list[type[Any]]:
         paged_class_names = {
             "DeepseekV2PagedAttention",
             "DeepseekV3PagedAttention",
+            "Qwen3PagedAttention",
         }
         classes: list[type[Any]] = []
         seen: set[type[Any]] = set()

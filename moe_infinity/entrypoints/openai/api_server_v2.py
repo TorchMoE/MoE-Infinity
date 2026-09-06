@@ -1838,6 +1838,10 @@ async def reload_modules(payload: dict[str, Any]) -> JSONResponse:
             except Exception as e:
                 errors.append({"module": module_name, "error": str(e)})
     status = "ok" if not errors else "partial"
+    if reloaded and engine is not None:
+        invalidate = getattr(engine, "invalidate_prefix_cache", None)
+        if callable(invalidate):
+            invalidate("module-reload")
     return JSONResponse(
         content={"status": status, "reloaded": reloaded, "errors": errors}
     )
@@ -2008,6 +2012,11 @@ def _build_engine_config(
         config["eos_token_id"] = eos_token_id
     if args.enable_prefix_caching:
         config["enable_prefix_caching"] = True
+    prefix_cache_max_entries = getattr(args, "prefix_cache_max_entries", None)
+    if prefix_cache_max_entries is not None:
+        if prefix_cache_max_entries < 1:
+            raise ValueError("--prefix-cache-max-entries must be >= 1")
+        config["prefix_cache_max_entries"] = prefix_cache_max_entries
     return config
 
 
@@ -2055,6 +2064,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-waiting-requests", type=int, default=0)
     parser.add_argument("--max-n", type=int, default=16)
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument(
+        "--prefix-cache-max-entries",
+        type=int,
+        default=1000,
+        help="maximum number of prefix cache entries (startup-only, >= 1)",
+    )
     parser.add_argument(
         "--enable-decode-cuda-graphs",
         action="store_true",

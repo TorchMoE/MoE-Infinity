@@ -39,6 +39,8 @@ class SequenceData:
     output_token_ids: list[int] = field(default_factory=list)
     status: SequenceStatus = SequenceStatus.WAITING
     num_computed_tokens: int = 0
+    committed_kv_tokens: int = 0
+    has_prefix_lease: bool = False
     created_at: float = field(default_factory=time.monotonic)
 
     def set_status(self, new_status: SequenceStatus) -> None:

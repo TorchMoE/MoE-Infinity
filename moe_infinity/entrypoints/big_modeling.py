@@ -233,6 +233,7 @@ class MoE:
                 or arch == "deepseek_v3"
                 or arch == "nllb"
                 or arch == "gptoss"
+                or arch == "qwen3"
                 or arch == "qwen3_5"
             ):
                 is_flash_attn_available = False
