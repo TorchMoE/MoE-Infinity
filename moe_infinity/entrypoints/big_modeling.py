@@ -465,6 +465,7 @@ class MoE:
                     spec=kv_spec,
                     num_gpu_blocks=num_gpu_blocks,
                     device=device,
+                    num_layers=max(1, int(num_layers)),
                 )
             except Exception:
                 attention_backend = None
