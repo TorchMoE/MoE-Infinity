@@ -27,6 +27,11 @@ from moe_infinity.engine.kv_transfer import (
     validate_metadata,
 )
 from moe_infinity.runtime import flashinfer_utils
+from moe_infinity.runtime.kv_cache_format import (
+    FormatLayeredKVStore,
+    LayeredKVPageChunk,
+    allocate_layered_paged_kv_store,
+)
 from moe_infinity.serving.prefix_contract import PrefixLease
 
 _BLOCK_DIM = 1
@@ -336,72 +341,116 @@ class _SequenceKVRecord:
 
 @dataclass
 class PagedKVCache:
-    num_blocks: int
-    block_size: int
-    num_layers: int
-    num_heads: int
-    head_dim: int
-    dtype: torch.dtype
-    device: torch.device | None = None
-    transfer_backend: KVTransferBackend | None = None
-    pinned_pool: PinnedBufferPool | None = None
-    host_pool_bytes: int = 0
-    max_inflight_bytes: int = 0
-    host_pool_factory: Callable[[int], PinnedBufferPool] | None = None
-    checksum: bool = False
-    storage: "PagedKVStorage | None" = None
-    block_allocator: BlockAllocator = field(init=False)
-    _sequence_tables: dict[int, BlockTable] = field(
-        init=False, default_factory=dict
-    )
-    _kv_records: dict[int, _SequenceKVRecord] = field(
-        init=False, default_factory=dict
-    )
-    _retiring_records: dict[tuple[int, int], _RetiringEntry] = field(
-        init=False, default_factory=dict
-    )
-    _swapped_storage_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = (
-        field(init=False, default_factory=dict)
-    )
-    _swapped_cpu_buffers: dict[int, torch.Tensor] = field(
-        init=False, default_factory=dict
-    )
-    _swapped_out_sequences: set[int] = field(init=False, default_factory=set)
-    _swapped_num_tokens: dict[int, int] = field(
-        init=False, default_factory=dict
-    )
-    _next_generation: int = field(init=False, default=1)
-    _backend: KVTransferBackend = field(init=False)
-    _pinned_pool: PinnedBufferPool | None = field(init=False, default=None)
-    _kv_cache: torch.Tensor | None = field(init=False)
-    _use_flashinfer: bool = field(init=False, default=False)
-    _fi_workspace: torch.Tensor | None = field(init=False, default=None)
-    _fi_prefill: _FlashinferPrefillWrapperLike | None = field(
-        init=False, default=None
-    )
-    _fi_decode: _FlashinferDecodeWrapperLike | None = field(
-        init=False, default=None
-    )
-    _cp_kv_manager: CPAwareKVManager | None = field(init=False, default=None)
-    _swap_counters: dict[str, int | float] = field(
-        init=False, default_factory=_new_swap_counters
-    )
-    _inflight_backpressure_total: int = field(init=False, default=0)
-    _block_store: "LayeredPagedKVStore | None" = field(init=False, default=None)
-    _block_store_owner: "PagedAttentionBackend | None" = field(
-        init=False, default=None
-    )
-    _swapped_checkpoints: dict[int, "LayeredPagedKVCheckpoint"] = field(
-        init=False, default_factory=dict
-    )
+    def __init__(
+        self,
+        num_blocks: int | None = None,
+        block_size: int | None = None,
+        num_layers: int | None = None,
+        num_heads: int | None = None,
+        head_dim: int | None = None,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        transfer_backend: KVTransferBackend | None = None,
+        pinned_pool: PinnedBufferPool | None = None,
+        host_pool_bytes: int = 0,
+        max_inflight_bytes: int = 0,
+        host_pool_factory: Callable[[int], PinnedBufferPool] | None = None,
+        checksum: bool = False,
+        *,
+        store: FormatLayeredKVStore | None = None,
+        owner_id: str | None = None,
+        storage: "PagedKVStorage | None" = None,
+    ) -> None:
+        self.transfer_backend = transfer_backend
+        self.pinned_pool = pinned_pool
+        self.host_pool_bytes = host_pool_bytes
+        self.max_inflight_bytes = max_inflight_bytes
+        self.host_pool_factory = host_pool_factory
+        self.checksum = checksum
+        self.storage = storage
+        self._sequence_tables = {}
+        self._kv_records = {}
+        self._retiring_records = {}
+        self._swapped_storage_buffers = {}
+        self._swapped_cpu_buffers = {}
+        self._swapped_out_sequences = set()
+        self._swapped_num_tokens = {}
+        self._next_generation = 1
+        self._pinned_pool = None
+        self._use_flashinfer = False
+        self._fi_workspace = None
+        self._fi_prefill = None
+        self._fi_decode = None
+        self._cp_kv_manager = None
+        self._swap_counters = _new_swap_counters()
+        self._inflight_backpressure_total = 0
+        self._block_store = None
+        self._block_store_owner = None
+        self._swapped_checkpoints = {}
+        self._swapped_page_chunks = {}
+        self._released_swapped = set()
+        if store is not None:
+            if owner_id is not None and store.owner_id != owner_id:
+                raise RuntimeError(
+                    "PagedKVCache owner_id does not match bound KV store"
+                )
+            self._store = store
+            self.owner_id = store.owner_id
+            self.num_blocks = (
+                min(int(num_blocks), store.num_pages)
+                if num_blocks is not None
+                else store.num_pages
+            )
+            self.block_size = store.block_size
+            self.num_layers = store.num_layers
+            self.num_heads = store.num_kv_heads
+            self.head_dim = store.head_dim
+            self.dtype = store.execution_dtype
+            self.device = store.payload.device
+        else:
+            if None in (
+                num_blocks,
+                block_size,
+                num_layers,
+                num_heads,
+                head_dim,
+                dtype,
+            ):
+                raise ValueError(
+                    "PagedKVCache requires either a store or full dimensions"
+                )
+            self.num_blocks = int(num_blocks)
+            self.block_size = int(block_size)
+            self.num_layers = int(num_layers)
+            self.num_heads = int(num_heads)
+            self.head_dim = int(head_dim)
+            self.dtype = dtype
+            self.device = self._resolve_device(device)
+            self._store = allocate_layered_paged_kv_store(
+                owner_id=owner_id or f"paged-kv-cache:{id(self)}",
+                format_name="native",
+                num_layers=self.num_layers,
+                num_blocks=self.num_blocks,
+                block_size=self.block_size,
+                num_kv_heads=self.num_heads,
+                head_dim=self.head_dim,
+                execution_dtype=self.dtype,
+                device=self.device,
+            )
+            self.owner_id = self._store.owner_id
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        if self.num_layers <= 0:
-            raise ValueError(f"num_layers must be > 0, got {self.num_layers}")
-        if self.num_heads <= 0:
-            raise ValueError(f"num_heads must be > 0, got {self.num_heads}")
-        if self.head_dim <= 0:
-            raise ValueError(f"head_dim must be > 0, got {self.head_dim}")
+        self._sequence_tables: dict[int, BlockTable] = {}
+        self._swapped_cpu_buffers: dict[int, torch.Tensor] = {}
+        self._swapped_num_tokens: dict[int, int] = {}
+        self._swapped_out_sequences: set[int] = set()
+        self._swapped_storage_buffers: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._swapped_page_chunks: dict[int, LayeredKVPageChunk] = {}
+        self._released_swapped: set[int] = set()
+        self._cp_kv_manager: CPAwareKVManager | None = None
 
         if self.storage is not None:
             self._bind_storage(self.storage)
@@ -413,20 +462,23 @@ class PagedKVCache:
             block_size=self.block_size,
             device=self.device,
         )
-        self._kv_cache = _PagedCacheTensor(
-            torch.zeros(
-                (
-                    self.num_layers,
-                    self.num_blocks,
-                    2,
-                    self.block_size,
-                    self.num_heads,
-                    self.head_dim,
-                ),
-                dtype=self.dtype,
-                device=self.device,
+        if self._store is not None:
+            self._kv_cache = _PagedCacheTensor(self._store.payload)
+        else:
+            self._kv_cache = _PagedCacheTensor(
+                torch.zeros(
+                    (
+                        self.num_layers,
+                        self.num_blocks,
+                        2,
+                        self.block_size,
+                        self.num_heads,
+                        self.head_dim,
+                    ),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
             )
-        )
 
         self._backend = self.transfer_backend or SyncKVTransferBackend()
 
@@ -474,6 +526,15 @@ class PagedKVCache:
                     self._fi_workspace = None
                     self._fi_prefill = None
                     self._fi_decode = None
+
+    @property
+    def store(self) -> FormatLayeredKVStore:
+        return self._store
+
+    def sequence_residency(self, seq_id: int) -> str:
+        if seq_id in self._released_swapped:
+            return "swapped"
+        return "resident"
 
     def resize_num_blocks(self, new_num_blocks: int) -> None:
         """Shrink the logical block budget to fit the physical paged store.
@@ -917,6 +978,11 @@ class PagedKVCache:
         """
         if new_len < 0:
             raise ValueError(f"new_len must be >= 0, got {new_len}")
+
+        if seq_id in self._released_swapped:
+            self._truncate_released_swapped(seq_id, new_len)
+            return
+
         block_table = self._require_sequence(seq_id)
         current = block_table.num_computed_tokens()
         if new_len > current:
@@ -983,6 +1049,39 @@ class PagedKVCache:
             except Exception:
                 pass
 
+    def _truncate_released_swapped(self, seq_id: int, new_len: int) -> None:
+        current = self._swapped_num_tokens.get(seq_id, 0)
+        if new_len > current:
+            raise ValueError(
+                f"truncate_tokens cannot grow sequence {seq_id}: "
+                f"new_len {new_len} > current {current}"
+            )
+        self._swapped_num_tokens[seq_id] = new_len
+        block_size = self.block_size
+        blocks_needed = (new_len + block_size - 1) // block_size
+        chunk = self._swapped_page_chunks.get(seq_id)
+        if chunk is None:
+            return
+        if blocks_needed == 0:
+            self._swapped_page_chunks[seq_id] = LayeredKVPageChunk(
+                page_ids=tuple(),
+                format=chunk.format,
+                payload=chunk.payload[:, :0, ...].clone(),
+                scales=None
+                if chunk.scales is None
+                else chunk.scales[:, :0, ...].clone(),
+            )
+            return
+        if int(chunk.payload.shape[1]) > blocks_needed:
+            self._swapped_page_chunks[seq_id] = LayeredKVPageChunk(
+                page_ids=chunk.page_ids[:blocks_needed],
+                format=chunk.format,
+                payload=chunk.payload[:, :blocks_needed, ...].clone(),
+                scales=None
+                if chunk.scales is None
+                else chunk.scales[:, :blocks_needed, ...].clone(),
+            )
+
     # ------------------------------------------------------------------ #
     # Destruction / cancellation                                          #
     # ------------------------------------------------------------------ #
@@ -1039,7 +1138,9 @@ class PagedKVCache:
         _ = self._swapped_cpu_buffers.pop(seq_id, None)
         _ = self._swapped_storage_buffers.pop(seq_id, None)
         _ = self._swapped_num_tokens.pop(seq_id, None)
+        _ = self._swapped_page_chunks.pop(seq_id, None)
         self._swapped_out_sequences.discard(seq_id)
+        self._released_swapped.discard(seq_id)
         _ = self._kv_records.pop(seq_id, None)
         _ = self._sequence_tables.pop(seq_id, None)
 
@@ -1093,6 +1194,10 @@ class PagedKVCache:
         self._cp_kv_manager = manager
 
     def free_gpu_blocks(self, seq_id: int) -> None:
+        if seq_id in self._released_swapped:
+            raise RuntimeError(
+                f"sequence {seq_id} does not own GPU blocks (SWAPPED)"
+            )
         block_table = self._sequence_tables.get(seq_id)
         if block_table is None:
             return
@@ -1757,7 +1862,11 @@ class PagedKVCache:
     # Compatibility wrappers                                              #
     # ------------------------------------------------------------------ #
 
-    def swap_out(self, seq_id: int) -> None:
+    def swap_out(self, seq_id: int, release_gpu_blocks: bool = False) -> None:
+        if release_gpu_blocks:
+            block_table = self._require_sequence(seq_id)
+            self._swap_out_release(seq_id, block_table)
+            return
         record = self._kv_records.get(seq_id)
         if record is not None and record.state is (
             KVTransferState.HOST_RESIDENT
@@ -1800,7 +1909,31 @@ class PagedKVCache:
                 )
         self._swapped_out_sequences.add(seq_id)
 
+    def _swap_out_release(self, seq_id: int, block_table: BlockTable) -> None:
+        if seq_id in self._released_swapped:
+            return
+        num_tokens = block_table.num_computed_tokens()
+        block_ids = block_table.get_block_ids()
+        chunk = self._store.snapshot_page_chunk(
+            list(block_ids), torch.device("cpu")
+        )
+        if block_ids:
+            self.block_allocator.free(list(block_ids))
+        block_table.release_blocks_only()
+        self._swapped_page_chunks[seq_id] = chunk
+        self._swapped_num_tokens[seq_id] = num_tokens
+        self._released_swapped.add(seq_id)
+        if self._cp_kv_manager is not None and block_ids:
+            try:
+                self._cp_kv_manager.notify_blocks_freed(seq_id, list(block_ids))
+            except Exception:
+                pass
+
     def swap_in(self, seq_id: int) -> None:
+        block_table = self._sequence_tables.get(seq_id)
+        if seq_id in self._released_swapped and block_table is not None:
+            self._swap_in_released(seq_id, block_table)
+            return
         record = self._kv_records.get(seq_id)
         if record is not None and record.state is (
             KVTransferState.GPU_RESIDENT
@@ -1884,6 +2017,26 @@ class PagedKVCache:
                     dtype=self._kv_cache.dtype,
                 )
         self._swapped_out_sequences.discard(seq_id)
+
+    def _swap_in_released(self, seq_id: int, block_table: BlockTable) -> None:
+        chunk = self._swapped_page_chunks.get(seq_id)
+        num_tokens = self._swapped_num_tokens.get(seq_id, 0)
+        num_blocks_needed = 0 if chunk is None else int(chunk.payload.shape[1])
+        restored_block_ids = self.block_allocator.allocate(num_blocks_needed)
+        try:
+            block_table.restore_blocks(
+                restored_block_ids, num_tokens=num_tokens
+            )
+            if chunk is not None and restored_block_ids:
+                self._store.restore_page_chunk(restored_block_ids, chunk)
+        except Exception:
+            if restored_block_ids:
+                self.block_allocator.free(restored_block_ids)
+            block_table.release_blocks_only()
+            raise
+        self._swapped_page_chunks.pop(seq_id, None)
+        self._swapped_num_tokens.pop(seq_id, None)
+        self._released_swapped.discard(seq_id)
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                    #

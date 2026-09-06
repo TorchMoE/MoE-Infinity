@@ -216,6 +216,63 @@ def test_execute_empty_batch_skips_forward() -> None:
     assert logits.shape == (0, 7)
 
 
+def _make_identity_store(owner_id: str):
+    from moe_infinity.runtime.kv_cache_format import (
+        allocate_layered_paged_kv_store,
+    )
+
+    return allocate_layered_paged_kv_store(
+        owner_id=owner_id,
+        format_name="native",
+        num_layers=1,
+        num_blocks=4,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=8,
+        execution_dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+
+def _make_identity_backend(owner_id: str):
+    import pytest as _pytest
+
+    from moe_infinity.runtime.attention_backend import PagedAttentionBackend
+    from moe_infinity.runtime.attention_types import KVCacheSpec
+
+    spec = KVCacheSpec(
+        num_kv_heads=2, head_dim=8, dtype=torch.float32, block_size=4
+    )
+    backend = PagedAttentionBackend(spec, 4, torch.device("cpu"))
+    store = _make_identity_store(owner_id)
+    backend.bind_store(store, owner_id=owner_id)
+    return backend, store, _pytest
+
+
+def test_model_runner_rejects_store_identity_mismatch_before_forward() -> None:
+    model = MockModel()
+    backend_a, store_a, _pytest = _make_identity_backend("engine-a")
+    store_b = _make_identity_store("engine-b")
+    with _pytest.raises(RuntimeError, match="KV store identity mismatch"):
+        ModelRunner(
+            model=model,
+            engine=object(),
+            kv_store=store_b,
+            attention_backend=backend_a,
+            owner_id="engine-b",
+            device=torch.device("cpu"),
+        )
+
+
+def test_backend_rejects_rebind_to_equal_shape_different_owner() -> None:
+    backend_a, store_a, _pytest = _make_identity_backend("engine-a")
+    store_b = _make_identity_store("engine-b")
+    with _pytest.raises(
+        RuntimeError, match="already bound to a different KV store"
+    ):
+        backend_a.bind_store(store_b, owner_id="engine-b")
+
+
 def test_runtime_metadata_maps_partial_prefill_slots() -> None:
     engine = MockOffloadEngine()
     engine.kv_cache = types.SimpleNamespace(block_size=4)

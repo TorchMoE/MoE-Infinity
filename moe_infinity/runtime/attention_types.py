@@ -5,6 +5,8 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
+from moe_infinity.runtime.kv_cache_format import KVCacheFormat
+
 DECODE_GRAPH_REASONS = (
     "eligible",
     "missing_capability",
@@ -92,14 +94,15 @@ class KVCacheSpec:
     head_dim: int
     dtype: torch.dtype
     block_size: int
+    format_name: str = "native"
 
     @property
     def page_size_bytes(self) -> int:
-        dtype_size = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4}[
-            self.dtype
-        ]
-        return (
-            self.block_size * self.num_kv_heads * self.head_dim * dtype_size * 2
+        return KVCacheFormat.parse(self.format_name).page_size_bytes(
+            block_size=self.block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            execution_dtype=self.dtype,
         )
 
 

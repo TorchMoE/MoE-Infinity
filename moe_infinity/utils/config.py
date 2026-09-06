@@ -113,6 +113,18 @@ class ArcherConfig:
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
         },
     )
+    kv_cache_format: str = field(
+        default="native",
+        metadata={
+            "help": "KV storage format: native or int8_sym; default preserves model dtype."
+        },
+    )
+    kv_cache_allow_fallback: bool = field(
+        default=True,
+        metadata={
+            "help": "Allow a visible native fallback when requested KV format is unsupported."
+        },
+    )
     kv_swap_mode: str = field(
         default="sync",
         metadata={
@@ -246,6 +258,9 @@ class ArcherConfig:
                 f"device_memory_ratio ({self.device_memory_ratio}) + kv_cache_memory_ratio ({self.kv_cache_memory_ratio}) > 1.0"
             )
 
+        from moe_infinity.runtime.kv_cache_format import KVCacheFormat
+
+        KVCacheFormat.parse(self.kv_cache_format)
         if self.kv_swap_mode not in ("sync", "async"):
             raise ValueError(
                 f"kv_swap_mode must be 'sync' or 'async', got {self.kv_swap_mode!r}"

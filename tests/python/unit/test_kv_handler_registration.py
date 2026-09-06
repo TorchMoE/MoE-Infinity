@@ -250,3 +250,35 @@ def test_handle_swap_in_returns_payload_bytes() -> None:
 
     selected = kv_tensors[:, [0, 1], ...]
     assert restored_bytes == selected.numel() * selected.element_size()
+
+
+def test_set_kv_store_installs_store_identity_before_registration() -> None:
+    from moe_infinity.runtime.kv_cache_format import (
+        allocate_layered_paged_kv_store,
+    )
+
+    store = allocate_layered_paged_kv_store(
+        owner_id="coord-owner",
+        format_name="int8_sym",
+        num_layers=1,
+        num_blocks=4,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=8,
+        execution_dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    scheduler = _DummyScheduler()
+    coordinator = KVCacheOffloadCoordinator(
+        kv_tensors=None,
+        block_pool=None,
+        config=SimpleNamespace(enable_kv_cache_offload=True),
+    )
+    coordinator.set_kv_store(store)
+    coordinator.register_with_scheduler(scheduler)
+
+    assert getattr(coordinator, "_kv_store") is store
+    assert getattr(coordinator, "_kv_store").format.name == "int8_sym"
+    handlers = cast(dict[TransferType, object], getattr(scheduler, "_handlers"))
+    assert TransferType.KV_SWAP_OUT in handlers
+    assert TransferType.KV_SWAP_IN in handlers
