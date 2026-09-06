@@ -6,6 +6,7 @@
 #include "archer_prefetch_handle.h"
 
 #include <cstdlib>
+#include <stdexcept>
 #include <cuda_runtime_api.h>
 #include <torch/extension.h>
 #include "aio/archer_tensor_handle.h"
@@ -20,6 +21,11 @@
 ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                                            const double device_memory_ratio)
     : prefix_(prefix), last_layer_id_(0), has_cleaned_up_resources_(false) {
+  if (kTopologyHandle != nullptr) {
+    throw std::runtime_error(
+        "MoE-Infinity supports one model per process; a model is already "
+        "loaded. Construct additional models in separate processes.");
+  }
   // InitLogger();
   int num_io_threads = 0;
   const char* io_threads_env = std::getenv("MOE_IO_THREADS");
