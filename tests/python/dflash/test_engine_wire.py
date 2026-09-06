@@ -13,7 +13,8 @@ REAL sync path end to end: ``MoE.generate(..., speculative_draft=...)`` ->
 
 Also pinned: omitting the kwarg detaches a previously attached strategy (the
 kwarg is per-call, never sticky), non-greedy params with a drafter configured
-still use the standard path (T1 gate), and batch>1 with a drafter fails loudly.
+still use the standard path (T1 gate), and rich batch>1 uses independent
+request sessions without pretending the singleton engine is physically batched.
 """
 
 from __future__ import annotations
@@ -259,12 +260,20 @@ def test_non_greedy_with_drafter_uses_standard_path():
     assert out.shape[1] > len(PROMPT)
 
 
-def test_batch_larger_than_one_with_drafter_raises():
-    """v1 guardrail: spec decoding is batch==1 only; fail loudly."""
+def test_batch_larger_than_one_with_drafter_preserves_every_row():
+    """The facade drives independent rich sessions and preserves row order."""
     shell, target = _tiny_moe_shell()
     spec = _tiny_speculator(shell, target)
     input_ids = torch.tensor([PROMPT, PROMPT], dtype=torch.long)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        with pytest.raises(NotImplementedError, match="batch"):
-            shell.generate(input_ids, do_sample=False, speculative_draft=spec)
+        output = shell.generate(
+            input_ids,
+            do_sample=False,
+            max_new_tokens=[2, 4],
+            speculative_draft=spec,
+        )
+
+    assert output.shape == (2, len(PROMPT) + 4)
+    assert torch.equal(output[:, : len(PROMPT)], input_ids)
+    assert spec.last_generated_lengths == [2, 4]

@@ -2,29 +2,28 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
+from numbers import Integral
 from types import SimpleNamespace
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     List,
-    NamedTuple,
     Optional,
     Sequence,
     Union,
+    cast,
 )
 
 import torch
 
 from moe_infinity.spec_decode._dflash_ops import (
     acceptance_length,
-    acceptance_lengths,
     build_block,
-    build_block_with_prefixes,
     committed_tokens,
-    committed_tokens_ragged,
 )
 from moe_infinity.spec_decode._dflash_sample_ops import (
+    _validate_generator_device,
     acceptance_sampled,
     committed_tokens_sampled,
     warped_probs,
@@ -33,6 +32,15 @@ from moe_infinity.spec_decode._nvtx import nvtx_phase
 from moe_infinity.spec_decode._prefetch_route import union_experts_from_mask
 from moe_infinity.spec_decode._route_ahead_ctx import route_ahead_context
 from moe_infinity.spec_decode._route_ahead_stats import RouteAheadStats
+from moe_infinity.spec_decode.protocols import (
+    CacheAdapter,
+    ExecutorEvidence,
+    NativeStepTrace,
+    PairingEvidence,
+    RequestSpec,
+    SamplingContext,
+    SessionTrace,
+)
 
 if TYPE_CHECKING:
     from moe_infinity.engine.generation_loop import GenerationEngine
@@ -102,7 +110,9 @@ DFLASH_BLOCK_SIZE = 10
 DFLASH_TARGET_LAYER_IDS = [1, 9, 17, 25, 33]
 
 
-def validate_pairing(draft_cfg: DFlashConfig, target_hf_config: Any) -> None:
+def validate_pairing(
+    draft_cfg: DFlashConfig, target_hf_config: Any
+) -> PairingEvidence:
     target_text = _get(target_hf_config, "text_config", target_hf_config)
     t_hidden = int(_get(target_text, "hidden_size"))
     t_vocab = int(_get(target_text, "vocab_size"))
@@ -136,6 +146,16 @@ def validate_pairing(draft_cfg: DFlashConfig, target_hf_config: Any) -> None:
             f"DFlash target_layer_ids reference target layer {max(draft_cfg.target_layer_ids)} "
             f"(capture index {highest_capture}) but target has only {t_layers} layers"
         )
+    return PairingEvidence(
+        valid=True,
+        config_valid=True,
+        dimensions_valid=True,
+        vocab_valid=True,
+        mask_valid=True,
+        layers_valid=True,
+        block_valid=True,
+        module_valid=None,
+    )
 
 
 def validate_drafter_module(draft_model: Any, draft_cfg: DFlashConfig) -> None:
@@ -164,6 +184,68 @@ def validate_drafter(
     validate_pairing(draft_cfg, target_hf_config)
     validate_drafter_module(draft_model, draft_cfg)
     return draft_cfg
+
+
+_PUBLISHED_DFLASH_PAIRS = frozenset(
+    {
+        ("openai/gpt-oss-20b", "z-lab/gpt-oss-20b-DFlash"),
+        ("openai/gpt-oss-120b", "z-lab/gpt-oss-120b-DFlash"),
+    }
+)
+
+
+def _validated_checkpoint_scope(
+    target_hf_config: Any,
+    draft_hf_config: Any,
+    draft_model_path: str | None = None,
+) -> tuple[str, ...]:
+    """Return checkpoint identities only for explicitly published pairs."""
+    target_name = _get(target_hf_config, "_name_or_path")
+    draft_name = draft_model_path or _get(draft_hf_config, "_name_or_path")
+    pair = (str(target_name), str(draft_name))
+    return pair if pair in _PUBLISHED_DFLASH_PAIRS else ()
+
+
+def build_pairing_evidence(
+    draft_model: Any,
+    target_hf_config: Any,
+    draft_cfg: DFlashConfig,
+    *,
+    validated_checkpoint_scope: tuple[str, ...] = (),
+) -> PairingEvidence:
+    """Run the authoritative structural checks and return their evidence."""
+    base = validate_pairing(draft_cfg, target_hf_config)
+    validate_drafter_module(draft_model, draft_cfg)
+    return PairingEvidence(
+        valid=base.valid,
+        config_valid=base.config_valid,
+        dimensions_valid=base.dimensions_valid,
+        vocab_valid=base.vocab_valid,
+        mask_valid=base.mask_valid,
+        layers_valid=base.layers_valid,
+        block_valid=base.block_valid,
+        module_valid=True,
+        validated_checkpoint_scope=validated_checkpoint_scope,
+    )
+
+
+def executor_wiring_reachable(moe: Any) -> bool:
+    """Whether a target can reach ``DistributedExpertExecutor`` dispatch."""
+    roots = (moe, getattr(moe, "model", None))
+    for root in roots:
+        if root is None:
+            continue
+        if getattr(root, "expert_executor", None) is not None:
+            return True
+        if getattr(root, "_executor", None) is not None:
+            return True
+        modules = getattr(root, "modules", None)
+        if not callable(modules):
+            continue
+        for module in modules():
+            if getattr(module, "expert_executor", None) is not None:
+                return True
+    return False
 
 
 def _resolve_input_embeddings(target: Any) -> Any:
@@ -231,17 +313,199 @@ def _infer_cuda_device(model: Any) -> str:
     return "cpu"
 
 
-def _resolve_stop_ids(
-    target: Any, stop_token_ids: Optional[List[int]]
-) -> List[int]:
-    if stop_token_ids is not None:
-        return list(stop_token_ids)
-    eos = _get(_get(target, "config", target), "eos_token_id")
-    if eos is None:
+def _resolve_stop_ids(target: Any, stop_token_ids: Any) -> List[int]:
+    value = (
+        _get(_get(target, "config", target), "eos_token_id")
+        if stop_token_ids is None
+        else stop_token_ids
+    )
+    if value is None:
         return []
-    if isinstance(eos, int):
-        return [eos]
-    return [int(x) for x in eos]
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return [int(value)]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = tuple(value)
+        if all(
+            isinstance(token, Integral) and not isinstance(token, bool)
+            for token in values
+        ):
+            return [int(token) for token in values]
+    raise ValueError(
+        "stop_token_ids must be an integer token ID or a sequence of integer token IDs"
+    )
+
+
+def _normalize_per_row(
+    name: str, value: Any, batch: int, convert: Callable[[Any], Any]
+) -> tuple[Any, ...]:
+    """Expand one scalar or validate one explicit value per batch row."""
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        rows = tuple(value)
+        if len(rows) != batch:
+            raise ValueError(
+                f"per-row {name} has {len(rows)} entries for batch size {batch}"
+            )
+        return tuple(convert(row) for row in rows)
+    return tuple(convert(value) for _ in range(batch))
+
+
+def _clone_generator(generator: torch.Generator) -> torch.Generator:
+    clone = torch.Generator(device=generator.device)
+    clone.set_state(generator.get_state())
+    return clone
+
+
+def _normalize_sampling_contexts(
+    *,
+    batch: int,
+    probability_device: Union[str, torch.device],
+    temperature: Union[float, Sequence[float]],
+    top_k: Union[int, Sequence[int]],
+    top_p: Union[float, Sequence[float]],
+    generator: Union[
+        torch.Generator,
+        Sequence[Optional[torch.Generator]],
+        None,
+    ],
+) -> tuple[SamplingContext, ...]:
+    """Normalize scalar-or-per-row sampling inputs before model prefill.
+
+    Numeric scalars broadcast. A scalar generator is an immutable template
+    for independent row-local clones; an explicit sequence is retained so
+    each request-owned stream visibly advances. In a physical batch, omitted
+    generators are replaced by independently seeded generators on the model
+    device so sampled rows never share the ambient RNG stream.
+    """
+    temperatures = _normalize_per_row("temperature", temperature, batch, float)
+    top_ks = _normalize_per_row(
+        "top_k", top_k, batch, lambda value: max(0, int(value))
+    )
+    top_ps = _normalize_per_row("top_p", top_p, batch, float)
+
+    if isinstance(generator, Sequence):
+        generators = tuple(generator)
+        if len(generators) != batch:
+            raise ValueError(
+                f"per-row generator has {len(generators)} entries for batch size {batch}"
+            )
+        if any(
+            item is not None and not isinstance(item, torch.Generator)
+            for item in generators
+        ):
+            raise TypeError(
+                "per-row generator values must be torch.Generator or None"
+            )
+    elif generator is None:
+        generators = (None,) * batch
+    elif isinstance(generator, torch.Generator):
+        generators = (
+            (generator,)
+            if batch == 1
+            else tuple(_clone_generator(generator) for _ in range(batch))
+        )
+    else:
+        raise TypeError(
+            "generator must be torch.Generator, a per-row sequence, or None"
+        )
+
+    if batch > 1:
+        missing_sampled = [
+            row
+            for row in range(batch)
+            if temperatures[row] > 0 and generators[row] is None
+        ]
+        if missing_sampled:
+            seeds = torch.randint(
+                0,
+                torch.iinfo(torch.int64).max,
+                (len(missing_sampled),),
+                dtype=torch.int64,
+            ).tolist()
+            mutable_generators = list(generators)
+            for row, seed in zip(missing_sampled, seeds):
+                mutable_generators[row] = torch.Generator(
+                    device=torch.device(probability_device)
+                ).manual_seed(seed)
+            generators = tuple(mutable_generators)
+
+    sampled_generator_ids = [
+        id(generators[row])
+        for row in range(batch)
+        if temperatures[row] > 0 and generators[row] is not None
+    ]
+    if len(set(sampled_generator_ids)) != len(sampled_generator_ids):
+        raise ValueError(
+            "the same explicit generator object cannot be shared by sampled "
+            "rows; pass distinct per-row generators or one scalar generator "
+            "to request cloned streams"
+        )
+
+    return tuple(
+        SamplingContext(
+            temperature=temperatures[row],
+            top_k=top_ks[row],
+            top_p=top_ps[row],
+            generator=generators[row],
+        )
+        for row in range(batch)
+    )
+
+
+def _normalize_stop_rows(
+    target: Any,
+    stop_token_ids: Any,
+    batch: int,
+) -> tuple[tuple[tuple[int, ...], ...], bool]:
+    """Disambiguate a shared flat stop set from nested per-row stop sets."""
+    if stop_token_ids is None or (
+        isinstance(stop_token_ids, Integral)
+        and not isinstance(stop_token_ids, bool)
+    ):
+        shared = tuple(_resolve_stop_ids(target, stop_token_ids))
+        return (shared,) * batch, False
+    if not isinstance(stop_token_ids, Sequence) or isinstance(
+        stop_token_ids, (str, bytes)
+    ):
+        raise ValueError(
+            "stop_token_ids must be an integer, a shared sequence of integers, "
+            "or one sequence per row"
+        )
+
+    values = tuple(stop_token_ids)
+    scalar_rows = tuple(
+        isinstance(value, Integral) and not isinstance(value, bool)
+        for value in values
+    )
+    nested_rows = tuple(
+        value is None
+        or (isinstance(value, Sequence) and not isinstance(value, (str, bytes)))
+        for value in values
+    )
+    if all(scalar_rows):
+        shared = tuple(int(token) for token in values)
+        return (shared,) * batch, False
+    if not all(nested_rows):
+        raise ValueError(
+            "stop_token_ids cannot mix shared scalar token IDs with per-row sequences"
+        )
+    if len(values) != batch:
+        raise ValueError(
+            f"per-row stop_token_ids has {len(values)} entries for batch size {batch}"
+        )
+    default = tuple(_resolve_stop_ids(target, None))
+    rows: list[tuple[int, ...]] = []
+    for row in values:
+        if row is None:
+            rows.append(default)
+            continue
+        try:
+            rows.append(tuple(_resolve_stop_ids(target, row)))
+        except ValueError as exc:
+            raise ValueError(
+                "each per-row stop_token_ids value must be None or a sequence "
+                "of integer token IDs"
+            ) from exc
+    return tuple(rows), True
 
 
 @dataclass(frozen=True)
@@ -446,38 +710,14 @@ def rollback_target_cache(
         )
 
 
-class NativeStepTrace(NamedTuple):
-    """Per-step state accounting for the native DFlash loop (diagnostics).
-
-    The bonus token is emitted but NOT cached, so after every step the target
-    cache length equals ``start`` while the absolute emitted length is exactly
-    one ahead -- conflating the two is the bonus-token trap (oracle ruling #3).
-    """
-
-    prev_start: int  # cached_len at step entry
-    # accepted drafts actually committed this step, in [0, block_size - 1];
-    # smaller than the accept-rule result when the step is truncated by a
-    # stop token or the max_new_tokens budget (drafts beyond the cut are
-    # dropped), so ``start == prev_start + accept + 1`` holds in every branch
-    accept: int
-    start: int  # cached_len after commit == prev_start + accept + 1
-    emitted_len: (
-        int  # generated tokens emitted so far (accepted drafts + bonus)
-    )
-    target_cache_len: int  # target_kv.get_seq_length() after crop
-    draft_cache_len: Optional[
-        int
-    ]  # context-KV length after crop (KV drafter only)
-
-
 # ---------------------------------------------------------------------------
 # Single-round control seam (PD-DFlash Task 6 Step 5)
 #
-# ``SpecSession`` + ``begin_session``/``draft_round``/``verify_round`` externalize
-# the ``_generate_single`` loop so the serving engine can interpose the 2-D
-# verify scheduler between DRAFT and VERIFY, registering each pending verify's
-# EXACT token/byte demand. This is ADDITIVE: ``generate()`` / ``_generate_single``
-# are intentionally left byte-identical and the session runs alongside them.
+# ``SpecSession`` + ``begin_session``/``draft_round``/``verify_round`` own the
+# canonical single-sequence state machine. ``_generate_single`` is only its
+# synchronous driver; serving can interpose the 2-D verify scheduler between
+# DRAFT and VERIFY while registering each pending verify's EXACT token/byte
+# demand without maintaining a second decode algorithm.
 # ---------------------------------------------------------------------------
 
 
@@ -581,13 +821,15 @@ class VerifyResult:
 
     ``accepted_token_ids`` are the tokens emitted this round (accepted drafts
     then the bonus, stop/budget-truncated); ``accept`` is the accepted drafts
-    committed to KV (cache advance minus one); ``committed_count`` is the number
-    of emitted tokens appended to the sequence; ``finished`` is set once a stop
-    id or ``max_new_tokens`` ends the session.
+    committed to KV (cache advance minus one), while ``verified_accept`` is the
+    untruncated acceptance-rule result. ``committed_count`` is the number of
+    emitted tokens appended to the sequence; ``finished`` is set once a stop id
+    or ``max_new_tokens`` ends the session.
     """
 
     accepted_token_ids: list[int]
     accept: int
+    verified_accept: int
     committed_count: int
     finished: bool
 
@@ -598,17 +840,13 @@ class SpecSession:
 
     ``begin_session`` seeds this from the prefill/anchor forward; ``draft_round``
     and ``verify_round`` advance it one DRAFT and one VERIFY round respectively,
-    reproducing the ``_generate_single`` loop body exactly but under explicit
-    engine control (Task 6 Step 5). ``generate()`` is left untouched and
-    byte-identical; this seam runs ALONGSIDE it.
+    reproducing singleton ``generate()`` under explicit engine control (Task 6
+    Step 5). The synchronous singleton path drives this same state machine.
     """
 
     input_ids: torch.Tensor
     max_new_tokens: int
-    temperature: float
-    top_k: int
-    top_p: float
-    sampled: bool
+    sampling: SamplingContext
     block_size: int
     layer_ids: list[int]
     mask_token_id: int
@@ -629,13 +867,41 @@ class SpecSession:
     _pending: bool = False
     _pending_block: Optional[torch.Tensor] = None
     _pending_prev_start: int = 0
-    _pending_draft_probs: Optional[torch.Tensor] = None
+    pending_draft_probs: Optional[torch.Tensor] = None
     _pending_cache_snapshot: Any = None
+
+    @property
+    def temperature(self) -> float:
+        return self.sampling.temperature
+
+    @property
+    def top_k(self) -> int:
+        return self.sampling.top_k
+
+    @property
+    def top_p(self) -> float:
+        return self.sampling.top_p
+
+    @property
+    def sampled(self) -> bool:
+        return self.sampling.is_sampled
 
     @property
     def output_ids(self) -> list[int]:
         """All tokens emitted so far (anchor ++ per-round commits), capped."""
         return list(self.emitted[: self.max_new_tokens])
+
+    @property
+    def has_pending_draft(self) -> bool:
+        """Whether this session owns a tentative block awaiting verification."""
+        return self._pending
+
+    def clear_pending(self) -> None:
+        """Discard tentative draft metadata after verification or abort."""
+        self._pending = False
+        self._pending_block = None
+        self.pending_draft_probs = None
+        self._pending_cache_snapshot = None
 
 
 class DFlashSpeculator:
@@ -661,10 +927,19 @@ class DFlashSpeculator:
         )
 
         self.config = read_dflash_config(self.draft.config)
-        validate_drafter(self.draft, self.target.config, draft_cfg=self.config)
+        checkpoint_scope = _validated_checkpoint_scope(
+            self.target.config, self.draft.config, draft_model_path
+        )
+        self.pairing_evidence = build_pairing_evidence(
+            self.draft,
+            self.target.config,
+            self.config,
+            validated_checkpoint_scope=checkpoint_scope,
+        )
         self.embed_tokens, self.lm_head = bind_shared_weights(
             self.draft, self.target
         )
+        self.executor_evidence = self._base_executor_evidence()
         self._init_native_runtime()
 
     @classmethod
@@ -704,11 +979,19 @@ class DFlashSpeculator:
         if config is None:
             config = read_dflash_config(_get(self.draft, "config"))
         self.config = config
-        validate_pairing(self.config, self.target.config)
-        validate_drafter_module(self.draft, self.config)
+        checkpoint_scope = _validated_checkpoint_scope(
+            self.target.config, _get(self.draft, "config")
+        )
+        self.pairing_evidence = build_pairing_evidence(
+            self.draft,
+            self.target.config,
+            self.config,
+            validated_checkpoint_scope=checkpoint_scope,
+        )
         self.embed_tokens, self.lm_head = bind_shared_weights(
             self.draft, self.target
         )
+        self.executor_evidence = self._base_executor_evidence()
         self._init_native_runtime()
         return self
 
@@ -738,6 +1021,10 @@ class DFlashSpeculator:
         # are right-padded in the returned rectangle). None on the batch==1
         # path, whose output is never padded.
         self.last_generated_lengths: Optional[List[int]] = None
+        self.last_session_traces: tuple[SessionTrace, ...] = ()
+        self.last_session_results: tuple[Any, ...] = ()
+        self.rich_forward_batched = False
+        self.rich_forward_batch_sizes: list[int] = []
         # Track A5 metrics handle; None (default) = instrumentation off, zero
         # overhead. Set via ``enable_route_ahead_stats``.
         self.route_ahead_stats: Optional[RouteAheadStats] = None
@@ -764,6 +1051,33 @@ class DFlashSpeculator:
         if callable(eval_fn):
             eval_fn()
 
+    @staticmethod
+    def _extract_context_feature(
+        hidden_states: Sequence[torch.Tensor], layer_ids: Sequence[int]
+    ) -> torch.Tensor:
+        return _extract_context_feature(hidden_states, layer_ids)
+
+    @staticmethod
+    def _snapshot_target_cache(target_kv: Any) -> TargetCacheSnapshot:
+        return snapshot_target_cache(target_kv)
+
+    @staticmethod
+    def _rollback_target_cache(
+        target_kv: Any,
+        snapshot: TargetCacheSnapshot,
+        *,
+        prev_start: int,
+        committed: int,
+        block_size: int,
+    ) -> None:
+        rollback_target_cache(
+            target_kv,
+            snapshot,
+            prev_start=prev_start,
+            committed=committed,
+            block_size=block_size,
+        )
+
     def _forward_target(
         self,
         input_ids: torch.Tensor,
@@ -772,6 +1086,7 @@ class DFlashSpeculator:
         *,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        attention_metadata: Any = None,
     ) -> tuple[torch.Tensor, Any, Any]:
         """Rich target forward -> on-device (logits, hidden_states, past_key_values).
 
@@ -784,19 +1099,51 @@ class DFlashSpeculator:
         """
         rich = getattr(self.moe, "_native_model_forward_rich", None)
         if callable(rich):
-            metadata = (
-                None
-                if past_key_values is None
-                else SimpleNamespace(is_prefill=False)
-            )
-            token_ids = [int(t) for t in input_ids[0].tolist()]
+            from moe_infinity.spec_decode.protocols import RichBatchMetadata
+
+            metadata = attention_metadata
+            if metadata is None and past_key_values is not None:
+                metadata = SimpleNamespace(is_prefill=False)
+            if int(input_ids.shape[0]) > 1:
+                batch = int(input_ids.shape[0])
+                query_lengths = (
+                    tuple(
+                        int(value)
+                        for value in attention_mask.sum(dim=1).tolist()
+                    )
+                    if attention_mask is not None
+                    and int(attention_mask.shape[1]) == int(input_ids.shape[1])
+                    else (int(input_ids.shape[1]),) * batch
+                )
+                offsets = [0]
+                for length in query_lengths:
+                    offsets.append(offsets[-1] + length)
+                metadata = RichBatchMetadata(
+                    row_offsets=tuple(offsets),
+                    row_lengths=query_lengths,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    cache_handles=(past_key_values,) * batch,
+                    is_prefill=past_key_values is None,
+                )
+                token_ids: list[int] | torch.Tensor = input_ids
+                self.rich_forward_batch_sizes.append(batch)
+            else:
+                token_ids = [int(t) for t in input_ids[0].tolist()]
             result = rich(token_ids, metadata, logits_to_keep=logits_to_keep)
-            if not isinstance(result, tuple) or len(result) != 3:
+            from moe_infinity.spec_decode.protocols import RichForwardResult
+
+            if isinstance(result, RichForwardResult):
+                logits = result.logits
+                hidden_states = result.hidden_states
+                past_key_values = result.cache_handle
+            elif isinstance(result, tuple) and len(result) == 3:
+                logits, hidden_states, past_key_values = result
+            else:
                 raise RuntimeError(
                     "_native_model_forward_rich must return "
                     "(logits, hidden_states, past_key_values)"
                 )
-            logits, hidden_states, past_key_values = result
             if not isinstance(logits, torch.Tensor):
                 raise RuntimeError(
                     "native rich forward logits must be a Tensor"
@@ -827,6 +1174,20 @@ class DFlashSpeculator:
         """
         engine = getattr(self.moe, "engine", None)
         return getattr(engine, "expert_prefetcher", None)
+
+    def _base_executor_evidence(self) -> ExecutorEvidence:
+        reachable = executor_wiring_reachable(self.moe)
+        prefetcher_present = self._resolve_route_ahead_prefetcher() is not None
+        reason = None
+        if not reachable:
+            reason = "executor_unreachable"
+        elif not prefetcher_present:
+            reason = "prefetcher_absent"
+        return ExecutorEvidence(
+            wiring_reachable=reachable,
+            prefetcher_present=prefetcher_present,
+            fallback_reason=reason,
+        )
 
     def _verify_target_block(
         self,
@@ -872,8 +1233,14 @@ class DFlashSpeculator:
         if position_ids is not None:
             kwargs["position_ids"] = position_ids
         with nvtx_phase("target_verify"):
+            row_width = int(block.shape[1])
+            row_offsets = tuple(
+                row * row_width for row in range(int(block.shape[0]) + 1)
+            )
             with route_ahead_context(
-                self._resolve_route_ahead_prefetcher(), stats=stats
+                self._resolve_route_ahead_prefetcher(),
+                stats=stats,
+                row_offsets=row_offsets,
             ):
                 return self._forward_target(
                     block, past_key_values=target_kv, logits_to_keep=0, **kwargs
@@ -925,7 +1292,9 @@ class DFlashSpeculator:
         stop_token_ids: Optional[List[int]] = None,
         top_k: int = 0,
         top_p: float = 1.0,
+        generator: Optional[torch.Generator] = None,
         collect_route_union: bool = False,
+        target_cache_adapter: CacheAdapter | None = None,
     ) -> SpecSession:
         """Prefill + anchor forward; seed a ``SpecSession`` for engine rounds.
 
@@ -950,8 +1319,19 @@ class DFlashSpeculator:
 
         from transformers import DynamicCache
 
-        sampled = float(temperature) > 0
+        normalized_top_k = max(0, int(top_k))
+        sampling = SamplingContext(
+            temperature=float(temperature),
+            top_k=normalized_top_k,
+            top_p=float(top_p),
+            generator=generator,
+        )
+        sampled = sampling.is_sampled
+        if target_cache_adapter is not None and sampled:
+            raise ValueError("paged target cache requires greedy sampling")
         input_ids = input_ids.to(self.device)
+        if sampled:
+            _validate_generator_device(generator, input_ids.device)
         self._configure_target_hooks(input_ids)
 
         num_prompt_tokens = int(input_ids.shape[1])
@@ -959,14 +1339,44 @@ class DFlashSpeculator:
         layer_ids = list(self.config.target_layer_ids)
         max_new_tokens = int(max_new_tokens)
 
-        logits, hidden_states, target_kv = self._forward_target(
-            input_ids, past_key_values=None, logits_to_keep=1
-        )
+        if target_cache_adapter is None:
+            logits, hidden_states, target_kv = self._forward_target(
+                input_ids, past_key_values=None, logits_to_keep=1
+            )
+        else:
+            build_metadata = getattr(
+                target_cache_adapter, "build_attention_metadata", None
+            )
+            if not callable(build_metadata):
+                raise TypeError(
+                    "paged target cache adapter must build attention metadata"
+                )
+            metadata = build_metadata(
+                query_length=num_prompt_tokens, is_prefill=True
+            )
+            logits, hidden_states, returned_handle = self._forward_target(
+                input_ids,
+                past_key_values=target_cache_adapter,
+                logits_to_keep=1,
+                attention_metadata=metadata,
+            )
+            engine_cache = getattr(target_cache_adapter, "cache", None)
+            if returned_handle is not engine_cache:
+                raise RuntimeError(
+                    "paged target forward did not return the engine-owned cache"
+                )
+            target_kv = target_cache_adapter
         if sampled:
             anchor = int(
                 torch.multinomial(
-                    warped_probs(logits[0, -1], temperature, top_k, top_p),
+                    warped_probs(
+                        logits[0, -1],
+                        sampling.temperature,
+                        sampling.top_k,
+                        sampling.top_p,
+                    ),
                     num_samples=1,
+                    generator=generator,
                 ).item()
             )
         else:
@@ -979,10 +1389,7 @@ class DFlashSpeculator:
         session = SpecSession(
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
-            temperature=float(temperature),
-            top_k=int(top_k),
-            top_p=float(top_p),
-            sampled=sampled,
+            sampling=sampling,
             block_size=block_size,
             layer_ids=layer_ids,
             mask_token_id=int(self.config.mask_token_id),
@@ -1020,7 +1427,7 @@ class DFlashSpeculator:
         """
         if session.finished:
             raise RuntimeError("draft_round called on a finished session")
-        if session._pending:
+        if session.has_pending_draft:
             raise RuntimeError(
                 "draft_round called with an un-verified pending block; "
                 "call verify_round first"
@@ -1045,17 +1452,22 @@ class DFlashSpeculator:
                 session.top_p,
             )
             block[:, 1:] = torch.multinomial(
-                draft_probs, num_samples=1
+                draft_probs,
+                num_samples=1,
+                generator=session.sampling.generator,
             ).squeeze(-1)
         else:
             block[:, 1:] = draft_logits.argmax(dim=-1)
 
         session._pending_block = block
         session._pending_prev_start = prev_start
-        session._pending_draft_probs = draft_probs
-        session._pending_cache_snapshot = snapshot_target_cache(
-            session.target_kv
-        )
+        session.pending_draft_probs = draft_probs
+        if isinstance(session.target_kv, CacheAdapter):
+            session._pending_cache_snapshot = session.target_kv.snapshot()
+        else:
+            session._pending_cache_snapshot = snapshot_target_cache(
+                session.target_kv
+            )
         session._pending = True
 
         return DraftResult(
@@ -1075,7 +1487,7 @@ class DFlashSpeculator:
         union is collected read-only and turned into the EXACT
         ``expert_nbytes``-summed demand carried to the next ``draft_round``.
         """
-        if not session._pending or session._pending_block is None:
+        if not session.has_pending_draft or session._pending_block is None:
             raise RuntimeError(
                 "verify_round called without a pending draft; "
                 "call draft_round first"
@@ -1083,8 +1495,13 @@ class DFlashSpeculator:
 
         block = session._pending_block
         prev_start = session._pending_prev_start
-        draft_probs = session._pending_draft_probs
+        draft_probs = session.pending_draft_probs
         cache_snapshot = session._pending_cache_snapshot
+        paged_target = (
+            session.target_kv
+            if isinstance(session.target_kv, CacheAdapter)
+            else None
+        )
 
         collector = session.collector
         stats = (
@@ -1096,13 +1513,44 @@ class DFlashSpeculator:
             stats.begin_step()
         with nvtx_phase("target_verify"):
             with route_ahead_context(
-                self._resolve_route_ahead_prefetcher(), stats=stats
+                self._resolve_route_ahead_prefetcher(),
+                stats=stats,
+                row_offsets=(0, int(block.numel())),
             ):
-                logits, hidden_states, session.target_kv = self._forward_target(
-                    block,
-                    past_key_values=session.target_kv,
-                    logits_to_keep=0,
-                )
+                if paged_target is None:
+                    logits, hidden_states, session.target_kv = (
+                        self._forward_target(
+                            block,
+                            past_key_values=session.target_kv,
+                            logits_to_keep=0,
+                        )
+                    )
+                else:
+                    paged_target.append(session.block_size)
+                    build_metadata = getattr(
+                        paged_target, "build_attention_metadata", None
+                    )
+                    if not callable(build_metadata):
+                        raise TypeError(
+                            "paged target cache adapter must build attention metadata"
+                        )
+                    metadata = build_metadata(
+                        query_length=session.block_size, is_prefill=False
+                    )
+                    logits, hidden_states, returned_handle = (
+                        self._forward_target(
+                            block,
+                            past_key_values=paged_target,
+                            logits_to_keep=0,
+                            attention_metadata=metadata,
+                        )
+                    )
+                    if returned_handle is not getattr(
+                        paged_target, "cache", None
+                    ):
+                        raise RuntimeError(
+                            "paged target forward replaced the engine-owned cache"
+                        )
 
         if session.sampled:
             assert draft_probs is not None
@@ -1115,6 +1563,7 @@ class DFlashSpeculator:
                     session.top_p,
                 ),
                 block[0, 1:],
+                generator=session.sampling.generator,
             )
             accept = decision.accept
             committed = committed_tokens_sampled(
@@ -1134,7 +1583,7 @@ class DFlashSpeculator:
                     keep = j + 1
                     stop = True
                     break
-        remaining = session.max_new_tokens - len(session.emitted)
+        remaining = max(0, session.max_new_tokens - len(session.emitted))
         if keep > remaining:
             keep = remaining
             stop = True
@@ -1142,24 +1591,33 @@ class DFlashSpeculator:
         session.emitted.extend(step_tokens[:keep])
         cache_committed = min(keep, accept) + 1
         session.start = prev_start + cache_committed
-        rollback_target_cache(
-            session.target_kv,
-            cache_snapshot,
-            prev_start=prev_start,
-            committed=cache_committed,
-            block_size=session.block_size,
-            block=block,
-            replay=(
-                (
-                    lambda prefix, cache: self._forward_target(
-                        prefix, past_key_values=cache, logits_to_keep=0
-                    )[2]
-                )
-                if cache_snapshot.linear
-                else None
-            ),
-        )
-        assert int(session.target_kv.get_seq_length()) == session.start
+        if paged_target is None:
+            rollback_target_cache(
+                session.target_kv,
+                cache_snapshot,
+                prev_start=prev_start,
+                committed=cache_committed,
+                block_size=session.block_size,
+                block=block,
+                replay=(
+                    (
+                        lambda prefix, cache: self._forward_target(
+                            prefix, past_key_values=cache, logits_to_keep=0
+                        )[2]
+                    )
+                    if cache_snapshot.linear
+                    else None
+                ),
+            )
+            target_cache_len = int(session.target_kv.get_seq_length())
+        else:
+            paged_target.truncate(session.start)
+            target_cache_len = paged_target.logical_length()
+        if target_cache_len != session.start:
+            raise RuntimeError(
+                "DFlash target cache length invariant violated: "
+                f"expected {session.start}, got {target_cache_len}"
+            )
 
         if collector is not None:
             collector.commit_step(kept_rows=cache_committed)
@@ -1178,7 +1636,7 @@ class DFlashSpeculator:
                 accept=cache_committed - 1,
                 start=session.start,
                 emitted_len=len(session.emitted),
-                target_cache_len=int(session.target_kv.get_seq_length()),
+                target_cache_len=target_cache_len,
                 draft_cache_len=(
                     int(session.draft_kv.get_seq_length())
                     if session.draft_kv is not None
@@ -1201,10 +1659,7 @@ class DFlashSpeculator:
                 )
             session.anchor = int(committed.bonus[0, 0].item())
 
-        session._pending = False
-        session._pending_block = None
-        session._pending_draft_probs = None
-        session._pending_cache_snapshot = None
+        session.clear_pending()
         session.round_index += 1
 
         if finished:
@@ -1215,6 +1670,7 @@ class DFlashSpeculator:
         return VerifyResult(
             accepted_token_ids=step_tokens[:keep],
             accept=cache_committed - 1,
+            verified_accept=accept,
             committed_count=keep,
             finished=finished,
         )
@@ -1224,11 +1680,22 @@ class DFlashSpeculator:
         self,
         input_ids: torch.Tensor,
         max_new_tokens: Union[int, Sequence[int]] = 256,
-        temperature: float = 0.0,
-        stop_token_ids: Optional[List[int]] = None,
-        top_k: int = 0,
-        top_p: float = 1.0,
+        temperature: Union[float, Sequence[float]] = 0.0,
+        stop_token_ids: Optional[
+            Union[
+                int,
+                Sequence[int],
+                Sequence[Optional[Sequence[int]]],
+            ]
+        ] = None,
+        top_k: Union[int, Sequence[int]] = 0,
+        top_p: Union[float, Sequence[float]] = 1.0,
         attention_mask: Optional[torch.Tensor] = None,
+        generator: Union[
+            torch.Generator,
+            Sequence[Optional[torch.Generator]],
+            None,
+        ] = None,
     ) -> torch.Tensor:
         """Native DFlash draft->verify->rollback loop (RFC 1.2).
 
@@ -1262,12 +1729,21 @@ class DFlashSpeculator:
         produced KV for block tokens, never for the bonus.
 
         Batching (Track C): ``input_ids`` with batch > 1 dispatches to
-        ``_generate_batched`` -- greedy-only (``temperature`` must be 0),
-        bare-HF-target-only (the MoE rich-forward seam stays batch==1), with
-        LEFT-padded prompts described by ``attention_mask`` (omit it when all
-        prompts share one length) and a scalar or per-sequence
-        ``max_new_tokens``. The ragged per-row outputs are right-padded into
-        the returned rectangle; each row's true new-token count is exposed as
+        ``_generate_batched`` for bare-HF targets and wrappers that explicitly
+        satisfy the row-aware rich-forward capability. Unsupported rich,
+        MLA, and hybrid wrappers retain independent per-request sessions.
+        ``temperature``, ``top_k``, ``top_p``, generators, budgets, and nested
+        stop-id sets accept one value per row; numeric scalars and flat stop-id
+        sets retain their shared/broadcast meaning.
+        For batch > 1, one scalar generator is cloned to the same initial
+        state for every row, so identical requests have correlated streams.
+        Callers wanting independent explicit streams should pass one generator
+        per row or omit the generator. Seed-exact outputs are not guaranteed
+        across different batch shapes; the batched API guarantees per-request
+        order/composition invariance for a fixed request and row-local stream.
+        Prompts are LEFT-padded according to ``attention_mask`` (omit it when
+        all prompts share one length). Ragged outputs are right-padded in the
+        returned rectangle and their true new-token counts are exposed as
         ``self.last_generated_lengths``. ``attention_mask`` is ignored on the
         batch==1 path.
         """
@@ -1275,43 +1751,168 @@ class DFlashSpeculator:
             raise ValueError(
                 f"DFlashSpeculator.generate expects input_ids of shape [batch, seq], got {tuple(input_ids.shape)}"
             )
-        if float(temperature) < 0:
-            raise ValueError(
-                f"DFlashSpeculator.generate: temperature must be >= 0, got {temperature}"
-            )
-        if input_ids.shape[0] == 1:
-            budget = max_new_tokens
-            if isinstance(budget, Sequence):
-                if len(budget) != 1:
-                    raise ValueError(
-                        f"per-sequence max_new_tokens has {len(budget)} entries "
-                        f"for batch size 1"
-                    )
-                budget = budget[0]
-            return self._generate_single(
+        batch = int(input_ids.shape[0])
+        sampling_contexts = _normalize_sampling_contexts(
+            batch=batch,
+            probability_device=self.device,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            generator=generator,
+        )
+        stop_rows, has_per_row_stops = _normalize_stop_rows(
+            self.target, stop_token_ids, batch
+        )
+        budgets = self._normalize_budgets(max_new_tokens, batch)
+        rich_forward = callable(
+            getattr(self.moe, "_native_model_forward_rich", None)
+        )
+        if batch == 1:
+            self.rich_forward_batched = False
+            return self._generate_per_request(
                 input_ids,
-                max_new_tokens=int(budget),
-                temperature=float(temperature),
-                stop_token_ids=stop_token_ids,
-                top_k=top_k,
-                top_p=top_p,
+                budgets=budgets,
+                stop_rows=stop_rows,
+                sampling_contexts=sampling_contexts,
+                attention_mask=attention_mask,
             )
-        if float(temperature) > 0:
-            raise NotImplementedError(
-                "batched DFlash (batch > 1) is greedy-only for now; "
-                f"got temperature {temperature}"
+        if rich_forward:
+            from moe_infinity.spec_decode.backends_rich import (
+                BatchedRichBackend,
             )
-        if callable(getattr(self.moe, "_native_model_forward_rich", None)):
-            raise NotImplementedError(
-                "batched DFlash (batch > 1) requires a bare HF target; the MoE "
-                "rich-forward seam is batch==1 (engine-gated) only"
-            )
+
+            if not BatchedRichBackend(self).wrapper_supported:
+                self.rich_forward_batched = False
+                return self._generate_per_request(
+                    input_ids,
+                    budgets=budgets,
+                    stop_rows=stop_rows,
+                    sampling_contexts=sampling_contexts,
+                    attention_mask=attention_mask,
+                )
+        self.rich_forward_batched = rich_forward
+        self.rich_forward_batch_sizes = []
         return self._generate_batched(
             input_ids,
-            max_new_tokens=max_new_tokens,
-            stop_token_ids=stop_token_ids,
+            max_new_tokens=budgets,
+            stop_token_ids=(None if has_per_row_stops else list(stop_rows[0])),
             attention_mask=attention_mask,
+            sampling_contexts=sampling_contexts,
+            stop_token_ids_by_row=(stop_rows if has_per_row_stops else None),
         )
+
+    @staticmethod
+    def _normalize_budgets(
+        max_new_tokens: Union[int, Sequence[int]], batch: int
+    ) -> tuple[int, ...]:
+        if isinstance(max_new_tokens, Sequence):
+            budgets = tuple(int(value) for value in max_new_tokens)
+            if len(budgets) != batch:
+                raise ValueError(
+                    f"per-sequence max_new_tokens has {len(budgets)} entries "
+                    f"for batch size {batch}"
+                )
+        else:
+            budgets = (int(max_new_tokens),) * batch
+        if any(value < 0 for value in budgets):
+            raise ValueError(
+                f"max_new_tokens must be >= 0, got {list(budgets)}"
+            )
+        return budgets
+
+    @torch.no_grad()
+    def _generate_per_request(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        budgets: tuple[int, ...],
+        stop_rows: tuple[tuple[int, ...], ...],
+        sampling_contexts: tuple[SamplingContext, ...],
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Adapt tensor rows to canonical request sessions in row order."""
+        from moe_infinity.spec_decode.backends import DFlashExecutionBackend
+        from moe_infinity.spec_decode.session_driver import (
+            SessionDriver,
+            UnsupportedRequestError,
+        )
+
+        batch = int(input_ids.shape[0])
+        if attention_mask is not None and batch > 1:
+            if tuple(attention_mask.shape) != tuple(input_ids.shape):
+                raise ValueError(
+                    f"attention_mask shape {tuple(attention_mask.shape)} != "
+                    f"input_ids shape {tuple(input_ids.shape)}"
+                )
+            binary = (attention_mask == 0) | (attention_mask == 1)
+            if not bool(torch.all(binary).item()):
+                raise ValueError("attention_mask must be 0/1 valued")
+
+        requests: list[RequestSpec] = []
+        for row in range(batch):
+            row_ids = input_ids[row]
+            if attention_mask is not None and batch > 1:
+                row_ids = row_ids[attention_mask[row].to(dtype=torch.bool)]
+            requests.append(
+                RequestSpec(
+                    request_id=f"direct-{row}",
+                    prompt_token_ids=tuple(
+                        int(token) for token in row_ids.tolist()
+                    ),
+                    max_new_tokens=budgets[row],
+                    stop_token_ids=frozenset(stop_rows[row]),
+                    sampling=sampling_contexts[row],
+                )
+            )
+
+        backend = DFlashExecutionBackend(
+            self,
+            retain_diagnostics=True,
+            collect_route_union=False,
+        )
+        for request in requests:
+            if (
+                request.is_sampled
+                and not backend.capabilities.supports_sampling
+            ):
+                raise UnsupportedRequestError(
+                    f"request {request.request_id!r} has no compatible sampled backend"
+                )
+            if not backend.supports(request):
+                mode = "sampled" if request.is_sampled else "greedy"
+                raise UnsupportedRequestError(
+                    f"request {request.request_id!r} has no compatible {mode} backend"
+                )
+
+        # The rich MoE seam stores its dense cache on the shell, so only one
+        # request may be live at a time.  Each row still uses the canonical
+        # driver/backend lifecycle; this is semantic batching, not a claim of
+        # physical model batching.
+        results = tuple(
+            SessionDriver([backend]).run(request)[0] for request in requests
+        )
+        self.last_session_results = results
+        self.last_session_traces = tuple(result.trace for result in results)
+        lengths = [len(result.output_token_ids) for result in results]
+        self.last_generated_lengths = None if batch == 1 else lengths
+
+        pad_id = _get(_get(self.target, "config", self.target), "pad_token_id")
+        pad_id = 0 if pad_id is None else int(pad_id)
+        width = max(lengths, default=0)
+        new_ids = torch.full(
+            (batch, width),
+            pad_id,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        for row, result in enumerate(results):
+            if result.output_token_ids:
+                new_ids[row, : lengths[row]] = torch.tensor(
+                    result.output_token_ids,
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+        return torch.cat([input_ids, new_ids], dim=1)
 
     @torch.no_grad()
     def _generate_single(
@@ -1322,186 +1923,34 @@ class DFlashSpeculator:
         stop_token_ids: Optional[List[int]],
         top_k: int,
         top_p: float,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """The v1 single-sequence loop (batch==1), byte-identical to pre-Track-C."""
-        sampled = float(temperature) > 0
-
-        from transformers import DynamicCache
-
-        input_ids = input_ids.to(self.device)
-        self._configure_target_hooks(input_ids)
-
-        num_prompt_tokens = int(input_ids.shape[1])
-        block_size = int(self.config.block_size)
-        layer_ids = list(self.config.target_layer_ids)
-        max_new_tokens = int(max_new_tokens)
-
-        logits, hidden_states, target_kv = self._forward_target(
-            input_ids, past_key_values=None, logits_to_keep=1
+        """Synchronously drive the canonical single-sequence session state."""
+        budget = max(0, int(max_new_tokens))
+        stop_ids = _resolve_stop_ids(self.target, stop_token_ids)
+        session = self.begin_session(
+            input_ids,
+            max_new_tokens=budget,
+            temperature=float(temperature),
+            stop_token_ids=stop_ids,
+            top_k=int(top_k),
+            top_p=float(top_p),
+            generator=generator,
         )
-        if sampled:
-            anchor = int(
-                torch.multinomial(
-                    warped_probs(logits[0, -1], temperature, top_k, top_p),
-                    num_samples=1,
-                ).item()
-            )
-        else:
-            anchor = int(logits[:, -1, :].argmax(dim=-1).item())
-        context_feature = _extract_context_feature(hidden_states, layer_ids).to(
-            self.device
-        )
+        if len(session.output_ids) >= budget:
+            session.finished = True
+        while not session.finished:
+            self.draft_round(session)
+            self.verify_round(session)
 
-        stop_ids = set(_resolve_stop_ids(self.target, stop_token_ids))
-
-        emitted: List[int] = [anchor]
-        start = num_prompt_tokens
-        draft_kv = DynamicCache() if self._drafter_has_kv_cache else None
-
-        self.step_trace = []
-        self.last_generated_lengths = None
-        if stop_ids and anchor in stop_ids and max_new_tokens >= 1:
-            # The prefill anchor is itself a stop token: emit it and halt
-            # before any block is drafted (nothing past EOS may be emitted
-            # or cached; the anchor/bonus is never cached).
-            self.last_target_cache = target_kv
-            self.last_draft_cache = draft_kv
-            new_ids = torch.tensor(
-                [emitted], dtype=torch.long, device=input_ids.device
-            )
-            return torch.cat([input_ids, new_ids], dim=1)
-
-        while len(emitted) < max_new_tokens:
-            prev_start = start
-            block = build_block(
-                anchor, self.config.mask_token_id, block_size
-            ).to(self.device)
-
-            drafter_out = self._run_drafter(
-                block, context_feature, start, draft_kv
-            )
-            draft_logits = self.lm_head(drafter_out)[:, -(block_size - 1) :, :]
-            draft_probs: Optional[torch.Tensor] = None
-            if sampled:
-                # The accept test divides by the drafter's OWN warped slot
-                # distributions, so drafts must be genuine draws from them --
-                # argmax drafts would void the losslessness proof.
-                draft_probs = warped_probs(
-                    draft_logits[0], temperature, top_k, top_p
-                )
-                block[:, 1:] = torch.multinomial(
-                    draft_probs, num_samples=1
-                ).squeeze(-1)
-            else:
-                block[:, 1:] = draft_logits.argmax(dim=-1)
-
-            cache_snapshot = snapshot_target_cache(target_kv)
-
-            logits, hidden_states, target_kv = self._verify_target_block(
-                block, target_kv
-            )
-
-            if sampled:
-                assert draft_probs is not None
-                decision = acceptance_sampled(
-                    draft_probs,
-                    warped_probs(logits[0], temperature, top_k, top_p),
-                    block[0, 1:],
-                )
-                accept = decision.accept
-                committed = committed_tokens_sampled(
-                    block, decision.accept, decision.final_token
-                )
-            else:
-                posterior = logits.argmax(dim=-1).to(self.device)
-                accept = acceptance_length(block, posterior)
-                committed = committed_tokens(block, posterior, accept)
-
-            # This step's emitted tokens are [d_1 .. d_accept, bonus]; the
-            # verify forward produced KV only for [anchor, d_1 .. d_accept].
-            # Keeping k emitted tokens (stop index k - 1) therefore commits
-            # min(k, accept) + 1 cached tokens: the anchor plus the first
-            # min(k, accept) drafts. The bonus is never cached, so a cut at
-            # the bonus still commits the full accept + 1 block prefix.
-            step_tokens = [int(t) for t in committed.emitted[0].tolist()]
-            keep = accept + 1
-            stop = False
-            if stop_ids:
-                for j, tok in enumerate(step_tokens):
-                    if tok in stop_ids:
-                        keep = j + 1
-                        stop = True
-                        break
-            remaining = max_new_tokens - len(emitted)
-            if keep > remaining:
-                keep = remaining
-                stop = True
-
-            emitted.extend(step_tokens[:keep])
-            cache_committed = min(keep, accept) + 1
-            start = prev_start + cache_committed
-            rollback_target_cache(
-                target_kv,
-                cache_snapshot,
-                prev_start=prev_start,
-                committed=cache_committed,
-                block_size=block_size,
-                block=block,
-                replay=(
-                    (
-                        lambda prefix, cache: self._forward_target(
-                            prefix,
-                            past_key_values=cache,
-                            logits_to_keep=0,
-                        )[2]
-                    )
-                    if cache_snapshot.linear
-                    else None
-                ),
-            )
-            assert int(target_kv.get_seq_length()) == start
-
-            if self.route_ahead_stats is not None:
-                # A5: finalize this verify step's coverage/waste accounting
-                # with the kept prefix the accept rule just fixed. Read-only.
-                self.route_ahead_stats.commit_step(kept_rows=cache_committed)
-
-            self.step_trace.append(
-                NativeStepTrace(
-                    prev_start=prev_start,
-                    accept=cache_committed - 1,
-                    start=start,
-                    emitted_len=len(emitted),
-                    target_cache_len=int(target_kv.get_seq_length()),
-                    draft_cache_len=(
-                        int(draft_kv.get_seq_length())
-                        if draft_kv is not None
-                        else None
-                    ),
-                )
-            )
-            if stop:
-                break
-
-            suffix = _extract_context_feature(hidden_states, layer_ids).to(
-                self.device
-            )[:, : accept + 1, :]
-            if self._drafter_has_kv_cache:
-                context_feature = suffix
-            else:
-                context_feature = torch.cat([context_feature, suffix], dim=1)
-
-            anchor = int(committed.bonus[0, 0].item())
-
-        self.last_target_cache = target_kv
-        self.last_draft_cache = draft_kv
-
+        self.last_target_cache = session.target_kv
+        self.last_draft_cache = session.draft_kv
         new_ids = torch.tensor(
-            [emitted[:max_new_tokens]],
+            [session.output_ids],
             dtype=torch.long,
-            device=input_ids.device,
+            device=session.input_ids.device,
         )
-        return torch.cat([input_ids, new_ids], dim=1)
+        return torch.cat([session.input_ids, new_ids], dim=1)
 
     @torch.no_grad()
     def _generate_batched(
@@ -1510,255 +1959,119 @@ class DFlashSpeculator:
         max_new_tokens: Union[int, Sequence[int]],
         stop_token_ids: Optional[List[int]],
         attention_mask: Optional[torch.Tensor],
+        sampling_contexts: Optional[tuple[SamplingContext, ...]] = None,
+        stop_token_ids_by_row: Optional[tuple[tuple[int, ...], ...]] = None,
     ) -> torch.Tensor:
-        """Track-C batched loop: one prefill + one verify per step for all rows.
+        """Adapt the legacy tensor API to a driver-owned physical cohort."""
+        from moe_infinity.spec_decode.backends import PhysicalCohortBackend
+        from moe_infinity.spec_decode.backends_bare_hf import (
+            BatchedBareHFBackend,
+        )
+        from moe_infinity.spec_decode.backends_rich import (
+            BatchedRichBackend,
+        )
+        from moe_infinity.spec_decode.session_driver import SessionDriver
 
-        Greedy correctness rests on two facts: (1) the emitted stream of a
-        greedy verify step is always the target's argmax continuation given
-        the committed prefix -- accepted drafts matched the target by
-        definition and the bonus/correction IS the target's argmax -- so
-        drafts (and hence batching) can only change HOW MANY tokens a step
-        commits, never WHICH tokens are emitted; (2) a row's verify logits
-        depend only on its own cache row, block prefix, and RoPE positions,
-        which the left-pad ``attention_mask`` + per-row ``position_ids``
-        plumbing reproduce exactly.
+        if input_ids.ndim != 2:
+            raise ValueError(
+                "DFlashSpeculator._generate_batched expects input_ids of shape "
+                f"[batch, seq], got {tuple(input_ids.shape)}"
+            )
+        batch = int(input_ids.shape[0])
+        budgets = self._normalize_budgets(max_new_tokens, batch)
+        cohort_input_ids = input_ids.to(self.device)
+        if attention_mask is None:
+            cohort_attention_mask = torch.ones_like(cohort_input_ids)
+        else:
+            cohort_attention_mask = attention_mask.to(device=self.device)
+        if tuple(cohort_attention_mask.shape) != tuple(cohort_input_ids.shape):
+            raise ValueError(
+                f"attention_mask shape {tuple(cohort_attention_mask.shape)} != "
+                f"input_ids shape {tuple(cohort_input_ids.shape)}"
+            )
+        binary = (cohort_attention_mask == 0) | (cohort_attention_mask == 1)
+        if not bool(torch.all(binary).item()):
+            raise ValueError("attention_mask must be 0/1 valued")
+        cohort_attention_mask = cohort_attention_mask.to(dtype=torch.long)
 
-        Per-sequence rollback (C1): HF ``DynamicCache`` is dense -- one
-        ``cumulative_length`` per layer and slot-index-based causal/sliding
-        masks (``create_causal_mask`` reads ``q_offset`` from the cache, not
-        per-row positions) -- so rows cannot physically hold ragged lengths.
-        Instead every row rolls back to ``prev_start + min_cc`` where
-        ``min_cc`` is the SMALLEST per-row commit among still-active rows
-        (``rollback_target_cache`` is reused unchanged: the sliding-window
-        snapshot/rebuild is per-row inside the batched tensors). Rows that
-        committed more than ``min_cc`` carry the un-cached tail of their
-        already-emitted (hence target-true) tokens as the KNOWN PREFIX of
-        their next block (``build_block_with_prefixes``); the drafter only
-        fills the MASK slots past it, the verify re-caches the prefix, and
-        the prefix's re-confirmation tokens are skipped on emission
-        (``pending - 1`` of them). Slot distances equal true token distances
-        under this uniform-length scheme, so sliding-window masks stay exact.
-        """
-        from transformers import DynamicCache
-
-        batch, padded_prompt = int(input_ids.shape[0]), int(input_ids.shape[1])
-        block_size = int(self.config.block_size)
-        layer_ids = list(self.config.target_layer_ids)
-        mask_token_id = int(self.config.mask_token_id)
-
-        if isinstance(max_new_tokens, Sequence):
-            budgets = [int(x) for x in max_new_tokens]
-            if len(budgets) != batch:
+        if sampling_contexts is None:
+            normalized_sampling = tuple(SamplingContext() for _ in range(batch))
+        else:
+            normalized_sampling = tuple(sampling_contexts)
+            if len(normalized_sampling) != batch:
                 raise ValueError(
-                    f"per-sequence max_new_tokens has {len(budgets)} entries "
+                    f"sampling_contexts has {len(normalized_sampling)} entries "
                     f"for batch size {batch}"
                 )
+        if stop_token_ids_by_row is None:
+            shared_stops = tuple(_resolve_stop_ids(self.target, stop_token_ids))
+            stop_rows = tuple(shared_stops for _ in range(batch))
         else:
-            budgets = [int(max_new_tokens)] * batch
-        if any(b < 0 for b in budgets):
-            raise ValueError(f"max_new_tokens must be >= 0, got {budgets}")
-
-        input_ids = input_ids.to(self.device)
-        self._configure_target_hooks(input_ids)
-
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        else:
-            attention_mask = attention_mask.to(
-                device=self.device, dtype=torch.long
-            )
-        if tuple(attention_mask.shape) != tuple(input_ids.shape):
-            raise ValueError(
-                f"attention_mask shape {tuple(attention_mask.shape)} != "
-                f"input_ids shape {tuple(input_ids.shape)}"
-            )
-        if attention_mask.min() < 0 or attention_mask.max() > 1:
-            raise ValueError("attention_mask must be 0/1 valued")
-        if int(attention_mask[:, -1].min()) != 1:
-            raise ValueError(
-                "batched DFlash requires LEFT-padded prompts: every row's last "
-                "token must be real (attention_mask[:, -1] == 1)"
-            )
-        steps = attention_mask[:, 1:] - attention_mask[:, :-1]
-        if int(steps.min()) < 0:
-            raise ValueError(
-                "batched DFlash requires LEFT-padded prompts: each "
-                "attention_mask row must be 0*1* (pads first, then real tokens)"
-            )
-        pads = padded_prompt - attention_mask.sum(dim=1)
-
-        prefill_position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp_min(0)
-        logits, hidden_states, target_kv = self._forward_target(
-            input_ids,
-            past_key_values=None,
-            logits_to_keep=1,
-            attention_mask=attention_mask,
-            position_ids=prefill_position_ids,
-        )
-        anchors = logits[:, -1, :].argmax(dim=-1)
-        context_feature = _extract_context_feature(hidden_states, layer_ids).to(
-            self.device
-        )
-        stop_ids = set(_resolve_stop_ids(self.target, stop_token_ids))
-
-        emitted: List[List[int]] = [[int(anchors[b])] for b in range(batch)]
-        finished: List[bool] = [
-            budgets[b] <= 0 or (bool(stop_ids) and int(anchors[b]) in stop_ids)
-            for b in range(batch)
-        ]
-        start = padded_prompt
-        draft_kv = DynamicCache() if self._drafter_has_kv_cache else None
-        self.step_trace = []
-
-        def active(b: int) -> bool:
-            return not finished[b] and len(emitted[b]) < budgets[b]
-
-        while any(active(b) for b in range(batch)):
-            prev_start = start
-            pendings = [
-                len(emitted[b]) - (start - padded_prompt) for b in range(batch)
-            ]
-            prefixes = [
-                emitted[b][start - padded_prompt :] if active(b) else []
-                for b in range(batch)
-            ]
-            block = build_block_with_prefixes(
-                prefixes, mask_token_id, block_size
-            ).to(self.device)
-
-            drafter_out = self._run_drafter(
-                block, context_feature, start, draft_kv
-            )
-            draft_logits = self.lm_head(drafter_out)[:, -(block_size - 1) :, :]
-            for b in range(batch):
-                if active(b) and pendings[b] < block_size:
-                    block[b, pendings[b] :] = draft_logits[
-                        b, pendings[b] - 1 :
-                    ].argmax(dim=-1)
-
-            cache_snapshot = snapshot_target_cache(target_kv)
-
-            block_attention = torch.cat(
-                [
-                    attention_mask,
-                    torch.ones(
-                        batch,
-                        start - padded_prompt + block_size,
-                        dtype=attention_mask.dtype,
-                        device=self.device,
-                    ),
-                ],
-                dim=1,
-            )
-            block_position_ids = torch.arange(
-                start, start + block_size, device=self.device, dtype=torch.long
-            ).unsqueeze(0) - pads.unsqueeze(1)
-            logits, hidden_states, target_kv = self._verify_target_block(
-                block,
-                target_kv,
-                attention_mask=block_attention,
-                position_ids=block_position_ids,
-            )
-            posterior = logits.argmax(dim=-1).to(self.device)
-            accepts = acceptance_lengths(block, posterior)
-            step_committed = committed_tokens_ragged(block, posterior, accepts)
-
-            # Per-row emission with the re-fed prefix skipped: of this step's
-            # ``accept + 1`` emitted tokens the first ``pending - 1`` are
-            # re-confirmations of tokens already emitted (the known prefix),
-            # so row b newly emits ``step_tokens[pending - 1:]``. Keeping k of
-            # those commits ``min(pending - 1 + k, accept) + 1`` cached tokens
-            # (the v1 rule ``min(k, accept) + 1`` at pending == 1).
-            step_cc: dict[int, int] = {}
-            for b in range(batch):
-                if not active(b):
-                    continue
-                pending = pendings[b]
-                accept = accepts[b]
-                step_tokens = [
-                    int(t) for t in step_committed[b].emitted[0].tolist()
-                ]
-                new_tokens = step_tokens[pending - 1 :]
-                keep = len(new_tokens)
-                stop = False
-                if stop_ids:
-                    for j, tok in enumerate(new_tokens):
-                        if tok in stop_ids:
-                            keep = j + 1
-                            stop = True
-                            break
-                remaining = budgets[b] - len(emitted[b])
-                if keep > remaining:
-                    keep = remaining
-                    stop = True
-                emitted[b].extend(new_tokens[:keep])
-                step_cc[b] = min(pending - 1 + keep, accept) + 1
-                if stop or len(emitted[b]) >= budgets[b]:
-                    finished[b] = True
-
-            continuing = [b for b in step_cc if active(b)]
-            min_cc = (
-                min(step_cc[b] for b in continuing)
-                if continuing
-                else min(step_cc.values())
-            )
-            rollback_target_cache(
-                target_kv,
-                cache_snapshot,
-                prev_start=prev_start,
-                committed=min_cc,
-                block_size=block_size,
-            )
-            start = prev_start + min_cc
-            assert int(target_kv.get_seq_length()) == start
-
-            if self.route_ahead_stats is not None:
-                self.route_ahead_stats.commit_step(kept_rows=min_cc)
-
-            for b, cc_b in step_cc.items():
-                self.step_trace.append(
-                    NativeStepTrace(
-                        prev_start=prev_start,
-                        accept=cc_b - 1,
-                        start=start,
-                        emitted_len=len(emitted[b]),
-                        target_cache_len=int(target_kv.get_seq_length()),
-                        draft_cache_len=(
-                            int(draft_kv.get_seq_length())
-                            if draft_kv is not None
-                            else None
-                        ),
-                    )
+            stop_rows = tuple(tuple(row) for row in stop_token_ids_by_row)
+            if len(stop_rows) != batch:
+                raise ValueError(
+                    f"stop_token_ids_by_row has {len(stop_rows)} entries "
+                    f"for batch size {batch}"
                 )
-            if not continuing:
-                break
 
-            suffix = _extract_context_feature(hidden_states, layer_ids).to(
-                self.device
-            )[:, :min_cc, :]
-            if self._drafter_has_kv_cache:
-                context_feature = suffix
-            else:
-                context_feature = torch.cat([context_feature, suffix], dim=1)
+        requests: list[RequestSpec] = []
+        for row in range(batch):
+            row_ids = cohort_input_ids[row][
+                cohort_attention_mask[row].to(dtype=torch.bool)
+            ]
+            requests.append(
+                RequestSpec(
+                    request_id=f"direct-{row}",
+                    prompt_token_ids=tuple(
+                        int(token) for token in row_ids.tolist()
+                    ),
+                    max_new_tokens=budgets[row],
+                    stop_token_ids=frozenset(stop_rows[row]),
+                    sampling=normalized_sampling[row],
+                )
+            )
 
-        self.last_target_cache = target_kv
-        self.last_draft_cache = draft_kv
+        backend = (
+            BatchedRichBackend(self)
+            if callable(getattr(self.moe, "_native_model_forward_rich", None))
+            else BatchedBareHFBackend(self)
+        )
+        run = SessionDriver(
+            [cast(PhysicalCohortBackend, backend)]
+        ).run_physical_cohort(
+            cohort_input_ids,
+            requests=tuple(requests),
+            attention_mask=cohort_attention_mask,
+        )
+        result = run.backend_result
 
-        new_lengths = [min(len(emitted[b]), budgets[b]) for b in range(batch)]
+        self.step_trace = list(result.step_trace)
+        self.last_target_cache = result.target_cache
+        self.last_draft_cache = result.draft_cache
+        self.last_session_results = run.results
+        self.last_session_traces = tuple(row.trace for row in run.results)
+        new_lengths = [len(row.output_token_ids) for row in run.results]
         self.last_generated_lengths = new_lengths
         pad_id = _get(_get(self.target, "config", self.target), "pad_token_id")
         pad_id = 0 if pad_id is None else int(pad_id)
         width = max(new_lengths) if new_lengths else 0
         new_ids = torch.full(
-            (batch, width), pad_id, dtype=torch.long, device=input_ids.device
+            (batch, width),
+            pad_id,
+            dtype=cohort_input_ids.dtype,
+            device=cohort_input_ids.device,
         )
-        for b in range(batch):
-            n = new_lengths[b]
-            if n:
-                new_ids[b, :n] = torch.tensor(
-                    emitted[b][:n], dtype=torch.long, device=input_ids.device
+        for row, driver_result in enumerate(run.results):
+            generated = driver_result.output_token_ids
+            if generated:
+                new_ids[row, : len(generated)] = torch.tensor(
+                    generated,
+                    dtype=cohort_input_ids.dtype,
+                    device=cohort_input_ids.device,
                 )
-        return torch.cat([input_ids, new_ids], dim=1)
+        return torch.cat([cohort_input_ids, new_ids], dim=1).to(
+            input_ids.device
+        )
 
     def run(
         self,
@@ -1783,7 +2096,6 @@ class DFlashSpeculator:
         generated token ids (prompt stripped); the engine wraps them in a
         ``GenerationResult`` and ``MoE.generate`` re-prepends the prompt.
         """
-        del request_id  # protocol-conformance parameter; the loop is stateless
         input_ids = torch.tensor([list(prompt_token_ids)], dtype=torch.long)
         max_new_tokens = int(getattr(sampling_params, "max_tokens", 256))
         eos = getattr(engine, "eos_token_id", None)
@@ -1798,6 +2110,29 @@ class DFlashSpeculator:
         )
         return [int(t) for t in output[0, len(prompt_token_ids) :].tolist()]
 
+    def supports_engine_request(
+        self, sampling_params: SamplingParams, *, batch_size: int
+    ) -> bool:
+        """Return whether the compatibility engine may select DFlash."""
+        if batch_size != 1:
+            return False
+        sampling = SamplingContext(
+            temperature=float(getattr(sampling_params, "temperature", 0.0)),
+            top_k=int(getattr(sampling_params, "top_k", 0) or 0),
+            top_p=float(getattr(sampling_params, "top_p", 1.0)),
+        )
+        if sampling.is_sampled or getattr(sampling_params, "do_sample", False):
+            return False
+        from moe_infinity.spec_decode.backends import DFlashExecutionBackend
+
+        request = RequestSpec(
+            request_id="engine-capability-check",
+            prompt_token_ids=(0,),
+            max_new_tokens=int(getattr(sampling_params, "max_tokens", 256)),
+            sampling=sampling,
+        )
+        return DFlashExecutionBackend(self).supports(request)
+
 
 __all__ = [
     "DFlashConfig",
@@ -1807,6 +2142,8 @@ __all__ = [
     "SpecSession",
     "VerifyResult",
     "bind_shared_weights",
+    "build_pairing_evidence",
+    "executor_wiring_reachable",
     "project_expert_bytes",
     "read_dflash_config",
     "validate_drafter",

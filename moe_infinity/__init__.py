@@ -1,4 +1,9 @@
-__version__ = "0.0.1"
+try:
+    # Generated at build time by setuptools-scm (see pyproject.toml).
+    from ._version import __version__
+except Exception:  # pragma: no cover - source tree built without setuptools-scm
+    __version__ = "0.0.0+unknown"
+
 __all__ = ["MoE", "OffloadEngine", "__version__"]
 
 
