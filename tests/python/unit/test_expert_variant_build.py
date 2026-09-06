@@ -58,16 +58,19 @@ def test_current_is_published_only_after_index_and_manifest_are_durable(
 
 
 def test_publication_order_puts_current_last(tmp_path, monkeypatch):
-    import moe_infinity.runtime.expert_variant_build as build
+    # Patch the globals the class methods actually close over, so the
+    # patches land even if another test dropped or replaced the module's
+    # sys.modules entry.
+    build_ns = DerivativeBuildJournal.publish_attested_generation.__globals__
 
     events = []
-    monkeypatch.setattr(
-        build,
+    monkeypatch.setitem(
+        build_ns,
         "_durable_replace_bytes",
         lambda path, data: events.append(("replace", path.name)),
     )
-    monkeypatch.setattr(
-        build,
+    monkeypatch.setitem(
+        build_ns,
         "_fsync_directory",
         lambda path: events.append(("fsync_dir", path.name)),
     )

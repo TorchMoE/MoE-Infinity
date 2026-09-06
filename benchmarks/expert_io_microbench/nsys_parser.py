@@ -21,6 +21,7 @@ the plan's QA scenario can verify alignment.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -32,6 +33,7 @@ from typing import Any
 NVTX_REPORT = "nvtx_pushpop_sum"
 MEMCPY_REPORT = "cuda_gpu_mem_size_sum"
 GPU_TRACE_REPORT = "cuda_gpu_sum"
+CUDA_API_REPORT = "cuda_api_sum"
 
 REQUIRED_RANGE_NAMES: tuple[str, ...] = (
     "cpu_to_gpu",
@@ -40,6 +42,10 @@ REQUIRED_RANGE_NAMES: tuple[str, ...] = (
     "cuda_stream_sync",
     "expert_compute",
     "expert_wait_barrier",
+    "gpu_route_submit",
+    "gpu_route_handoff",
+    "gpu_route_fallback",
+    "expert_completion_handoff",
 )
 
 PCIE_LANE_GBPS: dict[int, float] = {
@@ -116,6 +122,7 @@ def parse_nsys_report(rep_path: str) -> dict[str, Any]:
     nvtx_rows = _run_nsys_stats(rep_path, NVTX_REPORT)
     memcpy_rows = _run_nsys_stats(rep_path, MEMCPY_REPORT)
     gpu_trace_rows = _run_nsys_stats(rep_path, GPU_TRACE_REPORT)
+    cuda_api_rows = _run_nsys_stats(rep_path, CUDA_API_REPORT)
 
     ranges: dict[str, dict[str, float | int]] = {}
     for r in nvtx_rows:
@@ -172,6 +179,21 @@ def parse_nsys_report(rep_path: str) -> dict[str, Any]:
         elif "Device-to-Device" in name:
             gpu_memcpy_ns["d2d"] = total_ns
 
+    cuda_api = {
+        "stream_synchronize_count": sum(
+            int(row.get("Instances", 0) or row.get("Count", 0) or 0)
+            for row in cuda_api_rows
+            if "cudaStreamSynchronize"
+            in str(row.get("Name") or row.get("Operation") or "")
+        ),
+        "device_synchronize_count": sum(
+            int(row.get("Instances", 0) or row.get("Count", 0) or 0)
+            for row in cuda_api_rows
+            if "cudaDeviceSynchronize"
+            in str(row.get("Name") or row.get("Operation") or "")
+        ),
+    }
+
     duration_ns = 0
     for name, stats in ranges.items():
         duration_ns = max(duration_ns, int(stats["total_ns"]))
@@ -180,6 +202,7 @@ def parse_nsys_report(rep_path: str) -> dict[str, Any]:
         "ranges": ranges,
         "memcpy": memcpy,
         "gpu_memcpy_ns": gpu_memcpy_ns,
+        "cuda_api": cuda_api,
         "duration_ns": duration_ns,
     }
 
@@ -214,11 +237,45 @@ def _apply_criterion(
     return VERDICT_DEFER
 
 
+def gpu_routing_trace_verdict(ranges, cuda_api, profile):
+    if profile is None:
+        return {
+            "decision": "UNAVAILABLE",
+            "reasons": ["profile_json_not_provided"],
+        }
+    routing = profile["routing"]
+    enabled = profile["config"]["gpu_only_expert_routing"] == "on"
+    reasons = []
+    if int(ranges.get("gpu_route_fallback", {}).get("count", 0)) > 0:
+        reasons.append("gpu_route_fallback_present")
+    if int(cuda_api.get("stream_synchronize_count", 0)) > 0:
+        reasons.append("stream_synchronize_present")
+    if int(cuda_api.get("device_synchronize_count", 0)) > 0:
+        reasons.append("device_synchronize_present")
+    if enabled and routing["route_batches"] > 0:
+        if int(ranges.get("gpu_route_handoff", {}).get("count", 0)) == 0:
+            reasons.append("missing_route_handoff")
+        if (
+            int(ranges.get("expert_completion_handoff", {}).get("count", 0))
+            == 0
+        ):
+            reasons.append("missing_completion_handoff")
+    if routing["route_failures"] > 0:
+        reasons.append("native_route_failure")
+    if routing["fallback_count"] > 0:
+        reasons.append("unexpected_eager_fallback")
+    return {
+        "decision": "ROLLBACK" if reasons else "KEEP",
+        "reasons": reasons,
+    }
+
+
 def summarise(
     rep_path: str,
     step_count: int,
     hw: dict[str, Any],
     real_total_ns: int | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report = parse_nsys_report(rep_path)
     ranges = report["ranges"]
@@ -283,7 +340,30 @@ def summarise(
         util_pcie=util_pcie,
     )
 
+    cuda_api = report.get(
+        "cuda_api",
+        {"stream_synchronize_count": 0, "device_synchronize_count": 0},
+    )
+    d2h_count = int(memcpy["d2h_count"])
+    d2h_bytes = int(memcpy["d2h_bytes"])
+    routing_sync = {
+        "gpu_route_submit_ns": _range_total("gpu_route_submit"),
+        "gpu_route_handoff_ns": _range_total("gpu_route_handoff"),
+        "gpu_route_fallback_ns": _range_total("gpu_route_fallback"),
+        "expert_completion_handoff_ns": _range_total(
+            "expert_completion_handoff"
+        ),
+        "device_to_host_memcpy_count": d2h_count,
+        "device_to_host_memcpy_bytes": d2h_bytes,
+        "stream_synchronize_count": int(cuda_api["stream_synchronize_count"]),
+        "device_synchronize_count": int(cuda_api["device_synchronize_count"]),
+    }
+
+    gpu_routing_verdict = gpu_routing_trace_verdict(ranges, cuda_api, profile)
+
     return {
+        "routing_sync": routing_sync,
+        "gpu_routing_verdict": gpu_routing_verdict,
         "T_step_ns": t_step,
         "T_h2d_ns": t_h2d,
         "T_disk_ns": t_disk,
@@ -308,38 +388,36 @@ def summarise(
     }
 
 
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("rep_path")
+    parser.add_argument("--steps", type=int, default=1)
+    parser.add_argument("--link-width", type=int, default=16)
+    parser.add_argument("--link-gen", type=int, default=4)
+    parser.add_argument("--real-total-ns", type=int)
+    parser.add_argument("--profile-json")
+    return parser.parse_args(argv)
+
+
 def _cli() -> int:
-    if len(sys.argv) < 2:
-        print(
-            "usage: nsys_parser.py <rep.nsys-rep> [--steps N] [--link-width W] [--link-gen G] [--real-total-ns N]",
-            file=sys.stderr,
-        )
-        return 2
-    rep = sys.argv[1]
-    steps = 1
-    width = 16
-    gen = 4
-    real_total_ns: int | None = None
-    args = sys.argv[2:]
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--steps":
-            steps = int(args[i + 1])
-            i += 2
-        elif a == "--link-width":
-            width = int(args[i + 1])
-            i += 2
-        elif a == "--link-gen":
-            gen = int(args[i + 1])
-            i += 2
-        elif a == "--real-total-ns":
-            real_total_ns = int(args[i + 1])
-            i += 2
-        else:
-            i += 1
+    args = parse_cli_args()
+    profile = None
+    if args.profile_json is not None:
+        with open(args.profile_json, "r", encoding="utf-8") as handle:
+            profile = json.load(handle)
+        if profile.get("schema_version") != "gpu-routing-decision-profile-v1":
+            print(
+                "profile-json must be gpu-routing-decision-profile-v1, got "
+                f"{profile.get('schema_version')!r}",
+                file=sys.stderr,
+            )
+            return 2
     out = summarise(
-        rep, steps, {"link_width": width, "link_gen": gen}, real_total_ns
+        args.rep_path,
+        args.steps,
+        {"link_width": args.link_width, "link_gen": args.link_gen},
+        args.real_total_ns,
+        profile=profile,
     )
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
