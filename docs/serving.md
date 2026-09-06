@@ -54,6 +54,11 @@ Stable options from `api_server_v2.py`:
 | `--max-waiting-requests` | `0` | Queue depth backpressure threshold; `0` disables |
 | `--max-n` | `16` | Cap for parallel sampling `n` / `best_of` |
 | `--enable-prefix-caching` | off | Enable prefix-cache bookkeeping flag |
+| `--enable-decode-cuda-graphs` | off | Permit decode graph qualification; unsafe runtimes still run eagerly |
+| `--decode-cuda-graph-batch-sizes` | `1 2 4 8 16 32` | Positive capture/replay batch buckets |
+| `--decode-cuda-graph-context-sizes` | `128 256 512 1024 2048 4096` | Positive native-paged context buckets |
+| `--decode-cuda-graph-warmup-iters` | `2` | Warmup iterations before each lazy capture |
+| `--decode-cuda-graph-max-memory-bytes` | `0` | Graph private-pool byte limit; `0` is unlimited |
 | `--startup-timeout` | none | Startup watchdog timeout, seconds |
 | `--decode-step-timeout` | none | Decode watchdog timeout, seconds |
 | `--enable-pyspy-dump` | off | Scaffolded flag; currently accepted and stored, but no py-spy dump is triggered |
@@ -84,6 +89,105 @@ implications as the CLI. Configure `api_key` or `MOE_API_KEYS` before using a
 non-loopback bind on an untrusted network.
 
 `MoE.serve()` accepts the same serving knobs as the CLI for host, port, memory ratios, batch sizing, the prefix-cache feature flag, offload path, and DFlash drafter setup. The flag currently enables scaffolding only; it does not activate request-path reuse.
+
+## Decode CUDA graphs (experimental, opt-in)
+
+Decode CUDA graphs are disabled by default. Enabling the flag permits the
+runtime to evaluate graph safety; it does not override any safety rejection.
+The first rollout is deliberately limited to CUDA-resident models using the
+native paged-attention backend and exact ordinary-GQA
+`moe_infinity.models.qwen3_paged_attention.Qwen3PagedAttention` layers.
+
+An eligible batch must be pure single-token decode, fit a configured batch and
+context bucket, and have an explicit `eligible` runtime capability. The
+scheduler cache and native backend must share one `PagedKVStorage` object,
+allocator, owner ID, block count, and per-layer tensor pointers. Storage,
+`ModelRunner`, every graph buffer, and the stable output must resolve to the
+same indexed CUDA device. Every Qwen3 layer must have a unique in-range integer
+`layer_idx`; registration creates a distinct layer-bound subclass and requires
+an allocation-free `paged_kv_write_` proof that writes the current token to the
+authoritative `slot_mapping` before attention reads that layer's cache.
+
+The following always execute eagerly:
+
+- prefill, mixed unsupported execution, and speculative verification;
+- sampling and request callbacks (sampling is never captured);
+- non-paged models (`native_paged_required`);
+- FlashInfer planning/run paths (`flashinfer_plan_path`);
+- exact `DeepseekV2PagedAttention` and `DeepseekV3PagedAttention` MLA classes
+  (`mla_layout_unsupported`);
+- active model hooks, Archer begin/end callbacks, transfer schedulers, expert
+  dispatch, expert/KV offload, or dynamic allocation paths;
+- mismatched storage ownership/device, unknown paged classes, invalid
+  `layer_idx`, or incomplete per-layer write proofs;
+- batches outside configured buckets, capture failures, and quarantined keys.
+
+Graph keys are `(batch_bucket, context_bucket)`. Real rows retain scheduler
+order and current sequence metadata. Padding rows are compute-only and use
+unique scratch pages reserved from the same authoritative allocator; they do
+not enter scheduler accounting, sampling, callbacks, or token counts. Capture
+is lazy and may increase the first eligible step's latency. Denser bucket sets
+reduce padding but consume more graph private-pool memory and scratch KV
+capacity.
+
+Reload invalidates graph states before Python modules reload. Hot replacement
+waits for the active engine step and closes the old graph runner before
+returning. Application shutdown stops and awaits the engine task before closing
+the current runner. The sole lock order is application
+`_engine_lifecycle_lock` → engine step ownership → `CudaGraphRunner._lock`;
+shutdown never awaits a task while holding these locks. Close is idempotent and
+returns scratch blocks to the authoritative allocator.
+
+### Monitoring and rollback
+
+`/admin/stats` reports `capability_safe`, bounded `capability_reason`, storage
+owner ID, registered/proved layer counts, captures, replays, failures, replay
+fallbacks, graph private-pool bytes, and scratch KV bytes. Prometheus exports:
+
+- `moe_cuda_graph_captures_total`
+- `moe_cuda_graph_replays_total`
+- `moe_cuda_graph_capture_failures_total`
+- `moe_cuda_graph_instances`
+- `moe_cuda_graph_pool_bytes`
+- `moe_cuda_graph_scratch_kv_bytes`
+- `moe_cuda_graph_fallback_total{reason="..."}` over the fixed reason set
+
+Never use request IDs, model IDs, graph keys, exception text, owner IDs, or
+class names as metric labels.
+
+Emergency rollback is immediate: set `MOE_DISABLE_CUDA_GRAPHS=1`. The gate
+reads it for every batch, so replays stop without process restart. Confirm that
+the replay counter stops and the eager fallback counter increases. Call
+`engine.invalidate_cuda_graphs("operator_rollback")` to discard captured states,
+or restart without the enable flag when graph memory must be reclaimed
+immediately. `shutdown()` is reserved for replacement or process shutdown and
+also releases scratch reservations.
+
+### Staged rollout
+
+1. **Shadow qualification:** keep production disabled. Require exact
+   ordinary-GQA Qwen3, `capability_reason=eligible`, complete
+   `(class_fqn, layer_idx, writer)` proof coverage, allocator/backend identity,
+   exact device equality, per-layer persistence, two-step CUDA equivalence,
+   cleanup tests, and paired fixture/model evidence for each
+   model/GPU/dtype/bucket set.
+2. **Canary:** enable one resident native-paged replica. Alert on any capture
+   failure, post-capture non-`eligible` capability, request error, owner
+   mismatch, memory-budget breach, or replay coverage below the workload
+   target.
+3. **Limited rollout:** expand only while output parity stays clean, old-engine
+   scratch returns after replacement/shutdown, and observed p50/p99 ITL,
+   throughput, memory, and concurrency remain acceptable.
+4. **General opt-in:** retain a kill switch and per-model allowlist. DeepSeek
+   MLA, non-paged, FlashInfer, and offloaded MoE remain unsupported regardless
+   of benchmark results.
+5. **Rollback:** set `MOE_DISABLE_CUDA_GRAPHS=1`, verify counters, then restart
+   without the enable flag if immediate memory reclamation is required.
+
+This feature makes no speedup guarantee. Its utility boundary is resident,
+native-paged ordinary-GQA Qwen3 with complete write proofs. Supporting
+offloaded MoE requires a separate piecewise design with explicit eager
+attention, routing, dispatch, and transfer boundaries.
 
 ## Request Fields and Streaming
 

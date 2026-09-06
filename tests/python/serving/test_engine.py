@@ -3,7 +3,9 @@ import sys
 import types
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, Union
+from unittest.mock import Mock
 
 import torch
 
@@ -66,9 +68,18 @@ _ = _load_module(
     ROOT / "moe_infinity" / "serving" / "engine.py",
 )
 
+from moe_infinity.runtime.attention_types import (  # type: ignore[reportMissingImports]
+    DecodeGraphCapability,
+)
+from moe_infinity.serving.batch import (  # type: ignore[reportMissingImports]
+    BatchMetadata,
+)
 from moe_infinity.serving.engine import (  # type: ignore[reportMissingImports]
     ContinuousBatchingEngine,
     RequestOutput,
+)
+from moe_infinity.serving.sampler import (  # type: ignore[reportMissingImports]
+    SamplerOutput,
 )
 from moe_infinity.serving.sequence import (  # type: ignore[reportMissingImports]
     SamplingParams,
@@ -213,6 +224,46 @@ def _make_engine(
         config=_make_config(),
         tokenizer=tokenizer,
     )
+
+
+def test_shutdown_closes_cuda_graph_runner_once() -> None:
+    engine = _make_engine()
+    graph_runner = Mock()
+    engine.cuda_graph_runner = graph_runner
+
+    engine.shutdown()
+    engine.shutdown()
+
+    graph_runner.close.assert_called_once_with()
+
+
+def test_stats_include_bounded_cuda_graph_and_memory_usage() -> None:
+    engine = _make_engine()
+
+    stats = engine.get_stats()
+
+    cuda_graph = stats["cuda_graph"]
+    memory = stats["memory"]
+    assert isinstance(cuda_graph, dict)
+    assert isinstance(memory, dict)
+    assert cuda_graph["capability_reason"] == "missing_capability"
+    assert cuda_graph["capability_safe"] is False
+    assert cuda_graph["registered_paged_layers"] == 0
+    assert cuda_graph["proved_write_layers"] == 0
+    assert memory["cuda_graph_total_bytes"] == 0
+
+
+def test_engine_forwards_explicit_decode_graph_capability_provider() -> None:
+    provider = object()
+
+    engine = ContinuousBatchingEngine(
+        model=MockModel(),
+        engine=MockOffloadEngine(),
+        config=_make_config(),
+        decode_graph_capability_provider=provider,
+    )
+
+    assert engine.model_runner.decode_graph_capability_provider is provider
 
 
 def test_engine_single_request_run_until_done() -> None:
@@ -483,3 +534,159 @@ def test_engine_n_finished_when_all_complete() -> None:
     )
     assert engine.has_pending_requests() is True
     assert "req-n" not in engine._completed_request_ids
+
+
+def _decode_batch_for_engine(
+    token_ids: list[int],
+    *,
+    context_length: int = 3,
+) -> BatchMetadata:
+    count = len(token_ids)
+    return BatchMetadata(
+        seq_ids=list(range(count)),
+        input_token_ids=list(token_ids),
+        seq_lengths=[1] * count,
+        context_lengths=[context_length] * count,
+        is_prefill=[False] * count,
+        block_tables=[[0] for _ in range(count)],
+        token_offsets=list(range(count + 1)),
+        sampling_params=[
+            SamplingParams(temperature=0.0, max_tokens=8) for _ in range(count)
+        ],
+    )
+
+
+def _mixed_batch_for_engine() -> BatchMetadata:
+    return BatchMetadata(
+        seq_ids=[0, 1, 2, 3],
+        input_token_ids=[10, 20, 11, 21],
+        seq_lengths=[1, 1, 1, 1],
+        context_lengths=[0, 3, 0, 3],
+        is_prefill=[True, False, True, False],
+        block_tables=[[0], [0], [0], [0]],
+        token_offsets=[0, 1, 2, 3, 4],
+        sampling_params=[
+            SamplingParams(temperature=0.0, max_tokens=8) for _ in range(4)
+        ],
+    )
+
+
+def _make_graph_safe_native_paged_engine() -> ContinuousBatchingEngine:
+    return _make_engine()
+
+
+def _make_paged_engine() -> ContinuousBatchingEngine:
+    engine = _make_engine()
+    engine.paged_attention_registry = SimpleNamespace(bindings=[object()])
+    return engine
+
+
+def _make_resident_non_paged_engine(
+    *, enable_decode_cuda_graphs: bool
+) -> ContinuousBatchingEngine:
+    config = _make_config()
+    config["enable_decode_cuda_graphs"] = enable_decode_cuda_graphs
+    offload_engine = MockOffloadEngine()
+    offload_engine.decode_graph_capability = lambda: DecodeGraphCapability(
+        True, "eligible"
+    )
+    engine = ContinuousBatchingEngine(
+        model=MockModel(),
+        engine=offload_engine,
+        config=config,
+    )
+    engine.cuda_graph_runner._cuda_ops = SimpleNamespace(
+        available=True,
+        memory_allocated=lambda device: 0,
+    )
+    return engine
+
+
+def _install_three_decode_sequences(engine: ContinuousBatchingEngine) -> None:
+    for index in range(3):
+        engine.add_request(
+            request_id=f"req-{index}",
+            prompt_token_ids=[10 + index],
+            sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+        )
+    saved_sample = engine.sampler.sample
+    engine.sampler.sample = Mock(
+        return_value=SamplerOutput(torch.tensor([50, 51, 52]))
+    )
+    engine.step()
+    engine.sampler.sample = saved_sample
+
+
+def test_pure_decode_uses_graph_logits_before_existing_sampler() -> None:
+    engine = _make_graph_safe_native_paged_engine()
+    graph_logits = torch.zeros(2, 100)
+    graph_logits[:, 41] = 1.0
+    engine.cuda_graph_runner = SimpleNamespace(
+        try_execute=Mock(return_value=graph_logits),
+        stats=Mock(return_value={}),
+    )
+    batch = _decode_batch_for_engine([10, 11])
+
+    logits = engine._execute_batch(batch)
+
+    torch.testing.assert_close(logits, graph_logits)
+    engine.cuda_graph_runner.try_execute.assert_called_once_with(batch)
+
+
+def test_graph_miss_runs_exact_same_decode_batch_eagerly() -> None:
+    engine = _make_graph_safe_native_paged_engine()
+    engine.cuda_graph_runner = SimpleNamespace(
+        try_execute=Mock(return_value=None)
+    )
+    engine.model_runner.execute = Mock(return_value=torch.ones(2, 100))
+    batch = _decode_batch_for_engine([10, 11])
+
+    result = engine._execute_batch(batch)
+
+    engine.model_runner.execute.assert_called_once_with(batch)
+    assert result.shape == (2, 100)
+
+
+def test_mixed_batch_graphs_decode_partition_and_recombines_order() -> None:
+    engine = _make_paged_engine()
+    batch = _mixed_batch_for_engine()
+    engine.model_runner.execute = Mock(
+        return_value=torch.tensor([[10.0], [11.0]])
+    )
+    engine.cuda_graph_runner.try_execute = Mock(
+        return_value=torch.tensor([[20.0], [21.0]])
+    )
+
+    result = engine._execute_batch(batch)
+
+    assert result.tolist() == [[10.0], [20.0], [11.0], [21.0]]
+
+
+def test_sampler_receives_only_real_rows_from_padded_graph() -> None:
+    engine = _make_graph_safe_native_paged_engine()
+    engine.cuda_graph_runner.try_execute = Mock(
+        return_value=torch.zeros(3, 100)
+    )
+    engine.sampler.sample = Mock(
+        return_value=SamplerOutput(torch.tensor([1, 2, 3]))
+    )
+    _install_three_decode_sequences(engine)
+
+    engine.step()
+
+    sampled_logits = engine.sampler.sample.call_args.args[0]
+    assert sampled_logits.shape == (3, 100)
+
+
+def test_non_paged_decode_is_always_eager() -> None:
+    engine = _make_resident_non_paged_engine(enable_decode_cuda_graphs=True)
+    engine.model_runner.execute = Mock(return_value=torch.ones(2, 100))
+    result = engine._execute_batch(_decode_batch_for_engine([10, 11]))
+    assert result.shape == (2, 100)
+    assert engine.cuda_graph_runner.stats()["captures"] == 0
+    assert (
+        engine.cuda_graph_runner.stats()["fallback_reasons"][
+            "native_paged_required"
+        ]
+        == 1
+    )

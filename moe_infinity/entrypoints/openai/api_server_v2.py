@@ -9,7 +9,7 @@ import os
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
-from threading import Event, Lock
+from threading import Event, Lock, RLock
 from types import SimpleNamespace
 from typing import Any, Literal, Optional, cast
 
@@ -87,6 +87,7 @@ except Exception:
     uvicorn = SimpleNamespace(run=lambda *args, **kwargs: None)
 
 import moe_infinity.serving.watchdog as watchdog_module
+from moe_infinity.serving.cuda_graph import FALLBACK_REASONS
 from moe_infinity.serving.engine import ContinuousBatchingEngine, RequestOutput
 from moe_infinity.serving.health import ServerHealthState
 from moe_infinity.serving.sequence import SamplingParams
@@ -128,6 +129,7 @@ runtime_max_seq_length: int = 4096
 
 _engine_task: Optional[asyncio.Task[None]] = None
 _engine_shutdown_event: Optional[asyncio.Event] = None
+_engine_lifecycle_lock = RLock()
 _model_init_task: Optional[asyncio.Task[None]] = None
 _startup_args: Optional[argparse.Namespace] = None
 _health_state = ServerHealthState()
@@ -483,6 +485,18 @@ def initialize_with_model(
     max_batch_size: int = 32,
     enable_prefix_caching: bool = False,
     speculative_draft: Optional[Any] = None,
+    enable_decode_cuda_graphs: bool = False,
+    decode_cuda_graph_batch_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+    decode_cuda_graph_context_sizes: tuple[int, ...] = (
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+    ),
+    decode_cuda_graph_warmup_iters: int = 2,
+    decode_cuda_graph_max_memory_bytes: int = 0,
     enable_deepseek_mla_paging: bool = False,
     max_resident_paged_speculative_sessions: int = 1,
     min_free_mla_blocks_after_admission: int = 1,
@@ -505,6 +519,11 @@ def initialize_with_model(
         kv_cache_ratio=kv_cache_ratio,
         max_batch_size=max_batch_size,
         enable_prefix_caching=enable_prefix_caching,
+        enable_decode_cuda_graphs=enable_decode_cuda_graphs,
+        decode_cuda_graph_batch_sizes=decode_cuda_graph_batch_sizes,
+        decode_cuda_graph_context_sizes=decode_cuda_graph_context_sizes,
+        decode_cuda_graph_warmup_iters=decode_cuda_graph_warmup_iters,
+        decode_cuda_graph_max_memory_bytes=decode_cuda_graph_max_memory_bytes,
         enable_deepseek_mla_paging=enable_deepseek_mla_paging,
         max_resident_paged_speculative_sessions=(
             max_resident_paged_speculative_sessions
@@ -529,6 +548,7 @@ def initialize_with_model(
         config=engine_config,
         tokenizer=tokenizer,
         speculative_draft=speculative_draft,
+        decode_graph_capability_provider=moe_model,
     )
     if stream_manager is None:
         stream_manager = StreamManager()
@@ -752,6 +772,44 @@ def _format_prometheus_metrics(stats: dict[str, object]) -> str:
     lines.append("# HELP moe_engine_steps_total Total engine steps")
     lines.append("# TYPE moe_engine_steps_total counter")
     lines.append(f"moe_engine_steps_total {stats.get('num_steps', 0)}")
+    cuda_graph = stats.get("cuda_graph", {})
+    graph_stats = (
+        cast(dict[str, object], cuda_graph)
+        if isinstance(cuda_graph, dict)
+        else {}
+    )
+    graph_metrics = (
+        ("moe_cuda_graph_captures_total", "captures", "counter"),
+        ("moe_cuda_graph_replays_total", "replays", "counter"),
+        (
+            "moe_cuda_graph_capture_failures_total",
+            "capture_failures",
+            "counter",
+        ),
+        ("moe_cuda_graph_instances", "graphs", "gauge"),
+        ("moe_cuda_graph_pool_bytes", "graph_pool_bytes", "gauge"),
+        (
+            "moe_cuda_graph_scratch_kv_bytes",
+            "scratch_kv_bytes",
+            "gauge",
+        ),
+    )
+    for metric_name, stats_key, metric_type in graph_metrics:
+        lines.append(f"# TYPE {metric_name} {metric_type}")
+        lines.append(f"{metric_name} {graph_stats.get(stats_key, 0)}")
+
+    fallback_value = graph_stats.get("fallback_reasons", {})
+    fallback_reasons = (
+        cast(dict[str, object], fallback_value)
+        if isinstance(fallback_value, dict)
+        else {}
+    )
+    lines.append("# TYPE moe_cuda_graph_fallback_total counter")
+    for reason in FALLBACK_REASONS:
+        count = fallback_reasons.get(reason, 0)
+        lines.append(
+            f'moe_cuda_graph_fallback_total{{reason="{reason}"}} {count}'
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -990,21 +1048,46 @@ async def _chat_event_generator(
             return
 
 
+def _run_engine_step_once() -> None:
+    with _engine_lifecycle_lock:
+        current_engine = engine
+        if current_engine is not None:
+            _ = current_engine.step()
+
+
+def _replace_engine(new_engine: ContinuousBatchingEngine) -> None:
+    global engine
+    with _engine_lifecycle_lock:
+        old_engine = engine
+        engine = new_engine
+        if old_engine is not None and old_engine is not new_engine:
+            old_engine.shutdown()
+
+
 async def _engine_loop() -> None:
     while (
         _engine_shutdown_event is not None
         and not _engine_shutdown_event.is_set()
     ):
-        if engine is None:
+        with _engine_lifecycle_lock:
+            current_engine = engine
+        if current_engine is None:
             await asyncio.sleep(0.01)
             continue
 
-        if engine.has_pending_requests():
-            if _decode_watchdog is not None:
-                _decode_watchdog.activate()
-            _ = engine.step()
-            if _decode_watchdog is not None:
-                _decode_watchdog.feed()
+        with _engine_lifecycle_lock:
+            current_engine = engine
+            has_pending_requests = (
+                current_engine is not None
+                and current_engine.has_pending_requests()
+            )
+            if has_pending_requests:
+                if _decode_watchdog is not None:
+                    _decode_watchdog.activate()
+                _ = current_engine.step()
+                if _decode_watchdog is not None:
+                    _decode_watchdog.feed()
+        if has_pending_requests:
             await asyncio.sleep(0)
             continue
 
@@ -1117,11 +1200,12 @@ async def _initialize_model() -> None:
             config=engine_config,
             tokenizer=tokenizer,
             speculative_draft=speculative_draft,
+            decode_graph_capability_provider=moe_model,
         )
         if stream_manager is None:
             stream_manager = StreamManager()
 
-        engine = initialized_engine
+        _replace_engine(initialized_engine)
         configured_max_seq_length = engine_config.get("max_seq_length")
         if isinstance(configured_max_seq_length, int):
             runtime_max_seq_length = configured_max_seq_length
@@ -1192,10 +1276,10 @@ async def shutdown_event() -> None:
         _decode_watchdog.join(timeout=1.0)
         _decode_watchdog = None
 
-    if engine is not None:
-        shutdown_fn = getattr(engine, "shutdown", None)
-        if callable(shutdown_fn):
-            shutdown_fn()
+    with _engine_lifecycle_lock:
+        current_engine = engine
+        if current_engine is not None:
+            current_engine.shutdown()
 
 
 @app.get("/health")
@@ -1742,13 +1826,17 @@ async def reload_modules(payload: dict[str, Any]) -> JSONResponse:
         )
     reloaded = []
     errors = []
-    for module_name in modules:
-        try:
-            mod = importlib.import_module(module_name)
-            importlib.reload(mod)
-            reloaded.append(module_name)
-        except Exception as e:
-            errors.append({"module": module_name, "error": str(e)})
+    with _engine_lifecycle_lock:
+        current_engine = engine
+        if current_engine is not None:
+            current_engine.invalidate_cuda_graphs("module_reload")
+        for module_name in modules:
+            try:
+                mod = importlib.import_module(module_name)
+                importlib.reload(mod)
+                reloaded.append(module_name)
+            except Exception as e:
+                errors.append({"module": module_name, "error": str(e)})
     status = "ok" if not errors else "partial"
     return JSONResponse(
         content={"status": status, "reloaded": reloaded, "errors": errors}
@@ -1883,6 +1971,29 @@ def _build_engine_config(
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
         "dtype": _resolve_dtype(model),
+        "enable_decode_cuda_graphs": bool(
+            getattr(args, "enable_decode_cuda_graphs", False)
+        ),
+        "decode_cuda_graph_batch_sizes": tuple(
+            getattr(
+                args,
+                "decode_cuda_graph_batch_sizes",
+                (1, 2, 4, 8, 16, 32),
+            )
+        ),
+        "decode_cuda_graph_context_sizes": tuple(
+            getattr(
+                args,
+                "decode_cuda_graph_context_sizes",
+                (128, 256, 512, 1024, 2048, 4096),
+            )
+        ),
+        "decode_cuda_graph_warmup_iters": getattr(
+            args, "decode_cuda_graph_warmup_iters", 2
+        ),
+        "decode_cuda_graph_max_memory_bytes": getattr(
+            args, "decode_cuda_graph_max_memory_bytes", 0
+        ),
         "enable_deepseek_mla_paging": bool(
             getattr(args, "enable_deepseek_mla_paging", False)
         ),
@@ -1944,6 +2055,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-waiting-requests", type=int, default=0)
     parser.add_argument("--max-n", type=int, default=16)
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument(
+        "--enable-decode-cuda-graphs",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--decode-cuda-graph-batch-sizes",
+        nargs="+",
+        type=int,
+        default=[1, 2, 4, 8, 16, 32],
+    )
+    parser.add_argument(
+        "--decode-cuda-graph-context-sizes",
+        nargs="+",
+        type=int,
+        default=[128, 256, 512, 1024, 2048, 4096],
+    )
+    parser.add_argument(
+        "--decode-cuda-graph-warmup-iters",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--decode-cuda-graph-max-memory-bytes",
+        type=int,
+        default=0,
+    )
     parser.add_argument(
         "--startup-timeout",
         type=float,

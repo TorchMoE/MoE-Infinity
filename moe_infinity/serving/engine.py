@@ -8,12 +8,16 @@ from typing import Callable, Optional, Protocol, cast
 
 import torch
 
+from moe_infinity.runtime.attention_backend import PagedAttentionBackend
+from moe_infinity.runtime.attention_types import DECODE_GRAPH_REASONS
+
 from .batch import (
     BatchBuilder,
     BatchMetadata,
     _slice_batch,
     split_prefill_decode_batch,
 )
+from .cuda_graph import CudaGraphRunner
 from .kv_cache import PagedKVCache
 from .memory_manager import MemoryManager
 from .model_runner import ModelRunner
@@ -123,6 +127,7 @@ class ContinuousBatchingEngine:
         config: dict[str, object],
         tokenizer: Optional[object] = None,
         speculative_draft: SpeculativeGenerator | None = None,
+        decode_graph_capability_provider: object = None,
     ) -> None:
         self.model = model
         self.engine = engine
@@ -154,6 +159,7 @@ class ContinuousBatchingEngine:
             head_dim=head_dim,
         )
 
+        backend_storage = self._resolve_backend_storage(engine)
         self.kv_cache = PagedKVCache(
             num_blocks=num_blocks,
             block_size=block_size,
@@ -162,6 +168,7 @@ class ContinuousBatchingEngine:
             head_dim=head_dim,
             dtype=self.dtype,
             device=self.device,
+            storage=backend_storage,
         )
         self.scheduler = Scheduler(
             self.kv_cache,
@@ -182,7 +189,48 @@ class ContinuousBatchingEngine:
                 "verify_expert_byte_deficit_cap"
             ),
         )
-        self.model_runner = ModelRunner(model, engine, device=self.device)
+        from moe_infinity.models.paged_attention_registry import (
+            PagedAttentionLayerRegistry,
+        )
+
+        storage = self.kv_cache.storage
+        backend = backend_storage and self._resolve_attention_backend(engine)
+        if storage is None:
+            self.paged_attention_registry = PagedAttentionLayerRegistry.empty(
+                reason="native_paged_required"
+            )
+        else:
+            self.paged_attention_registry = (
+                PagedAttentionLayerRegistry.register(
+                    model=model, backend=backend, storage=storage
+                )
+            )
+        self.model_runner = ModelRunner(
+            model,
+            engine,
+            device=self.device,
+            paged_kv_storage=storage,
+            paged_attention_registry=self.paged_attention_registry,
+            decode_graph_capability_provider=decode_graph_capability_provider,
+        )
+        self.cuda_graph_runner = CudaGraphRunner(
+            self.model_runner,
+            storage,
+            enabled=self._get_bool_config("enable_decode_cuda_graphs", False),
+            batch_buckets=self._get_int_tuple_config(
+                "decode_cuda_graph_batch_sizes", (1, 2, 4, 8, 16, 32)
+            ),
+            context_buckets=self._get_int_tuple_config(
+                "decode_cuda_graph_context_sizes",
+                (128, 256, 512, 1024, 2048, 4096),
+            ),
+            warmup_iters=self._get_int_config(
+                "decode_cuda_graph_warmup_iters", 2
+            ),
+            max_graph_memory_bytes=self._get_int_config(
+                "decode_cuda_graph_max_memory_bytes", 0
+            ),
+        )
         self.sampler = Sampler()
         self.batch_builder = BatchBuilder()
         self.speculative_draft = speculative_draft
@@ -220,6 +268,7 @@ class ContinuousBatchingEngine:
         )
 
         self._next_seq_id = 0
+        self._shutdown = False
         self._sequences: dict[int, SequenceData] = {}
         self._sequence_to_request_id: dict[int, str] = {}
         self._request_to_seq_ids: dict[str, list[int]] = {}
@@ -1065,10 +1114,75 @@ class ContinuousBatchingEngine:
     def has_pending_requests(self) -> bool:
         return bool(self._pending_request_ids())
 
+    def invalidate_cuda_graphs(self, reason: str) -> None:
+        self.cuda_graph_runner.invalidate(reason)
+
+    def shutdown(self) -> None:
+        if self._shutdown:
+            return
+        self.cuda_graph_runner.close()
+        self._shutdown = True
+
     def get_stats(self) -> dict[str, object]:
         status_counts = {status.value: 0 for status in SequenceStatus}
         for sequence in self._sequences.values():
             status_counts[sequence.status.value] += 1
+
+        graph_runner = getattr(self, "cuda_graph_runner", None)
+        cuda_graph_stats = graph_runner.stats() if graph_runner else {}
+        storage = getattr(self.kv_cache, "storage", None)
+        scratch_kv_bytes = 0
+        if storage is not None:
+            scratch_kv_bytes = (
+                storage.num_graph_scratch_blocks
+                * storage.spec.block_size
+                * storage.spec.num_layers
+                * 2
+                * storage.spec.num_kv_heads
+                * storage.spec.head_dim
+                * torch.empty((), dtype=storage.spec.dtype).element_size()
+            )
+        graph_pool_bytes = int(cuda_graph_stats.get("graph_pool_bytes", 0))
+        set_graph_usage = getattr(
+            self.memory_manager, "set_cuda_graph_usage", None
+        )
+        if callable(set_graph_usage):
+            set_graph_usage(
+                graph_pool_bytes=graph_pool_bytes,
+                scratch_kv_bytes=scratch_kv_bytes,
+            )
+
+        capability_fn = getattr(
+            getattr(self, "model_runner", None),
+            "decode_graph_capability",
+            None,
+        )
+        capability = capability_fn() if callable(capability_fn) else None
+        registry = getattr(self, "paged_attention_registry", None)
+        if capability is not None and registry is not None:
+            capability_reason = (
+                capability.reason
+                if capability.reason in DECODE_GRAPH_REASONS
+                else "missing_capability"
+            )
+            bindings = tuple(registry.bindings)
+            proved_write_layers = sum(
+                1 for binding in bindings if binding.has_write_proof
+            )
+            cuda_graph_stats.update(
+                {
+                    "scratch_kv_bytes": scratch_kv_bytes,
+                    "kv_storage_owner_id": (
+                        storage.owner_id if storage is not None else None
+                    ),
+                    "capability_safe": (
+                        capability.safe and capability_reason == "eligible"
+                    ),
+                    "capability_reason": capability_reason,
+                    "registered_paged_layers": len(bindings),
+                    "proved_write_layers": proved_write_layers,
+                }
+            )
 
         return {
             "pending_requests": len(self._pending_request_ids()),
@@ -1095,6 +1209,7 @@ class ContinuousBatchingEngine:
                 else None
             ),
             "memory": self.memory_manager.report(),
+            "cuda_graph": cuda_graph_stats,
         }
 
     def get_request_failure(self, request_id: str) -> dict[str, str]:
@@ -1161,19 +1276,14 @@ class ContinuousBatchingEngine:
     def _execute_batch(self, batch: BatchMetadata) -> torch.Tensor:
         has_prefill = any(batch.is_prefill)
         has_decode = any(not p for p in batch.is_prefill)
-        paged_classes_getter = getattr(
-            self.model_runner,
-            "_get_paged_attention_classes",
-            None,
-        )
-        paged_classes: list[object] = []
-        if callable(paged_classes_getter):
-            maybe_paged_classes: object = paged_classes_getter()
-            if isinstance(maybe_paged_classes, list):
-                paged_classes = cast(list[object], maybe_paged_classes)
-        uses_paged = bool(paged_classes)
+        uses_paged = bool(self.paged_attention_registry.bindings)
 
-        if not uses_paged or not (has_prefill and has_decode):
+        if not (has_prefill and has_decode):
+            if has_decode and not has_prefill:
+                return self._execute_decode_batch(batch)
+            return self.model_runner.execute(batch)
+
+        if not uses_paged:
             return self.model_runner.execute(batch)
 
         split = split_prefill_decode_batch(batch)
@@ -1182,8 +1292,14 @@ class ContinuousBatchingEngine:
         if split.prefill_batch is not None:
             prefill_logits = self.model_runner.execute(split.prefill_batch)
         if split.decode_batch is not None:
-            decode_logits = self.model_runner.execute(split.decode_batch)
+            decode_logits = self._execute_decode_batch(split.decode_batch)
         return split.recombine_outputs(prefill_logits, decode_logits)
+
+    def _execute_decode_batch(self, batch: BatchMetadata) -> torch.Tensor:
+        graph_logits = self.cuda_graph_runner.try_execute(batch)
+        if graph_logits is not None:
+            return graph_logits
+        return self.model_runner.execute(batch)
 
     @staticmethod
     def _extract_last_token_logits(
@@ -1377,6 +1493,30 @@ class ContinuousBatchingEngine:
         return torch.device("cpu")
 
     @staticmethod
+    def _resolve_attention_backend(engine: object) -> object | None:
+        getter = getattr(engine, "get_attention_backend", None)
+        if callable(getter):
+            backend = getter()
+            if backend is not None:
+                return backend
+        for attr_name in (
+            "attention_backend",
+            "_attention_backend",
+            "_native_attention_backend",
+        ):
+            backend = getattr(engine, attr_name, None)
+            if backend is not None:
+                return backend
+        return None
+
+    @classmethod
+    def _resolve_backend_storage(cls, engine: object) -> object | None:
+        backend = cls._resolve_attention_backend(engine)
+        if not isinstance(backend, PagedAttentionBackend):
+            return None
+        return backend.storage
+
+    @staticmethod
     def _resolve_model_memory_bytes(model: object) -> int:
         get_memory_footprint = getattr(model, "get_memory_footprint", None)
         if callable(get_memory_footprint):
@@ -1441,6 +1581,29 @@ class ContinuousBatchingEngine:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"{key} must be an integer value")
         return value
+
+    def _get_bool_config(self, key: str, default: bool) -> bool:
+        value = self.config.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a boolean value")
+        return value
+
+    def _get_int_tuple_config(
+        self, key: str, default: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        if key not in self.config:
+            return default
+        value = self.config[key]
+        if isinstance(value, (str, bytes)) or not isinstance(
+            value, (list, tuple)
+        ):
+            raise ValueError(f"{key} must be a sequence of integers")
+        result: list[int] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError(f"{key} must contain only integers")
+            result.append(item)
+        return tuple(result)
 
 
 __all__ = [

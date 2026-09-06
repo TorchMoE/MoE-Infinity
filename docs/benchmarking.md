@@ -148,6 +148,62 @@ print(f"Decode throughput:           {streamer.decoding_iterations / streamer.de
 | Performance model and roofline | `benchmarks/performance_model/bench_glm.py`<br>`benchmarks/performance_model/report_glm.py` | Tiny GLM decode versus MTP validation and roofline report generation. | CUDA GPU, `MOE_GLM_TINY=1`, `matplotlib`, `numpy`, conference plot helper. | Decode tok/s, MTP tok/s, mean accept length, peak memory, arithmetic intensity, predicted bound, markdown report and plots. | Contributor-only, experimental. Helper modules are excluded below. |
 | Kernel microbenchmarks | `benchmarks/ab_fused_kernels.py`<br>`benchmarks/ab_kernels_micro.py`<br>`benchmarks/bench_p0_topk_softmax.py`<br>`benchmarks/mxfp4_benchmark.py` | Fused kernels on or off, kernel-only A/B, gating softmax microbench, and MXFP4 versus BF16 dequant. | CUDA GPU, optional `sglang-kernel`, optional FlashInfer, optional Triton or SM120 support depending on the script. | Median, p10, p90, p99 microseconds, speedups, correctness checks, TTFT, per-token latency, peak GPU memory, expert weight size. | Contributor-only, experimental. Do not treat these as production SLA numbers. |
 | Evaluation utility | `benchmarks/eval/perplexity.py` | Perplexity evaluation over Wikitext, C4, or PTB. | CUDA GPU, `datasets`, `transformers`, offload dir, local model cache. | Perplexity, NLL, sample count, elapsed seconds. | Contributor-only utility, useful for model checks, not serving validation. |
+| Decode CUDA graph qualification | `benchmarks/serving/decode_cuda_graph.py` | Paired eager/replay launch-overhead and correctness qualification. | CUDA; native paged-attention kernel for fixture mode. Model mode additionally requires a checkpoint and offload directory. | Raw microseconds, p50/p90/p99, observed ratio, launch counts, replay coverage, graph/scratch bytes, capability evidence, and per-layer KV checksums. | Contributor-only, experimental; no speedup pass threshold. |
+
+## Decode CUDA graph qualification
+
+Use fixture mode to qualify the formally defined persistent two-layer resident
+ordinary-GQA Qwen3 model. It constructs exact `Qwen3PagedAttention` layers, one
+native `PagedAttentionBackend`, and one `PagedKVStorage` shared by scheduler
+allocation, per-layer K/V tensors, graph scratch, and replay. It needs neither a
+checkpoint nor an offload directory:
+
+```bash
+python benchmarks/serving/decode_cuda_graph.py \
+  --mode fixture \
+  --batch-sizes 1 2 4 \
+  --context-sizes 128 512 \
+  --warmup-iters 5 \
+  --measure-iters 20 \
+  --profile-launches \
+  --output-json /tmp/decode-cuda-graph-fixture.json
+```
+
+Model mode requires both loader arguments:
+
+```bash
+python benchmarks/serving/decode_cuda_graph.py \
+  --mode model \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /tmp/moe-offload \
+  --batch-sizes 1 \
+  --context-sizes 128 \
+  --warmup-iters 1 \
+  --measure-iters 2 \
+  --output-json /tmp/decode-cuda-graph-model-capability.json
+```
+
+Current offloaded MoE loaders are expected to report an explicit unsafe
+capability and zero captures/replays. Treat that result as eager-fallback
+capability evidence, not a graph comparison. Do not force capture or infer
+resident Qwen3 utility from an offloaded or DeepSeek MLA run.
+
+Retain the raw JSON. It records CUDA, PyTorch, GPU, dtype, bucket configuration,
+storage owner, registered/proved layer counts, per-layer KV checksums, graph
+private-pool bytes, authoritative scratch bytes, replay coverage, raw eager and
+replay samples, and p50/p90/p99 summaries. With `--profile-launches`, it also
+records one eager and one replay profiler sample. `observed_ratio` is simply
+`eager_p50_us / replay_p50_us`; values below 1.0 are valid. There is no
+performance pass threshold, no automatic enablement, and no claimed speedup.
+
+Run fixture and model evidence for every resident Qwen3/GPU/dtype/bucket set
+being qualified. Denser capture points reduce padding but consume more graph
+memory and authoritative scratch KV capacity, which can reduce request
+concurrency. The stable-pointer and eager-boundary rationale follows
+[TensorRT-LLM's piecewise CUDA graph guide](https://nvidia.github.io/TensorRT-LLM/features/torch_compile_and_piecewise_cuda_graph.html),
+but MoE-Infinity's first rollout is narrower: resident native-paged
+ordinary-GQA Qwen3 decode only; sampling, DeepSeek MLA, FlashInfer planning, and
+offloaded MoE remain eager.
 
 ## DFlash validation
 

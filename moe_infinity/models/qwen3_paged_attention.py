@@ -146,13 +146,23 @@ class Qwen3PagedAttention(Qwen3MoeAttention):
             .view(-1, num_key_value_heads, self.head_dim)
         )
 
-        attn_output_tokens = paged_backend.forward(
-            query_tokens,
-            key_tokens,
-            value_tokens,
-            attention_metadata=attention_metadata,
-            scale=cast(float, self.scaling),
-        )
+        try:
+            attn_output_tokens = paged_backend.forward(
+                query_tokens,
+                key_tokens,
+                value_tokens,
+                attention_metadata=attention_metadata,
+                scale=cast(float, self.scaling),
+                layer_idx=self.layer_idx,
+            )
+        except TypeError:
+            attn_output_tokens = paged_backend.forward(
+                query_tokens,
+                key_tokens,
+                value_tokens,
+                attention_metadata=attention_metadata,
+                scale=cast(float, self.scaling),
+            )
 
         if attn_output_tokens is None or attn_output_tokens.ndim != 3:
             raise ValueError(

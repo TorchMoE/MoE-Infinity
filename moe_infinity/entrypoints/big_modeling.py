@@ -329,6 +329,7 @@ class MoE:
             self._native_memory_coordinator = None
             self._native_kv_cache_manager = None
             self._native_attention_backend = None
+            self._native_paged_kv_storage = None
             self._native_mla_cache = None
             self._native_transfer_scheduler = None
             self._native_scheduler = None
@@ -467,6 +468,12 @@ class MoE:
                 )
             except Exception:
                 attention_backend = None
+        native_paged_kv_storage = self._build_native_paged_kv_storage(
+            kv_spec=kv_spec,
+            num_layers=int(num_layers),
+            num_gpu_blocks=num_gpu_blocks,
+            device=device,
+        )
         transfer_scheduler = UnifiedTransferScheduler()
         kv_offload_coordinator = None
         if getattr(engine_config, "enable_kv_cache_offload", False):
@@ -535,6 +542,7 @@ class MoE:
         self._native_memory_coordinator = memory_coordinator
         self._native_kv_cache_manager = kv_cache_manager
         self._native_attention_backend = attention_backend
+        self._native_paged_kv_storage = native_paged_kv_storage
         self._native_mla_cache = mla_cache
         self._native_transfer_scheduler = transfer_scheduler
         self._native_scheduler = scheduler
@@ -546,6 +554,7 @@ class MoE:
             "memory_coordinator": memory_coordinator,
             "kv_cache_manager": kv_cache_manager,
             "attention_backend": attention_backend,
+            "paged_kv_storage": native_paged_kv_storage,
             "mla_cache": mla_cache,
             "transfer_scheduler": transfer_scheduler,
             "kv_offload_coordinator": kv_offload_coordinator,
@@ -553,6 +562,58 @@ class MoE:
             "scheduler": scheduler,
             "generation_engine": generation_engine,
         }
+
+    def _build_native_paged_kv_storage(
+        self,
+        *,
+        kv_spec: "KVCacheSpec",
+        num_layers: int,
+        num_gpu_blocks: int,
+        device: torch.device,
+    ) -> "Optional[PagedKVStorage]":
+        from moe_infinity.runtime.paged_kv_storage import (
+            PagedKVStorage,
+            PagedKVStorageSpec,
+        )
+
+        try:
+            spec = PagedKVStorageSpec(
+                num_layers=num_layers,
+                num_blocks=num_gpu_blocks,
+                block_size=kv_spec.block_size,
+                num_kv_heads=kv_spec.num_kv_heads,
+                head_dim=kv_spec.head_dim,
+                dtype=kv_spec.dtype,
+                device=device,
+            )
+            return PagedKVStorage(spec)
+        except Exception:
+            return None
+
+    def decode_graph_capability(self):
+        from moe_infinity.runtime.attention_types import DecodeGraphCapability
+
+        engine = getattr(self, "engine", None)
+        engine_capability_fn = getattr(engine, "decode_graph_capability", None)
+        if callable(engine_capability_fn):
+            engine_capability = engine_capability_fn()
+            if not engine_capability.safe:
+                return engine_capability
+
+        transfer_scheduler = getattr(self, "_native_transfer_scheduler", None)
+        if transfer_scheduler is not None:
+            return DecodeGraphCapability(False, "transfer_scheduler")
+
+        if getattr(self, "_native_kv_offload_coordinator", None) is not None:
+            return DecodeGraphCapability(False, "kv_offload")
+
+        storage = getattr(self, "_native_paged_kv_storage", None)
+        if storage is None:
+            return DecodeGraphCapability(False, "native_paged_required")
+
+        return DecodeGraphCapability(
+            True, "eligible", storage_owner_id=storage.owner_id
+        )
 
     def _resolve_native_input_device(self) -> torch.device:
         """Input device for the native forward (mirrors engine._resolve_device).

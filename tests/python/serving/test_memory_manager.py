@@ -61,6 +61,10 @@ class MemoryManagerProtocol(Protocol):
 
     def get_expert_cache_ratio(self) -> float: ...
 
+    def set_cuda_graph_usage(
+        self, *, graph_pool_bytes: int, scratch_kv_bytes: int
+    ) -> None: ...
+
     def report(self) -> dict[str, Union[str, int, float]]: ...
 
 
@@ -177,3 +181,34 @@ def test_handles_no_gpu() -> None:
     assert budget.available_bytes == 0
     assert budget.expert_cache_bytes == 0
     assert budget.kv_cache_bytes == 0
+
+
+def test_report_includes_graph_pool_and_reserved_scratch_bytes() -> None:
+    _, MemoryManager = _load_classes()
+    manager = MemoryManager(device=torch.device("cpu"))
+    manager.set_cuda_graph_usage(
+        graph_pool_bytes=4096,
+        scratch_kv_bytes=2048,
+    )
+
+    report = manager.report()
+
+    assert report["cuda_graph_pool_bytes"] == 4096
+    assert report["cuda_graph_scratch_kv_bytes"] == 2048
+    assert report["cuda_graph_total_bytes"] == 6144
+
+
+def test_cuda_graph_usage_rejects_negative_values() -> None:
+    _, MemoryManager = _load_classes()
+    manager = MemoryManager(device=torch.device("cpu"))
+
+    for graph_pool_bytes, scratch_kv_bytes in ((-1, 0), (0, -1)):
+        try:
+            manager.set_cuda_graph_usage(
+                graph_pool_bytes=graph_pool_bytes,
+                scratch_kv_bytes=scratch_kv_bytes,
+            )
+        except ValueError as exc:
+            assert "non-negative" in str(exc)
+        else:
+            raise AssertionError("negative CUDA graph usage was accepted")

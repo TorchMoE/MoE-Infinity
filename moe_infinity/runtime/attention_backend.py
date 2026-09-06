@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Protocol, cast, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Optional,
+    Protocol,
+    cast,
+    runtime_checkable,
+)
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +22,9 @@ from moe_infinity.runtime.attention_types import (
 from moe_infinity.runtime.attention_types import (
     KVCacheSpec,
 )
+
+if TYPE_CHECKING:
+    from moe_infinity.runtime.paged_kv_storage import PagedKVStorage
 
 
 @dataclass
@@ -79,8 +89,6 @@ class PagedAttentionBackend:
     spec: KVCacheSpec
     num_gpu_blocks: int
     device: torch.device
-    k_cache: torch.Tensor
-    v_cache: torch.Tensor
     _use_flashinfer: bool
     _fi_workspace: Optional[torch.Tensor]
     _fi_kv_cache: Optional[torch.Tensor]
@@ -89,19 +97,34 @@ class PagedAttentionBackend:
 
     def __init__(
         self,
-        spec: KVCacheSpec,
-        num_gpu_blocks: int,
-        device: torch.device,
+        spec: Optional[KVCacheSpec] = None,
+        num_gpu_blocks: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        *,
+        storage: "Optional[PagedKVStorage]" = None,
+        use_flashinfer: Optional[bool] = None,
+        layer_idx: Optional[int] = None,
     ) -> None:
+        if storage is not None:
+            self._init_from_storage(storage, layer_idx, use_flashinfer)
+            return
+
+        if spec is None or num_gpu_blocks is None or device is None:
+            raise ValueError(
+                "PagedAttentionBackend requires spec, num_gpu_blocks, and "
+                "device when no storage is provided"
+            )
         if spec.head_dim % 8 != 0:
             raise ValueError("spec.head_dim must be divisible by 8")
 
+        self.storage = None
+        self._layer_idx = None
         self.spec = spec
         self.num_gpu_blocks = int(num_gpu_blocks)
         self.device = device
 
         x = 8
-        self.k_cache = torch.zeros(
+        self._k_cache = torch.zeros(
             self.num_gpu_blocks,
             spec.num_kv_heads,
             spec.head_dim // x,
@@ -110,7 +133,7 @@ class PagedAttentionBackend:
             dtype=spec.dtype,
             device=device,
         )
-        self.v_cache = torch.zeros(
+        self._v_cache = torch.zeros(
             self.num_gpu_blocks,
             spec.num_kv_heads,
             spec.head_dim,
@@ -161,6 +184,61 @@ class PagedAttentionBackend:
                     self._fi_kv_cache = None
                     self._fi_prefill = None
                     self._fi_decode = None
+
+    def _init_from_storage(
+        self,
+        storage: "PagedKVStorage",
+        layer_idx: Optional[int],
+        use_flashinfer: Optional[bool],
+    ) -> None:
+        if use_flashinfer:
+            raise ValueError(
+                "storage-bound PagedAttentionBackend does not support "
+                "FlashInfer; the FlashInfer plan path is graph-ineligible"
+            )
+        self.storage = storage
+        self._layer_idx = layer_idx
+        self.spec = KVCacheSpec(
+            num_kv_heads=storage.num_kv_heads,
+            head_dim=storage.head_dim,
+            dtype=storage.spec.dtype,
+            block_size=storage.block_size,
+        )
+        self.num_gpu_blocks = storage.num_blocks
+        self.device = storage.spec.device
+        self._k_cache = None
+        self._v_cache = None
+        self._use_flashinfer = False
+        self._fi_workspace = None
+        self._fi_kv_cache = None
+        self._fi_prefill = None
+        self._fi_decode = None
+
+    @property
+    def layer_idx(self) -> Optional[int]:
+        return self._layer_idx
+
+    @property
+    def k_cache(self) -> torch.Tensor:
+        if self.storage is not None:
+            return self.storage.key_cache[self._layer_idx or 0]
+        return self._k_cache
+
+    @property
+    def v_cache(self) -> torch.Tensor:
+        if self.storage is not None:
+            return self.storage.value_cache[self._layer_idx or 0]
+        return self._v_cache
+
+    def _check_owner(
+        self,
+        metadata: "AttentionMetadata | RuntimeAttentionMetadata",
+    ) -> None:
+        if self.storage is None:
+            return
+        owner_id = getattr(metadata, "kv_storage_owner_id", None)
+        if owner_id is not None and owner_id != self.storage.owner_id:
+            raise ValueError("KV storage owner mismatch")
 
     def write_kv(
         self,
@@ -265,8 +343,10 @@ class PagedAttentionBackend:
         attention_metadata: Optional[
             AttentionMetadata | RuntimeAttentionMetadata
         ] = None,
+        layer_idx: Optional[int] = None,
+        graph_mode: bool = False,
     ) -> torch.Tensor:
-        _ = kv_cache
+        _ = (kv_cache, graph_mode)
         metadata = (
             attention_metadata
             if attention_metadata is not None
@@ -274,6 +354,10 @@ class PagedAttentionBackend:
         )
         if metadata is None:
             raise ValueError("attention metadata is required")
+
+        self._check_owner(metadata)
+        if self.storage is not None and layer_idx is not None:
+            self._layer_idx = int(layer_idx)
 
         if self._is_prefill(metadata):
             slot_mapping = self._get_slot_mapping(metadata)
@@ -290,7 +374,29 @@ class PagedAttentionBackend:
                 scale=scale,
             )
 
+        self._write_decode_kv(key, value, metadata)
         return self._decode_forward(query, metadata, scale=scale)
+
+    def _write_decode_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata: AttentionMetadata | RuntimeAttentionMetadata,
+    ) -> None:
+        if self.storage is None:
+            return
+        slot_mapping = self._get_slot_mapping(metadata)
+        if slot_mapping is None:
+            raise ValueError("decode requires slot_mapping")
+        from moe_infinity.kernel.paged_kv_write import paged_kv_write_
+
+        paged_kv_write_(
+            self.storage,
+            layer_idx=self._layer_idx or 0,
+            key=key,
+            value=value,
+            slot_mapping=slot_mapping,
+        )
 
     def _prefill_forward(
         self,
@@ -611,6 +717,17 @@ class PagedAttentionBackend:
 
     def supports_dtype(self, dtype: torch.dtype) -> bool:
         return dtype in (torch.float16, torch.bfloat16, torch.float32)
+
+    def decode_graph_capability(self) -> "DecodeGraphCapability":
+        from moe_infinity.runtime.attention_types import DecodeGraphCapability
+
+        if self._use_flashinfer:
+            return DecodeGraphCapability(False, "flashinfer_plan_path")
+        if self.storage is None:
+            return DecodeGraphCapability(False, "kv_storage_mismatch")
+        return DecodeGraphCapability(
+            True, "eligible", storage_owner_id=self.storage.owner_id
+        )
 
     @staticmethod
     def _is_prefill(
