@@ -88,22 +88,21 @@ PrefillChunk = sys.modules["moe_infinity.serving.batch"].PrefillChunk
 
 
 def _make_paged_backend(num_blocks: int) -> PagedAttentionBackend:
-    return PagedAttentionBackend(
+    backend = PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=2, head_dim=8, dtype=torch.float16, block_size=4
         ),
         num_gpu_blocks=num_blocks,
-        num_layers=1,
         device=torch.device("cpu"),
     )
+    backend.create_layered_store(layer_count=1)
+    return backend
 
 
 def _make_chunk_cache(num_blocks: int = 8) -> PagedKVCache:
     cache = _make_cache(num_blocks=num_blocks)
-    cache.set_block_store(
-        _make_paged_backend(num_blocks=num_blocks).block_store,
-        logical_capacity=cache.num_blocks,
-    )
+    backend = _make_paged_backend(num_blocks=num_blocks)
+    cache.set_block_store(backend.block_store, owner=backend)
     return cache
 
 

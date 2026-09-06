@@ -262,7 +262,7 @@ class CudaGraphRunner:
             return False
         if any(batch.is_prefill):
             return False
-        if any(seq_len != 1 for seq_len in batch.seq_lengths):
+        if any(seq_len != 1 for seq_len in batch.query_lengths):
             return False
         return batch.total_tokens == len(batch.seq_ids)
 

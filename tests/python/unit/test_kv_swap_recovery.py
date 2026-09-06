@@ -121,22 +121,21 @@ def _make_paged_backend(num_blocks: int):
     from moe_infinity.runtime.attention_backend import PagedAttentionBackend
     from moe_infinity.runtime.attention_types import KVCacheSpec
 
-    return PagedAttentionBackend(
+    backend = PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=1, head_dim=8, dtype=torch.float16, block_size=4
         ),
         num_gpu_blocks=num_blocks,
-        num_layers=1,
         device=torch.device("cpu"),
     )
+    backend.create_layered_store(layer_count=1)
+    return backend
 
 
 def test_partial_prefill_recovers_to_prefill_at_same_offset() -> None:
     cache = _make_kv_cache(4)
-    cache.set_block_store(
-        _make_paged_backend(num_blocks=4).block_store,
-        logical_capacity=cache.num_blocks,
-    )
+    backend = _make_paged_backend(num_blocks=4)
+    cache.set_block_store(backend.block_store, owner=backend)
     scheduler = Scheduler(
         kv_cache=cache,
         max_batch_size=1,

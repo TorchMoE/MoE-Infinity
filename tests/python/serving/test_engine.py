@@ -99,14 +99,15 @@ def make_flashinfer_backend(
     num_layers: int,
     device: torch.device | None = None,
 ) -> PagedAttentionBackend:
-    return PagedAttentionBackend(
+    backend = PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=2, head_dim=8, dtype=torch.float16, block_size=4
         ),
         num_gpu_blocks=num_blocks,
         device=device if device is not None else torch.device("cpu"),
-        num_layers=num_layers,
     )
+    backend.create_layered_store(layer_count=num_layers)
+    return backend
 
 
 def make_serving_cache(num_blocks: int, num_layers: int) -> PagedKVCache:
@@ -139,9 +140,7 @@ def _make_chunk_engine(
         num_layers=1,
         device=engine.kv_cache.device,
     )
-    engine.kv_cache.set_block_store(
-        backend.block_store, logical_capacity=engine.kv_cache.num_blocks
-    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
     engine.scheduler.set_chunked_prefill_runtime_enabled(True)
     engine.add_request(
         "long", prompt, SamplingParams(temperature=0.0, max_tokens=1)
@@ -599,14 +598,15 @@ def test_engine_n_finished_when_all_complete() -> None:
     assert "req-n" not in engine._completed_request_ids
 
 
-def test_set_block_store_rejects_unclamped_logical_capacity() -> None:
-    store = make_flashinfer_backend(num_blocks=8, num_layers=1).block_store
+def test_set_block_store_rejects_oversized_logical_capacity() -> None:
+    backend = make_flashinfer_backend(num_blocks=4, num_layers=1)
     cache = make_serving_cache(num_blocks=6, num_layers=1)
-    with pytest.raises(ValueError, match="logical capacity must match"):
-        cache.set_block_store(store, logical_capacity=8)
-    cache.set_block_store(store, logical_capacity=6)
-    assert cache.num_blocks == 6
-    assert cache.block_store.physical_capacity == 8
+    with pytest.raises(ValueError, match="logical cache exceeds"):
+        cache.set_block_store(backend.block_store, owner=backend)
+    cache.resize_num_blocks(4)
+    cache.set_block_store(backend.block_store, owner=backend)
+    assert cache.num_blocks == 4
+    assert cache.block_store.num_blocks == 4
 
 
 def test_engine_rejects_chunked_prefill_with_prefix_caching() -> None:
@@ -644,9 +644,7 @@ def test_partial_prefill_step_commits_progress_without_emitting_token() -> None:
         num_layers=1,
         device=engine.kv_cache.device,
     )
-    engine.kv_cache.set_block_store(
-        backend.block_store, logical_capacity=engine.kv_cache.num_blocks
-    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
     engine.scheduler.set_chunked_prefill_runtime_enabled(True)
     engine.add_request(
         "long",
@@ -677,9 +675,7 @@ def test_terminal_prefill_is_the_only_prefill_chunk_sampled() -> None:
         num_layers=1,
         device=engine.kv_cache.device,
     )
-    engine.kv_cache.set_block_store(
-        backend.block_store, logical_capacity=engine.kv_cache.num_blocks
-    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
     engine.scheduler.set_chunked_prefill_runtime_enabled(True)
     engine.add_request(
         "long",
@@ -729,9 +725,7 @@ def test_dflash_is_not_delegated_after_partial_prefill() -> None:
         num_layers=1,
         device=engine.kv_cache.device,
     )
-    engine.kv_cache.set_block_store(
-        backend.block_store, logical_capacity=engine.kv_cache.num_blocks
-    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
     engine.scheduler.set_chunked_prefill_runtime_enabled(True)
     engine.add_request(
         "long",
@@ -854,9 +848,7 @@ def test_dflash_generate_failure_rolls_back_chunk_transaction(
         num_layers=1,
         device=engine.kv_cache.device,
     )
-    engine.kv_cache.set_block_store(
-        backend.block_store, logical_capacity=engine.kv_cache.num_blocks
-    )
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
     engine.scheduler.set_chunked_prefill_runtime_enabled(True)
     engine.add_request(
         "long", [10, 11], SamplingParams(temperature=0.0, max_tokens=1)

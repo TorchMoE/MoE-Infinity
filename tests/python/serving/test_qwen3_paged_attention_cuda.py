@@ -82,5 +82,8 @@ def test_real_qwen3_paged_attention_runs_chunk_through_flashinfer() -> None:
     assert output.shape == hidden.shape
     assert weights is None
     assert torch.isfinite(output).all()
-    assert backend.last_flashinfer_plan.query_offsets.tolist() == [0, 2]
-    assert backend.last_flashinfer_plan.kv_seq_lengths.tolist() == [6]
+    assert backend.last_flashinfer_plan.lengths.query_offsets.tolist() == [
+        0,
+        2,
+    ]
+    assert backend.last_flashinfer_plan.lengths.kv_seq_lengths.tolist() == [6]

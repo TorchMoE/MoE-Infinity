@@ -275,24 +275,21 @@ def test_no_block_leak_after_cancel() -> None:
 def _make_paged_backend(
     num_blocks: int, device: torch.device
 ) -> PagedAttentionBackend:
-    return PagedAttentionBackend(
+    backend = PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=2, head_dim=8, dtype=torch.float16, block_size=4
         ),
         num_gpu_blocks=num_blocks,
-        num_layers=1,
         device=device,
     )
+    backend.create_layered_store(layer_count=1)
+    return backend
 
 
 def test_cancel_partial_prefill_frees_reserved_chunks() -> None:
     engine = _make_engine(num_kv_blocks=4, max_batch_size=1)
-    engine.kv_cache.set_block_store(
-        _make_paged_backend(
-            num_blocks=4, device=engine.kv_cache.device
-        ).block_store,
-        logical_capacity=engine.kv_cache.num_blocks,
-    )
+    backend = _make_paged_backend(num_blocks=4, device=engine.kv_cache.device)
+    engine.kv_cache.set_block_store(backend.block_store, owner=backend)
     engine.scheduler.chunked_prefill_requested = True
     engine.scheduler.prefill_chunk_size = 4
     engine.scheduler.max_tokens_per_step = 4

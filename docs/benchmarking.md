@@ -296,6 +296,34 @@ python benchmarks/serving/kv_offload_benchmark.py \
     --output-json kv_offload_results.json
 ```
 
+### Prefix KV reuse (disabled / cold / warm)
+
+`benchmarks/serving/prefix_cache_benchmark.py` measures the three prefix-reuse
+modes with fresh engine instances and aborts on any disabled/cold/warm token or
+logit digest mismatch (exit `2`, no JSON written). It reports canonical
+`PagedBatchLengths` geometry (query lengths vs total KV lengths), refcount
+high-water, TTFT/E2E, and per-mode prefix-cache counters. Report percentiles and
+ratios only for the measured `Qwen/Qwen3-30B-A3B` workload; never state a
+universal speedup.
+
+```bash
+# Schema/self-check with no model or GPU
+python benchmarks/serving/prefix_cache_benchmark.py \
+    --dry-run --output-json prefix-cache-dry.json
+
+# Real disabled/cold/warm parity on a Qwen3 + FlashInfer runner
+python benchmarks/serving/prefix_cache_benchmark.py \
+    --model Qwen/Qwen3-30B-A3B \
+    --offload-dir /tmp/moe-prefix-benchmark \
+    --shared-prefix-tokens 1024 --suffix-tokens 64 \
+    --output-json prefix-cache-results.json
+```
+
+Warm `query_offsets` reflect the suffix query while `kv_seq_lengths` stays full;
+cold `query_offsets` reflect the full query. Motivated by SGLang RadixAttention
+(<https://lmsys.org/blog/2024-01-17-sglang/>) and vLLM automatic prefix caching
+(<https://docs.vllm.ai/en/stable/examples/features/automatic_prefix_caching>).
+
 ## Comparing with other frameworks
 
 ### llama.cpp

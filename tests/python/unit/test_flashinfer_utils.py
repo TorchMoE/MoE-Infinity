@@ -50,8 +50,9 @@ def _load_flashinfer_utils_with_blocked_import() -> ModuleType:
 
 def test_has_flashinfer_flag_matches_import() -> None:
     importable = _import_flashinfer_available()
-    importlib.reload(flashinfer_utils)
-    assert flashinfer_utils.HAS_FLASHINFER is importable
+    module = importlib.import_module("moe_infinity.runtime.flashinfer_utils")
+    importlib.reload(module)
+    assert module.HAS_FLASHINFER is importable
 
 
 def test_get_workspace_returns_correct_shape_and_dtype() -> None:

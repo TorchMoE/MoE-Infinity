@@ -85,6 +85,15 @@ class _PrefillRowCommit:
         self._prepared = False
 
 
+from .batch import SchedulerOutput
+from .kv_cache import PagedKVCache, SequenceAllocationPlan
+from .prefix_contract import PrefixLease, PrefixLeaseProvider
+from .sequence import SequenceData, SequenceGroup, SequenceStatus
+
+if TYPE_CHECKING:
+    from .prefix_cache import CacheNamespace
+
+
 class CPAwareKVManager(Protocol):
     def predict_prefix_reuse(
         self, request_id: str, token_ids: list[int]
@@ -241,6 +250,8 @@ class Scheduler:
         enable_chunked_prefill: bool = False,
         prefill_chunk_size: int = 512,
         prefill_starvation_threshold_steps: int = 8,
+        prefix_lease_provider: Optional[PrefixLeaseProvider] = None,
+        cache_namespace: "Optional[CacheNamespace]" = None,
         verify_token_budget: Optional[int] = None,
         verify_expert_byte_budget: Optional[int] = None,
         verify_token_deficit_cap: Optional[int] = None,
@@ -267,6 +278,8 @@ class Scheduler:
         self.kv_cache = kv_cache
         self.max_batch_size = max_batch_size
         self.max_tokens_per_step = max_tokens_per_step
+        self.prefix_lease_provider = prefix_lease_provider
+        self.cache_namespace = cache_namespace
 
         self.chunked_prefill_requested = bool(enable_chunked_prefill)
         self.chunked_prefill_enabled = bool(enable_chunked_prefill)
@@ -298,6 +311,10 @@ class Scheduler:
         )
         self._verify_demands: dict[int, VerifyDemand] = {}
         self._carried_verify_deficit = Deficit2D(tokens=0, expert_bytes=0)
+
+    @property
+    def block_size(self) -> int:
+        return self.kv_cache.block_size
 
     def set_cp_kv_manager(self, manager: CPAwareKVManager) -> None:
         self._cp_kv_manager = manager
@@ -386,32 +403,64 @@ class Scheduler:
             if scheduled_tokens + prefill_tokens > self.max_tokens_per_step:
                 break
 
-            required_blocks = sum(
-                self._required_blocks(sequence) for sequence in next_seqs
-            )
+            leases = [
+                self._acquire_prefill_lease(
+                    sequence,
+                    max_prefix_tokens=self._max_safe_prefix_tokens(sequence),
+                )
+                for sequence in next_seqs
+            ]
 
-            if self.kv_cache.block_allocator.num_free_blocks < required_blocks:
+            plans: list[SequenceAllocationPlan] = []
+            suffix_blocks = 0
+            for sequence, lease in zip(next_seqs, leases):
+                prefix_tokens = lease.match.num_tokens
+                total_tokens = sequence.prompt_length
+                suffix = total_tokens - prefix_tokens
+                suffix_blocks += ceil(suffix / self.block_size) if suffix else 0
+                plans.append(
+                    SequenceAllocationPlan(
+                        seq_id=sequence.seq_id,
+                        total_tokens=total_tokens,
+                        prefix_tokens=prefix_tokens,
+                        pinned_block_ids=list(lease.match.block_ids),
+                    )
+                )
+
+            if self.kv_cache.block_allocator.num_free_blocks < suffix_blocks:
+                self._evict_prefix_cache_until_free(suffix_blocks)
+
+            if self.kv_cache.block_allocator.num_free_blocks < suffix_blocks:
                 preempted_seq_ids = self._preempt_oldest_running_group()
                 if not preempted_seq_ids:
+                    for lease in reversed(leases):
+                        if lease.state in ("open", "prepared"):
+                            lease.abort()
                     waiting_blocked = True
                     continue
                 output.preempted_seq_ids.extend(preempted_seq_ids)
 
                 if (
                     self.kv_cache.block_allocator.num_free_blocks
-                    < required_blocks
+                    < suffix_blocks
                 ):
+                    for lease in reversed(leases):
+                        if lease.state in ("open", "prepared"):
+                            lease.abort()
                     waiting_blocked = True
                     continue
+
+            receipt = self.kv_cache.prepare_group(plans, leases)
+            self.kv_cache.commit_group(receipt)
 
             _ = self._waiting.popleft()
             self._running.append(next_group)
 
-            for sequence in next_seqs:
-                self.kv_cache.allocate_sequence(
-                    sequence.seq_id,
-                    num_tokens=sequence.prompt_length,
-                )
+            for sequence, lease in zip(next_seqs, leases):
+                if lease.match.num_tokens > 0:
+                    sequence.has_prefix_lease = True
+                    sequence.num_computed_tokens = lease.match.num_tokens
+                    sequence.committed_kv_tokens = lease.match.num_tokens
                 sequence.set_status(SequenceStatus.PREFILL)
                 output.prefill_seq_ids.append(sequence.seq_id)
 
@@ -1023,6 +1072,33 @@ class Scheduler:
                 self._prefill_queue = deque(
                     queued for queued in self._prefill_queue if queued != seq_id
                 )
+
+    def _evict_prefix_cache_until_free(self, required_blocks: int) -> None:
+        provider = self.prefix_lease_provider
+        evict_until = getattr(provider, "evict_until", None)
+        if not callable(evict_until):
+            return
+        allocator = self.kv_cache.block_allocator
+        evict_until(lambda: allocator.num_free_blocks >= required_blocks)
+
+    def _acquire_prefill_lease(
+        self, sequence: SequenceData, max_prefix_tokens: int
+    ) -> PrefixLease:
+        provider = self.prefix_lease_provider
+        namespace = self.cache_namespace
+        if provider is None or namespace is None or sequence.has_prefix_lease:
+            return PrefixLease.empty()
+        return provider.acquire_prefix_lease(
+            namespace,
+            sequence.prompt_token_ids,
+            max_prefix_tokens=max_prefix_tokens,
+        )
+
+    def _max_safe_prefix_tokens(self, sequence: SequenceData) -> int:
+        block_size = self.block_size
+        if sequence.prompt_length <= 1:
+            return 0
+        return ((sequence.prompt_length - 1) // block_size) * block_size
 
     def _required_blocks(self, sequence: SequenceData) -> int:
         if sequence.prompt_length == 0:
