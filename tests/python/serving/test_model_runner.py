@@ -47,9 +47,15 @@ _MODEL_RUNNER_MODULE = _load_module(
     ROOT / "moe_infinity" / "serving" / "model_runner.py",
 )
 
+from moe_infinity.runtime.attention_types import PagedBatchLengths  # noqa: E402
+
 SamplingParams = _SEQUENCE_MODULE.SamplingParams
 BatchMetadata = _BATCH_MODULE.BatchMetadata
 ModelRunner = _MODEL_RUNNER_MODULE.ModelRunner
+
+from moe_infinity.runtime.attention_types import (  # noqa: E402
+    PagedBatchLengths,
+)
 
 
 class _MockOutput:
@@ -125,11 +131,14 @@ def _make_batch() -> BatchMetadata:
     return BatchMetadata(
         seq_ids=[10, 11],
         input_token_ids=[11, 12, 13, 21],
-        seq_lengths=[3, 1],
-        context_lengths=[0, 4],
+        lengths=PagedBatchLengths(
+            query_lengths=[3, 1],
+            query_offsets=[0, 3, 4],
+            context_lengths=[0, 4],
+            kv_seq_lengths=[3, 5],
+        ),
         is_prefill=[True, False],
         block_tables=[[0], [1]],
-        token_offsets=[0, 3, 4],
         sampling_params=[SamplingParams(), SamplingParams()],
     )
 
@@ -169,11 +178,14 @@ def test_execute_supports_rank2_logits_for_decode_batches() -> None:
     batch = BatchMetadata(
         seq_ids=[1, 2],
         input_token_ids=[30, 31],
-        seq_lengths=[1, 1],
-        context_lengths=[8, 3],
+        lengths=PagedBatchLengths(
+            query_lengths=[1, 1],
+            query_offsets=[0, 1, 2],
+            context_lengths=[8, 3],
+            kv_seq_lengths=[9, 4],
+        ),
         is_prefill=[False, False],
         block_tables=[[0], [1]],
-        token_offsets=[0, 1, 2],
         sampling_params=[SamplingParams(), SamplingParams()],
     )
 
@@ -188,11 +200,14 @@ def test_execute_empty_batch_skips_forward() -> None:
     batch = BatchMetadata(
         seq_ids=[99],
         input_token_ids=[],
-        seq_lengths=[0],
-        context_lengths=[10],
+        lengths=PagedBatchLengths(
+            query_lengths=[0],
+            query_offsets=[0, 0],
+            context_lengths=[10],
+            kv_seq_lengths=[10],
+        ),
         is_prefill=[False],
         block_tables=[[0]],
-        token_offsets=[0, 0],
         sampling_params=[SamplingParams()],
     )
 
@@ -256,6 +271,32 @@ def test_backend_rejects_rebind_to_equal_shape_different_owner() -> None:
         RuntimeError, match="already bound to a different KV store"
     ):
         backend_a.bind_store(store_b, owner_id="engine-b")
+
+
+def test_runtime_metadata_maps_partial_prefill_slots() -> None:
+    engine = MockOffloadEngine()
+    engine.kv_cache = types.SimpleNamespace(block_size=4)
+    runner = ModelRunner(MockModel(), engine, device=torch.device("cpu"))
+    batch = BatchMetadata(
+        seq_ids=[7],
+        input_token_ids=[30, 31, 32],
+        seq_lengths=[3],
+        context_lengths=[5],
+        is_prefill=[True],
+        prefill_is_terminal=[False],
+        block_tables=[[4, 9]],
+        token_offsets=[0, 3],
+        sampling_params=[SamplingParams()],
+    )
+
+    metadata = runner._build_runtime_attention_metadata(batch)
+
+    assert metadata.lengths.kv_seq_lengths.tolist() == [8]
+    assert metadata.lengths.query_lengths.tolist() == [3]
+    assert metadata.lengths.query_offsets.tolist() == [0, 3]
+    assert metadata.num_prefill_tokens == 3
+    assert metadata.num_decode_tokens == 0
+    assert metadata.slot_mapping.tolist() == [9 * 4 + 1, 9 * 4 + 2, 9 * 4 + 3]
 
 
 from transformers.models.qwen3_moe.configuration_qwen3_moe import (  # noqa: E402

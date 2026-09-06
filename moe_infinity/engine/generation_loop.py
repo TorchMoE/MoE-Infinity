@@ -9,7 +9,11 @@ import torch.nn.functional as F
 
 from moe_infinity.engine.types import SamplingParams, SequenceStatus
 from moe_infinity.memory.kv_cache_manager import KVCacheManager
-from moe_infinity.runtime.attention_types import AttentionMetadata, KVCacheSpec
+from moe_infinity.runtime.attention_types import (
+    AttentionMetadata,
+    KVCacheSpec,
+    PagedBatchLengths,
+)
 
 
 class PromptTooLongError(ValueError):
@@ -161,7 +165,18 @@ class GenerationEngine:
 
             prefill_meta = AttentionMetadata(
                 block_tables=torch.tensor([block_table], dtype=torch.int32),
-                seq_lens=torch.tensor([num_prompt_tokens], dtype=torch.int32),
+                lengths=PagedBatchLengths(
+                    query_lengths=torch.tensor(
+                        [num_prompt_tokens], dtype=torch.int32
+                    ),
+                    query_offsets=torch.tensor(
+                        [0, num_prompt_tokens], dtype=torch.int32
+                    ),
+                    context_lengths=torch.tensor([0], dtype=torch.int32),
+                    kv_seq_lengths=torch.tensor(
+                        [num_prompt_tokens], dtype=torch.int32
+                    ),
+                ),
                 max_seq_len=num_prompt_tokens,
                 num_prefill_tokens=num_prompt_tokens,
                 num_decode_tokens=0,
@@ -204,7 +219,16 @@ class GenerationEngine:
 
                 decode_meta = AttentionMetadata(
                     block_tables=torch.tensor([block_table], dtype=torch.int32),
-                    seq_lens=torch.tensor([current_seq_len], dtype=torch.int32),
+                    lengths=PagedBatchLengths(
+                        query_lengths=torch.tensor([1], dtype=torch.int32),
+                        query_offsets=torch.tensor([0, 1], dtype=torch.int32),
+                        context_lengths=torch.tensor(
+                            [current_seq_len - 1], dtype=torch.int32
+                        ),
+                        kv_seq_lengths=torch.tensor(
+                            [current_seq_len], dtype=torch.int32
+                        ),
+                    ),
                     max_seq_len=current_seq_len,
                     num_prefill_tokens=0,
                     num_decode_tokens=1,

@@ -195,7 +195,7 @@ class LayeredKVPageChunk:
 
 
 @dataclass
-class LayeredPagedKVStore:
+class FormatLayeredKVStore:
     owner_id: str
     format: KVCacheFormat
     num_layers: int
@@ -231,7 +231,7 @@ class LayeredPagedKVStore:
         if key_chunk.shape != expected or value_chunk.shape != expected:
             raise ValueError(f"K/V chunk must have shape {expected}")
         if not 0 <= layer_idx < self.num_layers:
-            raise ValueError("layer_idx outside LayeredPagedKVStore")
+            raise ValueError("layer_idx outside FormatLayeredKVStore")
         slots = slot_mapping.to(self.payload.device, dtype=torch.long)
         pages, offsets = slots // self.block_size, slots % self.block_size
         if bool(torch.any(slots < 0)) or bool(
@@ -315,7 +315,7 @@ class LayeredPagedKVStore:
 
 
 def _read_layer_prefix(
-    store: LayeredPagedKVStore,
+    store: FormatLayeredKVStore,
     layer_idx: int,
     block_table: torch.Tensor,
     seq_len: int,
@@ -349,7 +349,7 @@ def _read_layer_prefix(
 
 
 def _snapshot_page_chunk_blocking(
-    store: LayeredPagedKVStore,
+    store: FormatLayeredKVStore,
     page_ids: list[int],
     target_device: torch.device,
 ) -> LayeredKVPageChunk:
@@ -372,7 +372,7 @@ def _snapshot_page_chunk_blocking(
 
 
 def _restore_page_chunk_blocking(
-    store: LayeredPagedKVStore,
+    store: FormatLayeredKVStore,
     destination_page_ids: list[int],
     chunk: LayeredKVPageChunk,
 ) -> None:
@@ -417,9 +417,9 @@ def allocate_layered_paged_kv_store(
     head_dim: int,
     execution_dtype: torch.dtype,
     device: torch.device,
-) -> LayeredPagedKVStore:
+) -> FormatLayeredKVStore:
     if not owner_id:
-        raise ValueError("LayeredPagedKVStore requires a non-empty owner_id")
+        raise ValueError("FormatLayeredKVStore requires a non-empty owner_id")
     for name, dim in (
         ("num_layers", num_layers),
         ("num_blocks", num_blocks),
@@ -454,7 +454,7 @@ def allocate_layered_paged_kv_store(
             dtype=fmt.scale_dtype,
             device=device,
         )
-    return LayeredPagedKVStore(
+    return FormatLayeredKVStore(
         owner_id=owner_id,
         format=fmt,
         num_layers=num_layers,

@@ -296,6 +296,34 @@ python benchmarks/serving/kv_offload_benchmark.py \
     --output-json kv_offload_results.json
 ```
 
+### Prefix KV reuse (disabled / cold / warm)
+
+`benchmarks/serving/prefix_cache_benchmark.py` measures the three prefix-reuse
+modes with fresh engine instances and aborts on any disabled/cold/warm token or
+logit digest mismatch (exit `2`, no JSON written). It reports canonical
+`PagedBatchLengths` geometry (query lengths vs total KV lengths), refcount
+high-water, TTFT/E2E, and per-mode prefix-cache counters. Report percentiles and
+ratios only for the measured `Qwen/Qwen3-30B-A3B` workload; never state a
+universal speedup.
+
+```bash
+# Schema/self-check with no model or GPU
+python benchmarks/serving/prefix_cache_benchmark.py \
+    --dry-run --output-json prefix-cache-dry.json
+
+# Real disabled/cold/warm parity on a Qwen3 + FlashInfer runner
+python benchmarks/serving/prefix_cache_benchmark.py \
+    --model Qwen/Qwen3-30B-A3B \
+    --offload-dir /tmp/moe-prefix-benchmark \
+    --shared-prefix-tokens 1024 --suffix-tokens 64 \
+    --output-json prefix-cache-results.json
+```
+
+Warm `query_offsets` reflect the suffix query while `kv_seq_lengths` stays full;
+cold `query_offsets` reflect the full query. Motivated by SGLang RadixAttention
+(<https://lmsys.org/blog/2024-01-17-sglang/>) and vLLM automatic prefix caching
+(<https://docs.vllm.ai/en/stable/examples/features/automatic_prefix_caching>).
+
 ## Comparing with other frameworks
 
 ### llama.cpp
@@ -380,6 +408,43 @@ writer creates the artifact's parent directory automatically. Rollout gates:
 INT8 measured storage ratio `<= 0.52`, lower peak memory at 8K/32K, and 2K
 decode throughput at least 90% of native. Performance misses block rollout but
 never relax the correctness/quality tolerances.
+### Chunked-prefill TTFT/TPOT tails
+
+Start two identical paged-attention servers: baseline without the feature and
+candidate with `--enable-chunked-prefill --prefill-chunk-size 512`. Warm both
+servers with the same requests, then run:
+
+```bash
+python benchmarks/serving/chunked_prefill_latency.py \
+  --baseline-url http://127.0.0.1:8000 \
+  --candidate-url http://127.0.0.1:8001 \
+  --tokenizer /models/the-exact-served-tokenizer \
+  --short-requests 64 --long-requests 16 \
+  --short-prompt-tokens 128 --long-prompt-tokens 8192 \
+  --max-tokens 128 --rounds 5 \
+  --output-json chunked-prefill-paired.json
+```
+
+Repeat for chunk sizes 128, 256, 512, and 1024 at fixed hardware, model,
+offload layout, tokenizer, request trace, and seed. Requests are sent as exact
+token-ID arrays produced and range-checked by that tokenizer. Report p50/p90/p99
+TTFT and TPOT, measured output tokens/second, errors, prefill-backpressure steps,
+peak KV used blocks, and peak KV utilization. Do not infer a speedup from a
+single run.
+
+Before latency canarying, the direct real-Qwen3/real-FlashInfer test must PASS
+(not skip), the valid unequal-capacity test must report
+`logical_blocks=min(memory_budget_blocks, block_store.physical_capacity)`, and
+the later-row reservation/checkpoint plus every scheduler-preflight failure test
+must restore all progress, rows, block references, and tables. Confirm that a
+server with both feature flags fails startup with the documented exact error;
+benchmark only the supported both-disabled and chunking-only configurations.
+
+Latency acceptance requires output-token parity, zero request errors, no final
+KV-block leak, non-null measured throughput and peak-KV fields, candidate p99
+TPOT no more than 5% above baseline, and candidate p99 TTFT no more than 5%
+above baseline. If any gate fails, keep the default disabled and retain the
+paired JSON for diagnosis.
 ## GPU-only expert routing A/B and Nsight runbook
 
 Run both modes with the same checkout, checkpoint, offload tree, GPU
