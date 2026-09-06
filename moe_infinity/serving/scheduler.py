@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from math import ceil
 from typing import TYPE_CHECKING, Optional, Protocol
 
@@ -92,6 +93,22 @@ from .sequence import SequenceData, SequenceGroup, SequenceStatus
 
 if TYPE_CHECKING:
     from .prefix_cache import CacheNamespace
+
+
+class SwapGroupPhase(Enum):
+    OUT_IN_FLIGHT = "out_in_flight"
+    HOST_RESIDENT = "host_resident"
+    IN_IN_FLIGHT = "in_in_flight"
+    ROLLBACK_IN_FLIGHT = "rollback_in_flight"
+
+
+@dataclass
+class _SwappedGroupRecord:
+    group: SequenceGroup
+    prior_status_by_seq: dict[int, SequenceStatus]
+    phase: SwapGroupPhase
+    pending_seq_ids: set[int] = field(default_factory=set)
+    attempts: int = 0
 
 
 class CPAwareKVManager(Protocol):
@@ -256,6 +273,7 @@ class Scheduler:
         verify_expert_byte_budget: Optional[int] = None,
         verify_token_deficit_cap: Optional[int] = None,
         verify_expert_byte_deficit_cap: Optional[int] = None,
+        kv_swap_max_retries: int = 2,
     ) -> None:
         if max_batch_size <= 0:
             raise ValueError(
@@ -264,6 +282,10 @@ class Scheduler:
         if max_tokens_per_step <= 0:
             raise ValueError(
                 f"max_tokens_per_step must be > 0, got {max_tokens_per_step}"
+            )
+        if kv_swap_max_retries < 0:
+            raise ValueError(
+                f"kv_swap_max_retries must be >= 0, got {kv_swap_max_retries}"
             )
         if prefill_chunk_size <= 0:
             raise ValueError(
@@ -278,6 +300,7 @@ class Scheduler:
         self.kv_cache = kv_cache
         self.max_batch_size = max_batch_size
         self.max_tokens_per_step = max_tokens_per_step
+        self.kv_swap_max_retries = kv_swap_max_retries
         self.prefix_lease_provider = prefix_lease_provider
         self.cache_namespace = cache_namespace
 
@@ -298,6 +321,7 @@ class Scheduler:
         self._waiting: deque[SequenceGroup] = deque()
         self._running: deque[SequenceGroup] = deque()
         self._swapped: deque[SequenceGroup] = deque()
+        self._swapped_groups: dict[str, _SwappedGroupRecord] = {}
 
         self._sequence_map: dict[int, SequenceData] = {}
         self._request_map: dict[str, SequenceGroup] = {}
@@ -360,12 +384,13 @@ class Scheduler:
 
     def _schedule_whole_prefill(self) -> SchedulerOutput:
         output = SchedulerOutput()
-        swapped_snapshot = list(self._swapped)
 
         scheduled_seqs = 0
         scheduled_tokens = 0
+        self._restored_this_pass: set[str] = set()
 
-        self._recover_swapped_groups(swapped_snapshot)
+        completions = self.kv_cache.poll_transfers()
+        self._advance_swapped_groups(completions)
 
         if self._cp_kv_manager is not None and len(self._waiting) > 1:
             scored_waiting = [
@@ -468,6 +493,10 @@ class Scheduler:
             scheduled_tokens += prefill_tokens
             output.num_prefill_tokens += prefill_tokens
 
+        self._recover_host_resident_groups()
+
+        self._ensure_decode_headroom()
+
         capacity_reached = False
         for group in self._running:
             if capacity_reached:
@@ -493,7 +522,11 @@ class Scheduler:
     def _schedule_chunked_prefill(self) -> SchedulerOutput:
         output = SchedulerOutput()
         self._schedule_steps += 1
-        self._recover_swapped_groups(list(self._swapped))
+        self._restored_this_pass = set()
+        completions = self.kv_cache.poll_transfers()
+        self._advance_swapped_groups(completions)
+        self._recover_host_resident_groups()
+        self._advance_swapped_groups(self.kv_cache.poll_transfers())
 
         scheduled_rows = 0
         scheduled_tokens = 0
@@ -842,6 +875,8 @@ class Scheduler:
                     if committed_counts is None
                     else committed_counts.get(seq_id, 1)
                 )
+                if not self.kv_cache.can_append(seq_id, num_new):
+                    continue
                 try:
                     self.kv_cache.append_tokens(seq_id, num_new_tokens=num_new)
                     target_tokens = sequence.num_computed_tokens + 1
@@ -903,12 +938,32 @@ class Scheduler:
             for queued in self._swapped
             if queued.request_id != request_id
         )
+        _ = self._swapped_groups.pop(request_id, None)
 
         self._drop_request_metadata(group)
         self._prune_finished_and_cancelled_requests()
 
     def has_work(self) -> bool:
-        return bool(self._waiting or self._running)
+        return bool(
+            self._waiting
+            or self._running
+            or self._swapped
+            or self.kv_cache.has_pending_transfers()
+        )
+
+    def has_runnable_work(self) -> bool:
+        if self._waiting:
+            return True
+        for group in self._running:
+            for sequence in group.sequences:
+                if sequence.status in (
+                    SequenceStatus.PREFILL,
+                    SequenceStatus.DECODE,
+                    SequenceStatus.DRAFT,
+                    SequenceStatus.VERIFY,
+                ) and self.kv_cache.is_gpu_ready(sequence.seq_id):
+                    return True
+        return False
 
     @property
     def num_waiting(self) -> int:
@@ -927,99 +982,352 @@ class Scheduler:
                     running_seq_ids.append(sequence.seq_id)
         return running_seq_ids
 
+    _SWAPPABLE_STATUSES = frozenset(
+        {
+            SequenceStatus.PREFILL,
+            SequenceStatus.DECODE,
+            SequenceStatus.DRAFT,
+            SequenceStatus.VERIFY,
+        }
+    )
+
+    def _decode_block_demand(self) -> int:
+        block_size = self.kv_cache.block_size
+        demand = 0
+        for group in self._running:
+            for sequence in group.sequences:
+                if sequence.status is not SequenceStatus.DECODE:
+                    continue
+                if self.kv_cache.num_tokens(sequence.seq_id) % block_size == 0:
+                    demand += 1
+        return demand
+
+    def _ensure_decode_headroom(self) -> None:
+        for _ in range(len(self._running)):
+            demand = self._decode_block_demand()
+            if self.kv_cache.block_allocator.num_free_blocks >= demand:
+                return
+            if len(self._running) <= 1:
+                # Preempting the only running group cannot create headroom
+                # for anyone else; it would only swap-thrash that group.
+                return
+            if not self._preempt_oldest_running_group():
+                return
+
     def _preempt_oldest_running_group(self) -> list[int]:
         preserved: list[SequenceGroup] = []
-        while self._running:
-            group = self._running.popleft()
-            active = [
-                sequence
-                for sequence in group.sequences
-                if sequence.status
-                not in (SequenceStatus.FINISHED, SequenceStatus.CANCELLED)
-            ]
-            if not active or any(
-                sequence.status
-                not in (SequenceStatus.PREFILL, SequenceStatus.DECODE)
-                for sequence in active
-            ):
-                preserved.append(group)
-                continue
-            preempted_seq_ids: list[int] = []
-
-            for sequence in group.sequences:
-                if sequence.status not in (
-                    SequenceStatus.PREFILL,
-                    SequenceStatus.DECODE,
+        try:
+            while self._running:
+                group = self._running[0]
+                seqs = [
+                    sequence
+                    for sequence in group.sequences
+                    if sequence.status in self._SWAPPABLE_STATUSES
+                ]
+                if not seqs:
+                    preserved.append(self._running.popleft())
+                    continue
+                if group.request_id in getattr(
+                    self, "_restored_this_pass", set()
+                ) or any(
+                    sequence.status
+                    in (SequenceStatus.DRAFT, SequenceStatus.VERIFY)
+                    for sequence in seqs
                 ):
+                    preserved.append(self._running.popleft())
                     continue
 
+                reservation = self.kv_cache.reserve_swap_out_group(
+                    [sequence.seq_id for sequence in seqs]
+                )
+                if reservation is None:
+                    return []
                 if self.chunked_prefill_enabled:
-                    self._swapped_resume_status[sequence.seq_id] = (
-                        sequence.status
-                    )
-            for sequence in active:
-                try:
-                    self.kv_cache.swap_out(
-                        sequence.seq_id, release_gpu_blocks=True
-                    )
-                except KeyError:
-                    pass
-                sequence.set_status(SequenceStatus.SWAPPED)
-                preempted_seq_ids.append(sequence.seq_id)
+                    for sequence in seqs:
+                        if sequence.status in (
+                            SequenceStatus.PREFILL,
+                            SequenceStatus.DECODE,
+                        ):
+                            self._swapped_resume_status[sequence.seq_id] = (
+                                sequence.status
+                            )
 
-            if preempted_seq_ids:
+                prior = {sequence.seq_id: sequence.status for sequence in seqs}
+                self.kv_cache.submit_swap_out_group(reservation)
+
+                submitted = self._submitted_swap_out(seqs)
+                if len(submitted) != len(seqs):
+                    self._roll_back_failed_swap_out(group, seqs, prior)
+                    return []
+
+                _ = self._running.popleft()
+                for sequence in seqs:
+                    sequence.set_status(SequenceStatus.SWAPPED)
+                    if self._is_host_resident(sequence.seq_id):
+                        self.kv_cache.free_gpu_blocks(sequence.seq_id)
                 self._swapped.append(group)
-                self._running.extendleft(reversed(preserved))
-                return preempted_seq_ids
+                self._swapped_groups[group.request_id] = _SwappedGroupRecord(
+                    group=group,
+                    prior_status_by_seq=prior,
+                    phase=SwapGroupPhase.OUT_IN_FLIGHT,
+                    pending_seq_ids={
+                        sequence.seq_id
+                        for sequence in seqs
+                        if not self._is_host_resident(sequence.seq_id)
+                    },
+                )
+                return [sequence.seq_id for sequence in seqs]
 
-        self._running.extend(preserved)
-        return []
+            return []
+        finally:
+            self._running.extendleft(reversed(preserved))
 
-    def _recover_swapped_groups(
-        self, swapped_groups: list[SequenceGroup]
+    def _submitted_swap_out(
+        self, seqs: list[SequenceData]
+    ) -> list[SequenceData]:
+        from moe_infinity.engine.kv_transfer import KVTransferState
+
+        submitted: list[SequenceData] = []
+        for sequence in seqs:
+            try:
+                state = self.kv_cache.transfer_state(sequence.seq_id)
+            except KeyError:
+                continue
+            if state in (
+                KVTransferState.SWAP_OUT_IN_FLIGHT,
+                KVTransferState.HOST_RESIDENT,
+            ):
+                submitted.append(sequence)
+        return submitted
+
+    def _roll_back_failed_swap_out(
+        self,
+        group: SequenceGroup,
+        seqs: list[SequenceData],
+        prior: dict[int, SequenceStatus],
     ) -> None:
-        if self.kv_cache.block_allocator.num_free_blocks <= 0:
-            return
-
-        for group in swapped_groups:
-            if group not in self._swapped:
-                continue
-
-            swapped_sequences = [
-                sequence
-                for sequence in group.sequences
-                if sequence.status is SequenceStatus.SWAPPED
-            ]
-            if not swapped_sequences:
-                _ = self._swapped.remove(group)
-                continue
-
-            recovered = True
-            for sequence in swapped_sequences:
+        for sequence in seqs:
+            if self._is_host_resident(sequence.seq_id):
                 try:
                     self.kv_cache.swap_in(sequence.seq_id)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
-                        "swap_in failed for seq_id=%s: %s",
+                        "swap-out rollback failed for seq_id=%s: %s",
                         sequence.seq_id,
                         exc,
                     )
-                    recovered = False
-                    break
 
-            if not recovered:
+    def _is_host_resident(self, seq_id: int) -> bool:
+        from moe_infinity.engine.kv_transfer import KVTransferState
+
+        try:
+            return (
+                self.kv_cache.transfer_state(seq_id)
+                is KVTransferState.HOST_RESIDENT
+            )
+        except KeyError:
+            return False
+
+    def _advance_swapped_groups(self, completions: list[object]) -> None:
+        for request_id in list(self._swapped_groups.keys()):
+            self._advance_swapped_group_record(request_id)
+
+    def _advance_swapped_group_record(self, request_id: str) -> None:
+        from moe_infinity.engine.kv_transfer import KVTransferState
+
+        record = self._swapped_groups.get(request_id)
+        if record is None:
+            return
+        group = record.group
+
+        if record.phase is SwapGroupPhase.OUT_IN_FLIGHT:
+            if not self._all_in_state(group, KVTransferState.HOST_RESIDENT):
+                return
+            record.phase = SwapGroupPhase.HOST_RESIDENT
+
+        if record.phase is SwapGroupPhase.IN_IN_FLIGHT:
+            if self._any_failed(group):
+                self._begin_retry_or_evict(record)
+                return
+            if not self._all_in_state(group, KVTransferState.GPU_RESIDENT):
+                return
+            self._publish_restored_group(record)
+            return
+
+    def _recover_host_resident_groups(self) -> None:
+        for request_id in list(self._swapped_groups.keys()):
+            record = self._swapped_groups.get(request_id)
+            if record is None:
                 continue
+            if record.phase is SwapGroupPhase.HOST_RESIDENT:
+                self._try_start_swap_in(record)
 
-            for sequence in swapped_sequences:
-                resume = self._swapped_resume_status.pop(
-                    sequence.seq_id, SequenceStatus.DECODE
-                )
+    def _all_in_state(self, group: SequenceGroup, state: object) -> bool:
+        for sequence in group.sequences:
+            if sequence.status is not SequenceStatus.SWAPPED:
+                continue
+            try:
+                if self.kv_cache.transfer_state(sequence.seq_id) is not state:
+                    return False
+            except KeyError:
+                return False
+        return True
+
+    def _any_failed(self, group: SequenceGroup) -> bool:
+        from moe_infinity.engine.kv_transfer import KVTransferState
+
+        for sequence in group.sequences:
+            if sequence.status is not SequenceStatus.SWAPPED:
+                continue
+            try:
+                if (
+                    self.kv_cache.transfer_state(sequence.seq_id)
+                    is KVTransferState.FAILED
+                ):
+                    return True
+            except KeyError:
+                continue
+        return False
+
+    def _try_start_swap_in(self, record: _SwappedGroupRecord) -> None:
+        from moe_infinity.engine.kv_transfer import KVTransferState
+
+        if self.kv_cache.block_allocator.num_free_blocks <= 0:
+            return
+
+        group = record.group
+        swapped_ids = [
+            sequence.seq_id
+            for sequence in group.sequences
+            if sequence.status is SequenceStatus.SWAPPED
+        ]
+        if not swapped_ids:
+            self._finish_group_removal(record)
+            return
+
+        reservation = self.kv_cache.reserve_swap_in_group(swapped_ids)
+        if reservation is None:
+            return
+
+        record.attempts += 1
+        self.kv_cache.submit_swap_in_group(reservation)
+
+        in_flight_or_ready = all(
+            self._transfer_state_or_none(seq_id)
+            in (
+                KVTransferState.SWAP_IN_IN_FLIGHT,
+                KVTransferState.GPU_RESIDENT,
+            )
+            for seq_id in swapped_ids
+        )
+        if not in_flight_or_ready:
+            if record.attempts > self.kv_swap_max_retries:
+                self._evict_group_to_waiting(record)
+            return
+
+        record.phase = SwapGroupPhase.IN_IN_FLIGHT
+        self._advance_swapped_group_record(group.request_id)
+
+    def _transfer_state_or_none(self, seq_id: int) -> object:
+        try:
+            return self.kv_cache.transfer_state(seq_id)
+        except KeyError:
+            return None
+
+    def _publish_restored_group(self, record: _SwappedGroupRecord) -> None:
+        group = record.group
+        for sequence in group.sequences:
+            if sequence.status is not SequenceStatus.SWAPPED:
+                continue
+            resume = self._swapped_resume_status.pop(sequence.seq_id, None)
+            if resume is not None:
                 sequence.set_status(resume)
                 if resume is SequenceStatus.PREFILL:
                     self._enqueue_prefill_once(sequence.seq_id)
+                continue
+            prior = record.prior_status_by_seq.get(
+                sequence.seq_id, SequenceStatus.DECODE
+            )
+            target = (
+                SequenceStatus.DECODE
+                if prior is SequenceStatus.PREFILL
+                else prior
+            )
+            sequence.set_status(target)
 
+        if group in self._swapped:
             _ = self._swapped.remove(group)
-            self._running.appendleft(group)
+        self._running.appendleft(group)
+        _ = self._swapped_groups.pop(group.request_id, None)
+        getattr(self, "_restored_this_pass", set()).add(group.request_id)
+
+    def _begin_retry_or_evict(self, record: _SwappedGroupRecord) -> None:
+        from moe_infinity.engine.kv_transfer import KVTransferState
+
+        group = record.group
+        if self.kv_cache.has_pending_transfers():
+            return
+
+        for sequence in group.sequences:
+            if sequence.status is not SequenceStatus.SWAPPED:
+                continue
+            try:
+                state = self.kv_cache.transfer_state(sequence.seq_id)
+            except KeyError:
+                continue
+            if state is KVTransferState.FAILED:
+                self.kv_cache.discard_failed_for_reprefill(
+                    sequence.seq_id,
+                    self._generation_of(sequence.seq_id),
+                )
+
+        if record.attempts <= self.kv_swap_max_retries:
+            record.phase = SwapGroupPhase.HOST_RESIDENT
+            for sequence in group.sequences:
+                if (
+                    sequence.status is SequenceStatus.SWAPPED
+                    and not self._record_exists(sequence.seq_id)
+                ):
+                    self._evict_group_to_waiting(record)
+                    return
+            self._try_start_swap_in(record)
+            return
+
+        self._evict_group_to_waiting(record)
+
+    def _evict_group_to_waiting(self, record: _SwappedGroupRecord) -> None:
+        group = record.group
+        for sequence in group.sequences:
+            if sequence.status is SequenceStatus.SWAPPED:
+                sequence.set_status(SequenceStatus.WAITING)
+            self.kv_cache.free_sequence(sequence.seq_id)
+            sequence.num_computed_tokens = 0
+            sequence.output_token_ids.clear()
+
+        if group in self._swapped:
+            _ = self._swapped.remove(group)
+        if group not in self._waiting:
+            self._waiting.append(group)
+        _ = self._swapped_groups.pop(group.request_id, None)
+
+    def _finish_group_removal(self, record: _SwappedGroupRecord) -> None:
+        group = record.group
+        if group in self._swapped:
+            _ = self._swapped.remove(group)
+        _ = self._swapped_groups.pop(group.request_id, None)
+
+    def _record_exists(self, seq_id: int) -> bool:
+        try:
+            self.kv_cache.transfer_state(seq_id)
+            return True
+        except KeyError:
+            return False
+
+    def _generation_of(self, seq_id: int) -> int:
+        record = self.kv_cache._kv_records.get(seq_id)
+        if record is None:
+            return -1
+        return record.key.generation
 
     def _prune_finished_and_cancelled_requests(self) -> None:
         active_requests: dict[str, SequenceGroup] = {}
@@ -1059,6 +1367,11 @@ class Scheduler:
             for group in self._swapped
             if group.request_id in self._request_map
         )
+        self._swapped_groups = {
+            request_id: record
+            for request_id, record in self._swapped_groups.items()
+            if request_id in self._request_map
+        }
 
     def _drop_request_metadata(self, group: SequenceGroup) -> None:
         _ = self._request_map.pop(group.request_id, None)

@@ -162,9 +162,18 @@ class LayeredPagedKVStore:
             or payload.v_cache.dtype != self.dtype
         ):
             raise ValueError("K/V payload dtype mismatch")
+
+        def _dev_key(device: torch.device) -> tuple[str, int]:
+            if device.index is not None:
+                return (device.type, device.index)
+            if device.type == "cuda":
+                return (device.type, torch.cuda.current_device())
+            return (device.type, -1)
+
+        expected_dev = _dev_key(self.device)
         if (
-            payload.k_cache.device != self.device
-            or payload.v_cache.device != self.device
+            _dev_key(payload.k_cache.device) != expected_dev
+            or _dev_key(payload.v_cache.device) != expected_dev
         ):
             raise ValueError("K/V payload device mismatch")
         if (payload.fi_kv_cache is None) != (self.fi_kv_cache is None):
@@ -174,7 +183,7 @@ class LayeredPagedKVStore:
                 raise ValueError("FlashInfer payload geometry mismatch")
             if (
                 payload.fi_kv_cache.dtype != self.dtype
-                or payload.fi_kv_cache.device != self.device
+                or _dev_key(payload.fi_kv_cache.device) != expected_dev
             ):
                 raise ValueError("FlashInfer payload dtype/device mismatch")
 

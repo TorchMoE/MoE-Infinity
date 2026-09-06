@@ -871,7 +871,7 @@ class ModelRunner:
             and len(set(layer_indices)) == len(layer_indices)
             and isinstance(backend, PagedAttentionBackend)
             and isinstance(
-                getattr(backend, "block_store", None), LayeredPagedKVStore
+                getattr(backend, "_block_store", None), LayeredPagedKVStore
             )
             and backend.supports_chunked_prefill()
         )
@@ -891,7 +891,7 @@ class ModelRunner:
             return "incomplete_qwen3_paged_layer_registry"
         backend = self._get_attention_backend()
         if not isinstance(backend, PagedAttentionBackend) or not isinstance(
-            getattr(backend, "block_store", None), LayeredPagedKVStore
+            getattr(backend, "_block_store", None), LayeredPagedKVStore
         ):
             return "layered_paged_kv_store_unavailable"
         if not backend.supports_chunked_prefill():

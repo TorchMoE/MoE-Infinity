@@ -42,6 +42,30 @@ def _make_mock_stats() -> dict[str, Any]:
             "expert_cache_bytes": 0,
             "kv_cache_bytes": 0,
         },
+        "kv_swap": {
+            "mode": "async",
+            "fallback_reason": None,
+            "host_capacity_bytes": 4096,
+            "host_in_use_bytes": 1024,
+            "host_peak_in_use_bytes": 2048,
+            "inflight": 2,
+            "inflight_bytes": 512,
+            "retiring_records": 1,
+            "host_resident": 3,
+            "backpressure_total": 4,
+            "swap_out_started_total": 5,
+            "swap_out_completed_total": 6,
+            "swap_out_failed_total": 7,
+            "swap_in_started_total": 8,
+            "swap_in_completed_total": 9,
+            "swap_in_failed_total": 10,
+            "cancelled_total": 11,
+            "checksum_failures_total": 12,
+            "d2h_bytes_total": 13,
+            "h2d_bytes_total": 14,
+            "d2h_duration_ms_sum": 1500.0,
+            "h2d_duration_ms_sum": 2500.0,
+        },
     }
 
 
@@ -323,6 +347,208 @@ def test_dflash_paged_cli_values_forward_to_engine_config(
     assert config["min_free_mla_blocks_after_admission"] == 3
 
 
+def _swap_model_stub() -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size=32,
+            head_dim=8,
+            max_position_embeddings=128,
+            eos_token_id=2,
+            dtype="float32",
+        ),
+        dtype="float32",
+    )
+
+
+def test_parse_args_defines_kv_swap_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = [
+        "prog",
+        "--model",
+        "test-model",
+        "--offload-dir",
+        "/tmp/off",
+        "--kv-swap-mode",
+        "async",
+        "--kv-swap-host-memory-bytes",
+        "8192",
+        "--kv-swap-max-inflight-bytes",
+        "4096",
+        "--kv-swap-checksum",
+        "--kv-swap-max-retries",
+        "5",
+        "--no-kv-swap-sync-fallback",
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+
+    args = srv.parse_args()
+
+    assert args.kv_swap_mode == "async"
+    assert args.kv_swap_host_memory_bytes == 8192
+    assert args.kv_swap_max_inflight_bytes == 4096
+    assert args.kv_swap_checksum is True
+    assert args.kv_swap_max_retries == 5
+    assert args.kv_swap_allow_sync_fallback is False
+
+
+def test_parse_args_kv_swap_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = ["prog", "--model", "test-model", "--offload-dir", "/tmp/off"]
+    monkeypatch.setattr("sys.argv", argv)
+
+    args = srv.parse_args()
+
+    assert args.kv_swap_mode == "sync"
+    assert args.kv_swap_host_memory_bytes == 512 * 1024 * 1024
+    assert args.kv_swap_max_inflight_bytes == 256 * 1024 * 1024
+    assert args.kv_swap_checksum is False
+    assert args.kv_swap_max_retries == 2
+    assert args.kv_swap_allow_sync_fallback is True
+
+
+def test_build_engine_config_includes_kv_swap_fields() -> None:
+    args = SimpleNamespace(
+        device_memory_ratio=0.75,
+        kv_cache_ratio=0.25,
+        max_batch_size=32,
+        enable_prefix_caching=False,
+        kv_swap_mode="async",
+        kv_swap_host_memory_bytes=8192,
+        kv_swap_max_inflight_bytes=4096,
+        kv_swap_checksum=True,
+        kv_swap_max_retries=5,
+        kv_swap_allow_sync_fallback=False,
+    )
+
+    config = srv._build_engine_config(args=args, model=_swap_model_stub())
+
+    assert config["kv_swap_mode"] == "async"
+    assert config["kv_swap_host_memory_bytes"] == 8192
+    assert config["kv_swap_max_inflight_bytes"] == 4096
+    assert config["kv_swap_checksum"] is True
+    assert config["kv_swap_max_retries"] == 5
+    assert config["kv_swap_allow_sync_fallback"] is False
+
+
+def test_initialize_with_model_forwards_kv_swap_kwargs_to_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def _capture_engine(**kwargs: Any) -> MagicMock:
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(srv, "ContinuousBatchingEngine", _capture_engine)
+
+    moe_model = SimpleNamespace(
+        model=_swap_model_stub(),
+        engine=object(),
+    )
+
+    srv.initialize_with_model(
+        moe_model=moe_model,
+        model_name="test-model",
+        tok=None,
+        max_seq_length=128,
+        kv_swap_mode="async",
+        kv_swap_host_memory_bytes=8192,
+        kv_swap_max_inflight_bytes=4096,
+        kv_swap_checksum=True,
+        kv_swap_max_retries=5,
+        kv_swap_allow_sync_fallback=False,
+    )
+
+    engine_config = captured["config"]
+    assert engine_config["kv_swap_mode"] == "async"
+    assert engine_config["kv_swap_host_memory_bytes"] == 8192
+    assert engine_config["kv_swap_max_inflight_bytes"] == 4096
+    assert engine_config["kv_swap_checksum"] is True
+    assert engine_config["kv_swap_max_retries"] == 5
+    assert engine_config["kv_swap_allow_sync_fallback"] is False
+
+
+_SENTINEL_KV_SWAP = {
+    "kv_swap_mode": "async",
+    "kv_swap_host_memory_bytes": 12345678,
+    "kv_swap_max_inflight_bytes": 1234567,
+    "kv_swap_checksum": True,
+    "kv_swap_max_retries": 7,
+    "kv_swap_allow_sync_fallback": False,
+}
+
+
+def _serve_stub_model() -> SimpleNamespace:
+    engine_config = SimpleNamespace(**_SENTINEL_KV_SWAP)
+    return SimpleNamespace(
+        engine_config=engine_config,
+        model=SimpleNamespace(config=SimpleNamespace(_name_or_path="m")),
+        max_seq_length=128,
+        tokenizer=None,
+    )
+
+
+def _install_serve_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    import sys
+
+    from moe_infinity.entrypoints.big_modeling import MoE
+
+    captured: dict[str, Any] = {}
+
+    def _capture_initialize(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        srv, "initialize_with_model", _capture_initialize, raising=True
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(run=lambda *a, **k: None),
+    )
+    return {"MoE": MoE, "captured": captured}
+
+
+def test_serve_propagates_kv_swap_from_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _install_serve_capture(monkeypatch)
+    stub = _serve_stub_model()
+
+    setup["MoE"].serve(stub, offload_dir="/tmp/off")
+
+    captured = setup["captured"]
+    for key, value in _SENTINEL_KV_SWAP.items():
+        assert captured[key] == value
+
+
+def test_serve_explicit_override_beats_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _install_serve_capture(monkeypatch)
+    stub = _serve_stub_model()
+
+    setup["MoE"].serve(
+        stub,
+        offload_dir="/tmp/off",
+        kv_swap_mode="sync",
+        kv_swap_max_retries=1,
+    )
+
+    captured = setup["captured"]
+    assert captured["kv_swap_mode"] == "sync"
+    assert captured["kv_swap_max_retries"] == 1
+    assert captured["kv_swap_host_memory_bytes"] == 12345678
+    assert captured["kv_swap_allow_sync_fallback"] is False
+
+
 def test_list_models_engine_not_ready(client: TestClient) -> None:
     srv.engine = None
 
@@ -358,6 +584,25 @@ def test_metrics_endpoint(client: TestClient) -> None:
     assert "moe_queue_depth" in body
     assert "moe_kv_cache_free_blocks" in body
     assert "moe_tokens_generated_total" in body
+    required = [
+        "moe_kv_swap_inflight 2",
+        "moe_kv_swap_inflight_bytes 512",
+        "moe_kv_swap_retiring_records 1",
+        "moe_kv_swap_host_resident 3",
+        "moe_kv_swap_host_bytes 1024",
+        "moe_kv_swap_host_capacity_bytes 4096",
+        "moe_kv_swap_backpressure_total 4",
+        "moe_kv_swap_out_completed_total 6",
+        "moe_kv_swap_in_completed_total 9",
+        'moe_kv_swap_failures_total{direction="out"} 7',
+        'moe_kv_swap_failures_total{direction="in"} 10',
+        'moe_kv_swap_bytes_total{direction="d2h"} 13',
+        'moe_kv_swap_bytes_total{direction="h2d"} 14',
+        'moe_kv_swap_duration_seconds_sum{direction="d2h"} 1.5',
+        'moe_kv_swap_duration_seconds_sum{direction="h2d"} 2.5',
+    ]
+    for metric in required:
+        assert metric in body
 
 
 def test_metrics_endpoint_exports_graph_counters_and_bounded_reasons(

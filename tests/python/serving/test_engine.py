@@ -4,7 +4,7 @@ import types
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 from unittest.mock import Mock
 
 import pytest
@@ -91,6 +91,7 @@ from moe_infinity.serving.sampler import (  # type: ignore[reportMissingImports]
 )
 from moe_infinity.serving.sequence import (  # type: ignore[reportMissingImports]
     SamplingParams,
+    SequenceStatus,
 )
 
 
@@ -1016,3 +1017,117 @@ def test_non_paged_decode_is_always_eager() -> None:
         ]
         == 1
     )
+
+
+class _PendingTransferKVCache:
+    def __init__(
+        self,
+        *,
+        progress_rounds: int,
+        on_settle: Callable[[], None] | None = None,
+    ) -> None:
+        self._remaining_rounds = progress_rounds
+        self._on_settle = on_settle
+        self.wait_calls: list[float] = []
+        self.shutdown_calls = 0
+        self.pending = progress_rounds > 0
+
+    def has_pending_transfers(self) -> bool:
+        return self.pending
+
+    def wait_for_transfer_progress(self, timeout_ms: float) -> bool:
+        self.wait_calls.append(timeout_ms)
+        if self._remaining_rounds <= 0:
+            self.pending = False
+            return False
+        self._remaining_rounds -= 1
+        if self._remaining_rounds == 0:
+            self.pending = False
+            if self._on_settle is not None:
+                self._on_settle()
+        return True
+
+    def shutdown(self, timeout_ms: float = 5000.0) -> None:
+        self.shutdown_calls += 1
+
+
+def test_engine_forwards_kv_swap_max_retries_to_scheduler() -> None:
+    config = _make_config()
+    config["kv_swap_max_retries"] = 5
+    engine = ContinuousBatchingEngine(
+        model=MockModel(),
+        engine=MockOffloadEngine(),
+        config=config,
+    )
+
+    assert engine.scheduler.kv_swap_max_retries == 5
+
+
+def test_run_until_done_waits_for_pending_transfers_without_error() -> None:
+    engine = _make_engine()
+
+    engine.add_request(
+        request_id="req-swap",
+        prompt_token_ids=[10],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
+    )
+    seq_id = engine._request_to_seq_ids["req-swap"][0]
+    engine._sequences[seq_id].set_status(SequenceStatus.SWAPPED)
+
+    def _settle() -> None:
+        engine.abort_request("req-swap")
+
+    fake_cache = _PendingTransferKVCache(progress_rounds=2, on_settle=_settle)
+    engine.kv_cache = fake_cache
+
+    outputs = engine.run_until_done()
+
+    assert isinstance(outputs, dict)
+    assert fake_cache.wait_calls == [100.0, 100.0]
+
+
+def test_run_until_done_raises_when_no_progress_and_no_pending_transfer() -> (
+    None
+):
+    engine = _make_engine()
+    fake_cache = _PendingTransferKVCache(progress_rounds=0)
+    engine.kv_cache = fake_cache
+    engine.add_request(
+        request_id="req-stuck",
+        prompt_token_ids=[10],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
+    )
+    seq_id = engine._request_to_seq_ids["req-stuck"][0]
+    engine._sequences[seq_id].set_status(SequenceStatus.SWAPPED)
+
+    try:
+        engine.run_until_done()
+    except RuntimeError as exc:
+        assert "no progress" in str(exc)
+    else:
+        raise AssertionError("stuck engine must raise a no-progress error")
+
+
+def test_engine_shutdown_is_idempotent() -> None:
+    engine = _make_engine()
+    fake_cache = _PendingTransferKVCache(progress_rounds=0)
+    engine.kv_cache = fake_cache
+
+    engine.shutdown()
+    engine.shutdown()
+
+    assert fake_cache.shutdown_calls == 1
+
+
+def test_engine_shutdown_aborts_pending_requests() -> None:
+    engine = _make_engine()
+    engine.add_request(
+        request_id="req-open",
+        prompt_token_ids=[10],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+    )
+    assert engine.has_pending_requests() is True
+
+    engine.shutdown()
+
+    assert engine.has_pending_requests() is False
