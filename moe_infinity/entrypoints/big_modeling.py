@@ -250,6 +250,21 @@ class MoE:
                 is_flash_attn_available=is_flash_attn_available,
                 trust_remote_code=True,
             )
+        mla_cache = native_components.get("mla_cache")
+        if mla_cache is not None:
+            from moe_infinity.models.deepseek_mla_attention import (
+                adapt_deepseek_model,
+            )
+
+            adapted = adapt_deepseek_model(
+                self.model,
+                mla_cache,
+                enabled=True,
+            )
+            if not adapted:
+                self._native_mla_cache = None
+
+        self._native_rich_batch_capable = self._supports_native_rich_batch()
 
         self._ensure_generation_mixin()
         self.engine_config = engine_config
@@ -314,6 +329,8 @@ class MoE:
             self._native_memory_coordinator = None
             self._native_kv_cache_manager = None
             self._native_attention_backend = None
+            self._native_paged_kv_storage = None
+            self._native_mla_cache = None
             self._native_transfer_scheduler = None
             self._native_scheduler = None
             self._native_generation_engine = None
@@ -428,21 +445,52 @@ class MoE:
         )
         num_cpu_blocks = max(32, num_gpu_blocks * 2)
 
+        from moe_infinity.models.deepseek_mla_attention import (
+            is_deepseek_mla_eligible,
+        )
+
+        mla_enabled = is_deepseek_mla_eligible(
+            model_config,
+            enabled=bool(
+                getattr(engine_config, "enable_deepseek_mla_paging", False)
+            ),
+        )
+
         kv_cache_manager = KVCacheManager(
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=kv_spec.block_size,
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        try:
-            attention_backend = PagedAttentionBackend(
-                spec=kv_spec,
-                num_gpu_blocks=num_gpu_blocks,
-                device=device,
+        mla_cache = None
+        if mla_enabled:
+            from moe_infinity.serving.mla_cache import MLAPagedKVCache
+
+            mla_cache = MLAPagedKVCache(
+                num_blocks=num_gpu_blocks,
+                block_size=kv_spec.block_size,
                 num_layers=int(num_layers),
+                latent_dim=int(getattr(model_config, "kv_lora_rank")),
+                rope_dim=int(getattr(model_config, "qk_rope_head_dim")),
+                dtype=kv_spec.dtype,
+                device=device,
             )
-        except Exception:
             attention_backend = None
+        else:
+            try:
+                attention_backend = PagedAttentionBackend(
+                    spec=kv_spec,
+                    num_gpu_blocks=num_gpu_blocks,
+                    device=device,
+                )
+            except Exception:
+                attention_backend = None
+        native_paged_kv_storage = self._build_native_paged_kv_storage(
+            kv_spec=kv_spec,
+            num_layers=int(num_layers),
+            num_gpu_blocks=num_gpu_blocks,
+            device=device,
+        )
         transfer_scheduler = UnifiedTransferScheduler()
         kv_offload_coordinator = None
         if getattr(engine_config, "enable_kv_cache_offload", False):
@@ -511,6 +559,8 @@ class MoE:
         self._native_memory_coordinator = memory_coordinator
         self._native_kv_cache_manager = kv_cache_manager
         self._native_attention_backend = attention_backend
+        self._native_paged_kv_storage = native_paged_kv_storage
+        self._native_mla_cache = mla_cache
         self._native_transfer_scheduler = transfer_scheduler
         self._native_scheduler = scheduler
         self._native_generation_engine = generation_engine
@@ -521,12 +571,66 @@ class MoE:
             "memory_coordinator": memory_coordinator,
             "kv_cache_manager": kv_cache_manager,
             "attention_backend": attention_backend,
+            "paged_kv_storage": native_paged_kv_storage,
+            "mla_cache": mla_cache,
             "transfer_scheduler": transfer_scheduler,
             "kv_offload_coordinator": kv_offload_coordinator,
             "expert_offload_coordinator": expert_offload_coordinator,
             "scheduler": scheduler,
             "generation_engine": generation_engine,
         }
+
+    def _build_native_paged_kv_storage(
+        self,
+        *,
+        kv_spec: "KVCacheSpec",
+        num_layers: int,
+        num_gpu_blocks: int,
+        device: torch.device,
+    ) -> "Optional[PagedKVStorage]":
+        from moe_infinity.runtime.paged_kv_storage import (
+            PagedKVStorage,
+            PagedKVStorageSpec,
+        )
+
+        try:
+            spec = PagedKVStorageSpec(
+                num_layers=num_layers,
+                num_blocks=num_gpu_blocks,
+                block_size=kv_spec.block_size,
+                num_kv_heads=kv_spec.num_kv_heads,
+                head_dim=kv_spec.head_dim,
+                dtype=kv_spec.dtype,
+                device=device,
+            )
+            return PagedKVStorage(spec)
+        except Exception:
+            return None
+
+    def decode_graph_capability(self):
+        from moe_infinity.runtime.attention_types import DecodeGraphCapability
+
+        engine = getattr(self, "engine", None)
+        engine_capability_fn = getattr(engine, "decode_graph_capability", None)
+        if callable(engine_capability_fn):
+            engine_capability = engine_capability_fn()
+            if not engine_capability.safe:
+                return engine_capability
+
+        transfer_scheduler = getattr(self, "_native_transfer_scheduler", None)
+        if transfer_scheduler is not None:
+            return DecodeGraphCapability(False, "transfer_scheduler")
+
+        if getattr(self, "_native_kv_offload_coordinator", None) is not None:
+            return DecodeGraphCapability(False, "kv_offload")
+
+        storage = getattr(self, "_native_paged_kv_storage", None)
+        if storage is None:
+            return DecodeGraphCapability(False, "native_paged_required")
+
+        return DecodeGraphCapability(
+            True, "eligible", storage_owner_id=storage.owner_id
+        )
 
     def _resolve_native_input_device(self) -> torch.device:
         """Input device for the native forward (mirrors engine._resolve_device).
@@ -601,10 +705,14 @@ class MoE:
             if not is_prefill and _attention_metadata is not None:
                 seq_lens = getattr(_attention_metadata, "seq_lens", None)
                 if seq_lens is not None and seq_lens.numel() > 0:
-                    current_pos = int(seq_lens[0].item()) - 1
-                    extra_kwargs["position_ids"] = torch.tensor(
-                        [[current_pos]], device=input_tensor.device
-                    )
+                    total_len = int(seq_lens[0].item())
+                    start_pos = total_len - len(token_ids)
+                    extra_kwargs["position_ids"] = torch.arange(
+                        start_pos,
+                        total_len,
+                        device=input_tensor.device,
+                        dtype=torch.long,
+                    ).unsqueeze(0)
 
         with torch.no_grad():
             if not use_paged_context:
@@ -640,10 +748,10 @@ class MoE:
 
     def _native_model_forward_rich(
         self,
-        token_ids: list[int],
+        token_ids: list[int] | torch.Tensor,
         _attention_metadata: object = None,
         logits_to_keep: int = 0,
-    ) -> tuple[torch.Tensor, tuple, object]:
+    ) -> tuple[torch.Tensor, tuple, object] | object:
         """On-device forward for speculative decoding: hidden-state capture.
 
         Single HF forward with ``output_hidden_states=True`` returning
@@ -660,16 +768,40 @@ class MoE:
         ExpertExecutor dispatch (and its ``speculative_prefetch`` hook) is
         preserved — nothing here bypasses expert dispatch.
         """
-        input_tensor = torch.tensor([token_ids], dtype=torch.long)
+        batched = isinstance(token_ids, torch.Tensor)
+        if batched:
+            if token_ids.ndim != 2:
+                raise ValueError(
+                    "batched rich token_ids must have shape [batch, seq]"
+                )
+            input_tensor = token_ids.to(dtype=torch.long)
+        else:
+            input_tensor = torch.tensor([token_ids], dtype=torch.long)
         input_tensor = input_tensor.to(self._resolve_native_input_device())
 
         is_prefill = True
         if _attention_metadata is not None:
             is_prefill = bool(getattr(_attention_metadata, "is_prefill", True))
 
+        mla_attention_modules = self._get_mla_attention_modules()
+        use_mla_context = bool(
+            mla_attention_modules
+            and _attention_metadata is not None
+            and getattr(self, "_native_mla_cache", None) is not None
+            and all(
+                hasattr(_attention_metadata, name)
+                for name in (
+                    "block_tables",
+                    "seq_lens",
+                    "slot_mapping",
+                    "is_prefill",
+                )
+            )
+        )
         paged_attention_classes = self._get_paged_attention_classes()
         use_paged_context = bool(
-            paged_attention_classes
+            not use_mla_context
+            and paged_attention_classes
             and _attention_metadata is not None
             and getattr(self, "_native_attention_backend", None) is not None
         )
@@ -677,27 +809,63 @@ class MoE:
         extra_kwargs: dict = {"output_hidden_states": True}
         if logits_to_keep:
             extra_kwargs["logits_to_keep"] = int(logits_to_keep)
+        if batched and _attention_metadata is not None:
+            attention_mask = getattr(
+                _attention_metadata, "attention_mask", None
+            )
+            position_ids = getattr(_attention_metadata, "position_ids", None)
+            if attention_mask is not None:
+                extra_kwargs["attention_mask"] = attention_mask.to(
+                    input_tensor.device
+                )
+            if position_ids is not None:
+                extra_kwargs["position_ids"] = position_ids.to(
+                    input_tensor.device
+                )
 
-        if not use_paged_context:
+        if not use_paged_context and not use_mla_context:
             # Same HF KV-cache contract as the baseline: prefill captures
             # past_key_values; decode steps consume the cached KV.
             extra_kwargs["use_cache"] = True
-            if not is_prefill:
-                cached_kv = getattr(self, "_cached_past_key_values", None)
+            if not is_prefill or batched:
+                cached_kv = None
+                handles = getattr(_attention_metadata, "cache_handles", ())
+                if handles and all(handle is handles[0] for handle in handles):
+                    cached_kv = handles[0]
+                if cached_kv is None:
+                    cached_kv = getattr(self, "_cached_past_key_values", None)
                 if cached_kv is not None:
                     extra_kwargs["past_key_values"] = cached_kv
         else:
+            extra_kwargs["use_cache"] = False
             if not is_prefill and _attention_metadata is not None:
                 seq_lens = getattr(_attention_metadata, "seq_lens", None)
                 if seq_lens is not None and seq_lens.numel() > 0:
-                    current_pos = int(seq_lens[0].item()) - 1
-                    extra_kwargs["position_ids"] = torch.tensor(
-                        [[current_pos]], device=input_tensor.device
-                    )
+                    total_len = int(seq_lens[0].item())
+                    start_pos = total_len - len(token_ids)
+                    extra_kwargs["position_ids"] = torch.arange(
+                        start_pos,
+                        total_len,
+                        device=input_tensor.device,
+                        dtype=torch.long,
+                    ).unsqueeze(0)
 
         with torch.no_grad():
-            if not use_paged_context:
+            if not use_paged_context and not use_mla_context:
                 outputs = self.model(input_tensor, **extra_kwargs)
+            elif use_mla_context:
+                from moe_infinity.models.deepseek_mla_attention import (
+                    clear_deepseek_mla_context,
+                    set_deepseek_mla_context,
+                )
+
+                for module in mla_attention_modules:
+                    set_deepseek_mla_context(module, _attention_metadata)
+                try:
+                    outputs = self.model(input_tensor, **extra_kwargs)
+                finally:
+                    for module in mla_attention_modules:
+                        clear_deepseek_mla_context(module)
             else:
                 backend = self._native_attention_backend
                 for attn_cls in paged_attention_classes:
@@ -708,7 +876,7 @@ class MoE:
                     for attn_cls in paged_attention_classes:
                         attn_cls.clear_paged_context()
 
-        if not use_paged_context:
+        if not use_paged_context and not use_mla_context:
             past_kv = getattr(outputs, "past_key_values", None)
             if past_kv is not None:
                 self._cached_past_key_values = past_kv
@@ -728,8 +896,47 @@ class MoE:
                 "output_hidden_states=True is required"
             )
 
+        if use_mla_context or batched:
+            from moe_infinity.spec_decode.protocols import RichForwardResult
+
+            cache_handle = (
+                self._native_mla_cache
+                if use_mla_context
+                else getattr(outputs, "past_key_values", None)
+            )
+            supplied_handles = tuple(
+                getattr(_attention_metadata, "cache_handles", ())
+            )
+            if use_mla_context and supplied_handles:
+                row_handles = supplied_handles
+            else:
+                row_handles = (cache_handle,) * int(input_tensor.shape[0])
+
+            return RichForwardResult(
+                logits=logits,
+                hidden_states=tuple(hidden_states),
+                cache_handle=cache_handle,
+                cache_handles=row_handles,
+                row_offsets=tuple(
+                    getattr(_attention_metadata, "row_offsets", ())
+                ),
+                row_lengths=tuple(
+                    getattr(_attention_metadata, "row_lengths", ())
+                ),
+            )
         past_key_values = getattr(outputs, "past_key_values", None)
         return logits, hidden_states, past_key_values
+
+    def _get_mla_attention_modules(self) -> list[torch.nn.Module]:
+        names = {"DeepseekV2MLAPagedAttention", "DeepseekV3MLAPagedAttention"}
+        modules_fn = getattr(self.model, "modules", None)
+        if not callable(modules_fn):
+            return []
+        return [
+            module
+            for module in modules_fn()
+            if module.__class__.__name__ in names
+        ]
 
     def _get_paged_attention_classes(self) -> list[type[Any]]:
         paged_class_names = {
@@ -757,6 +964,26 @@ class MoE:
             classes.append(cls)
 
         return classes
+
+    def _supports_native_rich_batch(self) -> bool:
+        """Fail-closed declaration for the dense row-aware rich contract."""
+        config = getattr(self.model, "config", None)
+        if any(
+            bool(getattr(config, name, False))
+            for name in (
+                "hybrid_attention",
+                "sliding_window_pattern",
+                "recurrent_chunk_size",
+            )
+        ):
+            return False
+        # Existing paged wrappers retain engine ownership and are driven by
+        # ModelRunner; MLA and Qwen/hybrid rollback are intentionally not
+        # widened through the dense direct-generation backend.
+        return (
+            not self._get_paged_attention_classes()
+            and not self._get_mla_attention_modules()
+        )
 
     def _configure_hook(self, input_ids: torch.LongTensor):
         if self.arch == "mixtral":
@@ -845,19 +1072,30 @@ class MoE:
 
         speculative_draft = kwargs.pop("speculative_draft", None)
 
+        generation_config = kwargs.get("generation_config")
+
+        def generation_value(name: str, default: Any) -> Any:
+            if name in kwargs:
+                return kwargs[name]
+            if generation_config is not None:
+                value = getattr(generation_config, name, None)
+                if value is not None:
+                    return value
+            return default
+
         model_type = getattr(
             getattr(self.model, "config", None), "model_type", ""
         )
         is_qwen35 = model_type == "qwen3_5_moe"
-        do_sample = kwargs.get("do_sample", None)
+        do_sample = generation_value("do_sample", None)
         sampling_temperature = (
-            0.0 if do_sample is False else float(kwargs.get("temperature", 1.0))
+            0.0
+            if do_sample is False
+            else float(generation_value("temperature", 1.0))
         )
-        is_greedy = (
-            sampling_temperature == 0.0
-            and float(kwargs.get("top_p", 1.0)) == 1.0
-            and int(kwargs.get("top_k", 0)) == 0
-        )
+        top_p = float(generation_value("top_p", 1.0))
+        top_k = int(generation_value("top_k", 0) or 0)
+        is_greedy = sampling_temperature == 0.0 and top_p == 1.0 and top_k == 0
         qwen35_dflash = bool(speculative_draft) and is_greedy
         native_engine = self._native_generation_engine
         native_for_call = (
@@ -868,18 +1106,94 @@ class MoE:
             and (not is_qwen35 or qwen35_dflash)
         )
 
+        if speculative_draft and is_qwen35 and not is_greedy:
+            raise ValueError(
+                "qwen3_5_moe speculative_draft (DFlash) requires "
+                "greedy decoding (do_sample=False or temperature=0, "
+                "top_p=1, top_k=0)"
+            )
+
+        if (
+            speculative_draft
+            and is_greedy
+            and input_ids.ndim == 2
+            and input_ids.shape[0] > 1
+        ):
+            if not self.use_native_engine or native_engine is None:
+                raise ValueError(
+                    "speculative_draft (DFlash) requires the MoE-Infinity "
+                    "native engine (use_native_engine=True)"
+                )
+            self._resolve_spec_strategy(speculative_draft)
+            try:
+                speculator = getattr(self, "_dflash_speculator", None)
+                if speculator is None:
+                    raise RuntimeError("DFlash speculator was not configured")
+
+                attention_mask = kwargs.get("attention_mask")
+                if attention_mask is None:
+                    prompt_lengths = [int(input_ids.shape[1])] * int(
+                        input_ids.shape[0]
+                    )
+                else:
+                    if tuple(attention_mask.shape) != tuple(input_ids.shape):
+                        raise ValueError(
+                            f"attention_mask shape {tuple(attention_mask.shape)} != "
+                            f"input_ids shape {tuple(input_ids.shape)}"
+                        )
+                    prompt_lengths = [
+                        int(value)
+                        for value in attention_mask.to(dtype=torch.long)
+                        .sum(dim=1)
+                        .tolist()
+                    ]
+                for prompt_length in prompt_lengths:
+                    if prompt_length > self.max_seq_length:
+                        raise ValueError(
+                            f"prompt length {prompt_length} exceeds max_seq_length "
+                            f"{self.max_seq_length}"
+                        )
+
+                max_tokens = generation_value("max_new_tokens", None)
+                if max_tokens is None:
+                    max_tokens = generation_value("max_tokens", 256)
+                stop_token_ids = kwargs.get("stop_token_ids")
+                if stop_token_ids is None:
+                    stop_token_ids = generation_value("eos_token_id", None)
+                if isinstance(stop_token_ids, bool):
+                    raise ValueError(
+                        "eos_token_id/stop_token_ids cannot be boolean"
+                    )
+                if isinstance(stop_token_ids, int):
+                    stop_token_ids = [stop_token_ids]
+                generator = kwargs.get("generator")
+                self._configure_hook(input_ids)
+                self._cached_past_key_values = None
+                self.model.eval()
+                output = speculator.generate(
+                    input_ids,
+                    max_new_tokens=max_tokens,
+                    temperature=sampling_temperature,
+                    stop_token_ids=stop_token_ids,
+                    top_k=top_k,
+                    top_p=top_p,
+                    attention_mask=attention_mask,
+                    generator=generator,
+                )
+                self.last_dflash_traces = getattr(
+                    speculator, "last_session_traces", ()
+                )
+                return output
+            finally:
+                self._cached_past_key_values = None
+                native_engine.spec_strategy = None
+
         if not native_for_call:
             if speculative_draft:
                 if input_ids.ndim == 2 and input_ids.shape[0] != 1:
                     raise NotImplementedError(
                         "speculative_draft (DFlash) v1 supports batch==1 "
                         f"only; got batch size {input_ids.shape[0]}"
-                    )
-                if is_qwen35 and not is_greedy:
-                    raise ValueError(
-                        "qwen3_5_moe speculative_draft (DFlash) requires "
-                        "greedy decoding (do_sample=False or temperature=0, "
-                        "top_p=1, top_k=0)"
                     )
                 raise ValueError(
                     "speculative_draft (DFlash) requires the MoE-Infinity "
@@ -908,11 +1222,13 @@ class MoE:
                 f"prompt length {len(prompt_token_ids)} exceeds max_seq_length {self.max_seq_length}"
             )
 
-        max_tokens = kwargs.get("max_new_tokens", kwargs.get("max_tokens", 256))
+        max_tokens = generation_value("max_new_tokens", None)
+        if max_tokens is None:
+            max_tokens = generation_value("max_tokens", 256)
         sampling_params = SamplingParams(
             temperature=sampling_temperature,
-            top_p=float(kwargs.get("top_p", 1.0)),
-            top_k=int(kwargs.get("top_k", 0)),
+            top_p=top_p,
+            top_k=top_k,
             max_tokens=int(max_tokens) if max_tokens is not None else 256,
         )
         try:
@@ -940,6 +1256,9 @@ class MoE:
         enable_prefix_caching: bool = False,
         offload_dir: Optional[str] = None,
         speculative_draft: Optional[object] = None,
+        enable_deepseek_mla_paging: bool = False,
+        max_resident_paged_speculative_sessions: int = 1,
+        min_free_mla_blocks_after_admission: int = 1,
     ) -> None:
         """
         Start the OpenAI-compatible continuous batching server.
@@ -954,6 +1273,9 @@ class MoE:
             kv_cache_ratio: Fraction of device_memory_ratio for KV cache (default: 0.25)
             max_batch_size: Maximum concurrent sequences (default: 32)
             enable_prefix_caching: Enable hash-based prefix caching (default: False)
+            enable_deepseek_mla_paging: Enable default-off DeepSeek V2/V3 MLA paging.
+            max_resident_paged_speculative_sessions: Resident paged-session cap.
+            min_free_mla_blocks_after_admission: Free blocks retained after admission.
             offload_dir: Path to offload directory (required)
             speculative_draft: Optional DFlash checkpoint, speculator, or draft
                 module for greedy batch-1 serving.
@@ -984,6 +1306,13 @@ class MoE:
             max_batch_size=max_batch_size,
             enable_prefix_caching=enable_prefix_caching,
             speculative_draft=serving_speculator,
+            enable_deepseek_mla_paging=enable_deepseek_mla_paging,
+            max_resident_paged_speculative_sessions=(
+                max_resident_paged_speculative_sessions
+            ),
+            min_free_mla_blocks_after_admission=(
+                min_free_mla_blocks_after_admission
+            ),
         )
 
         uvicorn = importlib.import_module("uvicorn")

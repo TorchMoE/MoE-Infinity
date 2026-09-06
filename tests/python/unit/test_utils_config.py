@@ -89,3 +89,71 @@ def test_native_engine_autocorrects_kv_cache_ratio(monkeypatch):
             kv_cache_memory_ratio=0.0,
         )
     assert config.kv_cache_memory_ratio == pytest.approx(0.15)
+
+
+def test_gpu_only_expert_routing_defaults_off(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig(offload_path="/tmp", use_native_engine=False)
+    assert config.gpu_only_expert_routing is False
+
+
+def test_gpu_only_expert_routing_loads_from_json(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig.load_from_json(
+        {
+            "offload_path": "/tmp",
+            "use_native_engine": False,
+            "gpu_only_expert_routing": True,
+        }
+    )
+    assert config.gpu_only_expert_routing is True
+
+
+def test_gpu_routing_rejects_current_overlap_boolean(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(
+        ValueError,
+        match="gpu_only_expert_routing cannot be combined with overlap prefetch",
+    ):
+        ArcherConfig(
+            offload_path="/tmp",
+            use_native_engine=False,
+            gpu_only_expert_routing=True,
+            speculative_prefetch_overlap=True,
+        )
+
+
+@pytest.mark.parametrize("mode", ["observe", "enforce"])
+def test_gpu_routing_rejects_future_overlap_modes(mode):
+    with pytest.raises(
+        ValueError,
+        match="gpu_only_expert_routing cannot be combined with overlap prefetch",
+    ):
+        ArcherConfig._validate_gpu_routing_overlap(True, False, mode)
+
+
+def test_paged_mla_admission_guard_defaults_are_safe(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig(use_native_engine=False)
+
+    assert config.enable_deepseek_mla_paging is False
+    assert config.max_resident_paged_speculative_sessions == 1
+    assert config.min_free_mla_blocks_after_admission == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_resident_paged_speculative_sessions", True),
+        ("max_resident_paged_speculative_sessions", -1),
+        ("min_free_mla_blocks_after_admission", False),
+        ("min_free_mla_blocks_after_admission", 0),
+    ],
+)
+def test_paged_mla_admission_guard_rejects_invalid_values(
+    monkeypatch, field_name, value
+):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+
+    with pytest.raises(ValueError, match=field_name):
+        ArcherConfig(use_native_engine=False, **{field_name: value})

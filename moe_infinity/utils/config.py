@@ -42,6 +42,15 @@ class ArcherConfig:
             "help": "When True, fire speculative prefetch BEFORE the layer-L barrier in dispatch_local so PCIe transfers overlap with layer-L compute. When False (default), prefetch fires after the barrier (legacy behavior). Requires speculative_prefetch=True. Currently exposes a cache-pressure failure mode (see .sisyphus/findings/ibp-feasibility/SUMMARY.md) when device_memory_ratio is high; lower device_memory_ratio if you enable this and observe 'All cached expert locked' warnings."
         },
     )
+    gpu_only_expert_routing: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use native CUDA active-expert discovery for single-host local "
+                "dispatch. Falls back to eager Python routing when unavailable."
+            )
+        },
+    )
     device_memory_ratio: float = field(
         default=0.9,
         metadata={"help": "Ratio of device memory to use"},
@@ -74,6 +83,24 @@ class ArcherConfig:
             "help": "Enable attention backend offloading. Default False (uses HuggingFace attention)."
         },
     )
+    enable_deepseek_mla_paging: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable experimental batch-one DeepSeek V2/V3 MLA paging. Default False."
+        },
+    )
+    max_resident_paged_speculative_sessions: int = field(
+        default=1,
+        metadata={
+            "help": "Maximum concurrent resident paged-MLA speculative sessions. Default 1; set 0 to force Stage 4a fallback."
+        },
+    )
+    min_free_mla_blocks_after_admission: int = field(
+        default=1,
+        metadata={
+            "help": "Minimum MLA blocks that remain free after reserving all active and newly admitted requests' full declared budgets plus maximum transient DFlash verify peaks. Default 1."
+        },
+    )
     enable_kv_cache_offload: bool = field(
         default=False,
         metadata={
@@ -86,6 +113,22 @@ class ArcherConfig:
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
         },
     )
+
+    @staticmethod
+    def _validate_gpu_routing_overlap(
+        gpu_only_expert_routing: bool,
+        speculative_prefetch_overlap: bool,
+        overlap_prefetch_mode: str = "off",
+    ) -> None:
+        if gpu_only_expert_routing and (
+            speculative_prefetch_overlap
+            or overlap_prefetch_mode in {"observe", "enforce"}
+        ):
+            raise ValueError(
+                "gpu_only_expert_routing cannot be combined with overlap "
+                "prefetch in the first release; disable "
+                "speculative_prefetch_overlap and overlap_prefetch_mode"
+            )
 
     @classmethod
     def load_from_file(cls, config_path: Union[str, os.PathLike]):
@@ -110,6 +153,12 @@ class ArcherConfig:
         return config
 
     def __post_init__(self):
+        self._validate_gpu_routing_overlap(
+            self.gpu_only_expert_routing,
+            self.speculative_prefetch_overlap,
+            getattr(self, "overlap_prefetch_mode", "off"),
+        )
+
         self.perfect_cache_file = os.path.join(
             self.offload_path, "perfect_cache"
         )
@@ -159,4 +208,18 @@ class ArcherConfig:
         if self.device_memory_ratio + self.kv_cache_memory_ratio > 1.0:
             raise ValueError(
                 f"device_memory_ratio ({self.device_memory_ratio}) + kv_cache_memory_ratio ({self.kv_cache_memory_ratio}) > 1.0"
+            )
+        if (
+            type(self.max_resident_paged_speculative_sessions) is not int
+            or self.max_resident_paged_speculative_sessions < 0
+        ):
+            raise ValueError(
+                "max_resident_paged_speculative_sessions must be an integer >= 0"
+            )
+        if (
+            type(self.min_free_mla_blocks_after_admission) is not int
+            or self.min_free_mla_blocks_after_admission < 1
+        ):
+            raise ValueError(
+                "min_free_mla_blocks_after_admission must be an integer >= 1"
             )

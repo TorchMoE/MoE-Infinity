@@ -44,18 +44,22 @@ class _FakeRuntimeEngine:
         config: dict[str, object],
         tokenizer: object,
         speculative_draft: object = None,
+        decode_graph_capability_provider: object = None,
     ) -> None:
         self.model = model
         self.engine = engine
         self.config = config
         self.tokenizer = tokenizer
         self.speculative_draft = speculative_draft
+        self.decode_graph_capability_provider = decode_graph_capability_provider
 
 
 class _FakeMoE:
+    last_config: dict[str, object] | None = None
+
     def __init__(self, model_name: str, config: dict[str, object]) -> None:
         _ = model_name
-        _ = config
+        type(self).last_config = config
         self.model = SimpleNamespace(
             config=SimpleNamespace(
                 num_hidden_layers=1,
@@ -238,6 +242,80 @@ def test_watchdog_enabled_with_flags(monkeypatch: Any) -> None:
         assert config.enable_pyspy_dump is True
 
         assert module._decode_watchdog is decode_watchdog
+    finally:
+        _restore_runtime_state(module, original_state)
+
+
+@pytest.mark.parametrize(
+    ("mla_overrides", "expected_mla_config"),
+    [
+        (
+            {},
+            {
+                "enable_deepseek_mla_paging": False,
+                "max_resident_paged_speculative_sessions": 1,
+                "min_free_mla_blocks_after_admission": 1,
+            },
+        ),
+        (
+            {
+                "enable_deepseek_mla_paging": True,
+                "max_resident_paged_speculative_sessions": 3,
+                "min_free_mla_blocks_after_admission": 5,
+            },
+            {
+                "enable_deepseek_mla_paging": True,
+                "max_resident_paged_speculative_sessions": 3,
+                "min_free_mla_blocks_after_admission": 5,
+            },
+        ),
+    ],
+)
+def test_partial_namespace_starts_watchdog_and_preserves_mla_config(
+    monkeypatch: Any,
+    mla_overrides: dict[str, object],
+    expected_mla_config: dict[str, object],
+) -> None:
+    module: Any = importlib.import_module(MODULE_NAME)
+    original_state = _snapshot_runtime_state(module)
+    _patch_initialize_model_dependencies(monkeypatch, module)
+
+    module.engine = None
+    module.stream_manager = None
+    module.tokenizer = None
+    module.model_name_global = None
+    module._startup_args = _startup_args(
+        startup_timeout=12.0,
+        decode_step_timeout=0.8,
+        **mla_overrides,
+    )
+    _FakeMoE.last_config = None
+
+    startup_watchdog = MagicMock()
+    decode_watchdog = MagicMock()
+    try:
+        with (
+            patch.object(
+                watchdog_module,
+                "start_startup_watchdog",
+                return_value=startup_watchdog,
+            ) as startup_mock,
+            patch.object(
+                watchdog_module,
+                "start_decode_watchdog",
+                return_value=decode_watchdog,
+            ) as decode_mock,
+        ):
+            asyncio.run(module._initialize_model())
+
+        startup_mock.assert_called_once()
+        decode_mock.assert_called_once()
+        startup_watchdog.cancel.assert_called_once()
+        assert isinstance(module.engine, _FakeRuntimeEngine)
+        assert _FakeMoE.last_config is not None
+        assert {
+            key: _FakeMoE.last_config[key] for key in expected_mla_config
+        } == expected_mla_config
     finally:
         _restore_runtime_state(module, original_state)
 

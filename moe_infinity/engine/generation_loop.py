@@ -114,6 +114,9 @@ class GenerationEngine:
     ) -> bool:
         if self.spec_strategy is None:
             return False
+        supports = getattr(self.spec_strategy, "supports_engine_request", None)
+        if callable(supports):
+            return bool(supports(sp, batch_size=batch_size))
         if batch_size != 1:
             return False
         if (

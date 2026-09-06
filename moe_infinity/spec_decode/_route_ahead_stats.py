@@ -47,6 +47,7 @@ from moe_infinity.spec_decode._prefetch_route import (
     rejected_expert_ids,
     union_experts_from_mask,
 )
+from moe_infinity.spec_decode.protocols import ExecutorEvidence
 
 
 class RouteAheadStepSummary(NamedTuple):
@@ -98,6 +99,14 @@ class RouteAheadStats:
         self.kept_prefetch_bytes: int = 0
         self.wasted_prefetch_bytes: int = 0
         self._bytes_seen: bool = False
+        self._attempted_layers: List[int] = []
+        self._fired_layers: List[int] = []
+        self._actual_expert_union: set[tuple[int, int]] = set()
+        self._actual_expert_union_by_row: set[tuple[int, int, int]] = set()
+        self._prefetcher_present: bool = False
+        self._attempted_prefetch_bytes: int = 0
+        self._cache_hit_rate: Optional[float] = None
+        self._fallback_reason: Optional[str] = None
         self._pending: List[
             Tuple[int, List[int], torch.Tensor, Optional[Dict[int, int]]]
         ] = []
@@ -152,6 +161,38 @@ class RouteAheadStats:
         self._pending.append(
             (int(layer_id), [int(e) for e in predicted_ids], mask_cpu, nbytes)
         )
+
+    def observe_executor_attempt(
+        self,
+        layer_id: int,
+        actual_ids: Sequence[int],
+        *,
+        actual_ids_by_row: Sequence[tuple[int, int, int]] = (),
+        prefetcher_present: bool,
+        fired: bool,
+        fallback_reason: Optional[str] = None,
+        prefetched_bytes: int = 0,
+        cache_hit_rate: Optional[float] = None,
+    ) -> None:
+        """Record executor capability/firing without affecting dispatch."""
+        layer = int(layer_id)
+        self._attempted_layers.append(layer)
+        self._actual_expert_union.update(
+            (layer, int(expert_id)) for expert_id in actual_ids
+        )
+        self._actual_expert_union_by_row.update(actual_ids_by_row)
+        self._prefetcher_present = self._prefetcher_present or bool(
+            prefetcher_present
+        )
+        if fired:
+            self._fired_layers.append(layer)
+        if fallback_reason is not None and self._fallback_reason is None:
+            self._fallback_reason = fallback_reason
+        self._attempted_prefetch_bytes += max(0, int(prefetched_bytes))
+        if cache_hit_rate is not None:
+            rate = float(cache_hit_rate)
+            if 0.0 <= rate <= 1.0:
+                self._cache_hit_rate = rate
 
     def commit_step(self, kept_rows: int) -> RouteAheadStepSummary:
         """Finalize the in-flight step: coverage + rejected-token waste.
@@ -243,11 +284,33 @@ class RouteAheadStats:
             return 0.0
         return self.wasted_experts / self.predicted_experts
 
+    @property
+    def executor_evidence(self) -> ExecutorEvidence:
+        """Immutable snapshot, separate from target/drafter pairing."""
+        attempted = tuple(self._attempted_layers)
+        return ExecutorEvidence(
+            wiring_reachable=bool(attempted),
+            prefetcher_present=self._prefetcher_present,
+            attempted_layers=attempted,
+            fired_layers=tuple(self._fired_layers),
+            actual_expert_union=frozenset(self._actual_expert_union),
+            actual_expert_union_by_row=frozenset(
+                self._actual_expert_union_by_row
+            ),
+            prefetched_bytes=self._attempted_prefetch_bytes,
+            coverage=self.coverage if attempted else None,
+            wasted_prefetch_bytes=(
+                self.wasted_prefetch_bytes if self._bytes_seen else None
+            ),
+            cache_hit_rate=self._cache_hit_rate,
+            fallback_reason=self._fallback_reason,
+        )
+
     def reset(self) -> None:
         """Zero all counters and drop any uncommitted records."""
         self.__init__()
 
-    def as_dict(self) -> Dict[str, Union[int, float, None]]:
+    def as_dict(self) -> Dict[str, object]:
         """Flat snapshot of the counters, byte totals, and derived ratios.
 
         The three ``*_prefetch_bytes`` entries are ``None`` until a step is
@@ -273,6 +336,7 @@ class RouteAheadStats:
             "wasted_prefetch_bytes": (
                 self.wasted_prefetch_bytes if self._bytes_seen else None
             ),
+            "executor_evidence": self.executor_evidence.as_dict(),
         }
 
 

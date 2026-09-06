@@ -113,6 +113,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_inputs", &ExpertDispatcher::SetInputs)
       .def("set_expected_queue", &ExpertDispatcher::SetExpectedQueue)
       .def("wait_expert", &ExpertDispatcher::WaitHiddenStates)
+      .def("dispatch_experts", &ExpertDispatcher::DispatchExperts)
+      .def("take_last_active_experts", &ExpertDispatcher::TakeLastActiveExperts)
+      .def("get_routing_stats", &ExpertDispatcher::GetRoutingStats)
+      .def("_set_dispatch_fault_for_test",
+           &ExpertDispatcher::SetDispatchFaultForTest)
+      .def("_fail_dispatch_for_test", &ExpertDispatcher::FailDispatchForTest)
       .def("notify_fetch_start", &ExpertDispatcher::NotifyFetchStart)
       .def("clear_expert_cache_counts",
            &ExpertDispatcher::ClearExpertCacheCounts)

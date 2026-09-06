@@ -5,6 +5,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -198,3 +199,180 @@ def test_execute_empty_batch_skips_forward() -> None:
     logits = runner.execute(batch)
 
     assert logits.shape == (0, 7)
+
+
+from transformers.models.qwen3_moe.configuration_qwen3_moe import (  # noqa: E402
+    Qwen3MoeConfig,
+)
+
+from moe_infinity.models.paged_attention_registry import (  # noqa: E402
+    PagedAttentionLayerRegistry,
+)
+from moe_infinity.models.qwen3_paged_attention import (  # noqa: E402
+    Qwen3PagedAttention,
+)
+from moe_infinity.runtime.attention_backend import (  # noqa: E402
+    PagedAttentionBackend,
+)
+from moe_infinity.runtime.paged_kv_storage import (  # noqa: E402
+    PagedKVStorage,
+    PagedKVStorageSpec,
+)
+
+
+def _qwen3_config(num_layers: int = 2) -> Qwen3MoeConfig:
+    return Qwen3MoeConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_hidden_layers=num_layers,
+        intermediate_size=32,
+        moe_intermediate_size=16,
+        num_experts=2,
+        num_experts_per_tok=1,
+        vocab_size=64,
+    )
+
+
+class _PagedEngine:
+    def __init__(self, backend: object, block_size: int) -> None:
+        self.request_id = 0
+        self.expert_tracer = _MockExpertTracer()
+        self.expert_layer_modules = [types.SimpleNamespace(seq_id_list=[])]
+        self._attention_backend = backend
+        self.kv_cache = types.SimpleNamespace(
+            block_size=block_size, storage=getattr(backend, "storage", None)
+        )
+
+    def _generate_request_id(self) -> int:
+        request_id = self.request_id
+        self.request_id += 1
+        return request_id
+
+    def get_attention_backend(self) -> object:
+        return self._attention_backend
+
+
+class _TwoLayerQwen3(torch.nn.Module):
+    def __init__(self, config: Qwen3MoeConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.embed = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = torch.nn.ModuleList(
+            [
+                Qwen3PagedAttention(config, layer_idx=0),
+                Qwen3PagedAttention(config, layer_idx=1),
+            ]
+        )
+        self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size)
+        head_dim = config.head_dim
+
+        def _rotary(seq_len: int, device: torch.device):
+            cos = torch.ones(1, seq_len, head_dim, device=device)
+            sin = torch.zeros(1, seq_len, head_dim, device=device)
+            return cos, sin
+
+        self._rotary = _rotary
+
+    def eval(self) -> "_TwoLayerQwen3":
+        return super().eval()
+
+    def forward(self, input_ids: torch.Tensor, **kwargs: object) -> _MockOutput:
+        _ = kwargs
+        hidden = self.embed(input_ids)
+        cos, sin = self._rotary(input_ids.shape[1], input_ids.device)
+        for layer in self.layers:
+            attn_out, _ = layer(
+                hidden_states=hidden,
+                position_embeddings=(cos, sin),
+                attention_mask=None,
+            )
+            hidden = hidden + attn_out
+        return _MockOutput(self.lm_head(hidden))
+
+
+def _make_graph_safe_native_paged_runner(
+    *,
+    storage_device: torch.device | None = None,
+    runner_device: torch.device | None = None,
+):
+    storage_device = storage_device or torch.device("cpu")
+    runner_device = runner_device or storage_device
+    spec = PagedKVStorageSpec(
+        num_layers=2,
+        num_blocks=16,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        device=storage_device,
+    )
+    storage = PagedKVStorage(spec)
+    backend = PagedAttentionBackend(storage=storage, use_flashinfer=False)
+    config = _qwen3_config(num_layers=2)
+    model = _TwoLayerQwen3(config).to(storage.spec.device)
+    registry = PagedAttentionLayerRegistry.register(model, backend, storage)
+    engine = _PagedEngine(backend, block_size=storage.block_size)
+    runner = ModelRunner(
+        model,
+        engine,
+        device=runner_device,
+        paged_kv_storage=storage,
+        paged_attention_registry=registry,
+    )
+    batch = BatchMetadata(
+        seq_ids=[1, 2],
+        input_token_ids=[5, 6],
+        seq_lengths=[1, 1],
+        context_lengths=[8, 3],
+        is_prefill=[False, False],
+        block_tables=[[0, 1, 2], [3]],
+        token_offsets=[0, 1, 2],
+        sampling_params=[SamplingParams(), SamplingParams()],
+    )
+    return runner, batch, storage
+
+
+def test_prepared_native_paged_decode_preserves_side_effects_and_pointers() -> (
+    None
+):
+    runner, batch, storage = _make_graph_safe_native_paged_runner()
+    prepared = runner.allocate_decode_buffers(batch_bucket=2, context_bucket=16)
+    pointers = prepared.data_ptrs()
+    runner.copy_decode_batch(batch, prepared, scratch_block_ids=[])
+    runner.prepare_batch_side_effects(batch)
+    logits = runner.forward_prepared_decode(prepared)
+
+    assert logits.shape[0] == 2
+    assert prepared.data_ptrs() == pointers
+    assert prepared.attention_metadata.kv_storage_owner_id == storage.owner_id
+    assert prepared.attention_metadata.seq_lens.tolist() == [9, 4]
+
+
+def test_copy_decode_batch_rejects_block_id_outside_authoritative_storage() -> (
+    None
+):
+    runner, batch, storage = _make_graph_safe_native_paged_runner()
+    batch.block_tables[0] = [storage.num_blocks]
+    prepared = runner.allocate_decode_buffers(batch_bucket=2, context_bucket=16)
+    with pytest.raises(ValueError, match="block id"):
+        runner.copy_decode_batch(batch, prepared, scratch_block_ids=[])
+
+
+def test_allocate_decode_buffers_requires_exact_runner_storage_device() -> None:
+    runner, _, _ = _make_graph_safe_native_paged_runner(
+        storage_device=torch.device("cpu"),
+        runner_device=torch.device("cuda:0"),
+    )
+    with pytest.raises(ValueError, match="device"):
+        runner.allocate_decode_buffers(batch_bucket=2, context_bucket=16)
+
+
+def test_every_prepared_buffer_uses_exact_storage_device() -> None:
+    runner, _, storage = _make_graph_safe_native_paged_runner()
+    prepared = runner.allocate_decode_buffers(batch_bucket=2, context_bucket=16)
+    tensors = prepared.tensor_values()
+    assert tensors
+    assert all(tensor.device == storage.spec.device for tensor in tensors)

@@ -414,6 +414,8 @@ class Scheduler:
                 SequenceStatus.WAITING,
                 SequenceStatus.PREFILL,
                 SequenceStatus.DECODE,
+                SequenceStatus.DRAFT,
+                SequenceStatus.VERIFY,
                 SequenceStatus.SWAPPED,
             ):
                 sequence.set_status(SequenceStatus.FINISHED)
@@ -467,22 +469,32 @@ class Scheduler:
                 if sequence.status in (
                     SequenceStatus.PREFILL,
                     SequenceStatus.DECODE,
+                    SequenceStatus.DRAFT,
+                    SequenceStatus.VERIFY,
                 ):
                     running_seq_ids.append(sequence.seq_id)
         return running_seq_ids
 
     def _preempt_oldest_running_group(self) -> list[int]:
+        preserved: list[SequenceGroup] = []
         while self._running:
             group = self._running.popleft()
+            active = [
+                sequence
+                for sequence in group.sequences
+                if sequence.status
+                not in (SequenceStatus.FINISHED, SequenceStatus.CANCELLED)
+            ]
+            if not active or any(
+                sequence.status
+                not in (SequenceStatus.PREFILL, SequenceStatus.DECODE)
+                for sequence in active
+            ):
+                preserved.append(group)
+                continue
             preempted_seq_ids: list[int] = []
 
-            for sequence in group.sequences:
-                if sequence.status not in (
-                    SequenceStatus.PREFILL,
-                    SequenceStatus.DECODE,
-                ):
-                    continue
-
+            for sequence in active:
                 try:
                     self.kv_cache.swap_out(sequence.seq_id)
                 except KeyError:
@@ -493,8 +505,10 @@ class Scheduler:
 
             if preempted_seq_ids:
                 self._swapped.append(group)
+                self._running.extendleft(reversed(preserved))
                 return preempted_seq_ids
 
+        self._running.extend(preserved)
         return []
 
     def _recover_swapped_groups(

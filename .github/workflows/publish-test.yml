@@ -13,36 +13,16 @@ on:
       - 'tests/**'
       - 'docs/**'
 
-env:
-  # Bump this to the NEXT planned release when cutting a stable release.
-  # Nightlies must sort higher than the current stable so that
-  # `pip install --pre moe-infinity` picks them up.
-  NIGHTLY_BASE_VERSION: "0.0.2"
-
 permissions:
   contents: write
 
 jobs:
-  setup-version:
-    runs-on: ubuntu-22.04
-    steps:
-    - name: Generate version number
-      run: |
-        VERSION_HASH=$(date +"%Y%m%d%H%M%S")
-        echo "Generated version hash: $VERSION_HASH"
-        echo $VERSION_HASH > version.txt
-
-    - name: Upload version number as artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: version
-        path: version.txt
-
   wheel:
     name: Build Wheel
     runs-on: ${{ matrix.os }}
-    needs: setup-version
-    permissions: write-all
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -53,12 +33,8 @@ jobs:
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v3
-
-      - name: Download version value artifact
-        uses: actions/download-artifact@v4
         with:
-          name: version
-          path: artifact
+          fetch-depth: 0
 
       - name: Free disk space
         run: |
@@ -83,13 +59,16 @@ jobs:
       - name: Install Python build dependencies (torch matched to CUDA)
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install "setuptools>=78.1.1,<82" wheel ninja py-cpuinfo build
+          python3 -m pip install "setuptools>=78.1.1,<82" "setuptools-scm>=8" wheel ninja py-cpuinfo build
           python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu128
 
       - name: Fetch CUTLASS headers
         run: |
           git clone --depth 1 --branch v3.9.2 https://github.com/NVIDIA/cutlass.git "${HOME}/cutlass"
 
+      # setuptools-scm derives the version from git history: a commit that is N
+      # commits after tag "vX.Y.Z" builds as "X.Y.(Z+1).devN". local_scheme in
+      # pyproject.toml strips the "+gHASH" suffix so the sdist is PyPI-valid.
       - name: Build Wheel
         shell: bash
         env:
@@ -98,8 +77,7 @@ jobs:
           export CUDA_HOME="/usr/local/cuda-${{ matrix.cuda-version }}"
           export PATH="${CUDA_HOME}/bin:${PATH}"
           export CUTLASS_DIR="${HOME}/cutlass"
-          VERSION_HASH=$(cat artifact/version.txt)
-          MOEINF_VERSION=${{ env.NIGHTLY_BASE_VERSION }}.dev${VERSION_HASH} python3 -m build --wheel --no-isolation
+          python3 -m build --wheel --no-isolation
           wheel_name=$(ls dist/*whl | xargs -n 1 basename)
           asset_name=${wheel_name//"linux"/"manylinux1"}
           echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
@@ -108,8 +86,7 @@ jobs:
       - name: Build Source
         if: ${{ matrix.python-version == '3.10' }}
         run: |
-          VERSION_HASH=$(cat artifact/version.txt)
-          MOEINF_VERSION=${{ env.NIGHTLY_BASE_VERSION }}.dev${VERSION_HASH} python3 -m build --sdist
+          python3 -m build --sdist
 
       - name: Rename Wheel
         run: |
@@ -122,12 +99,12 @@ jobs:
           cp dist/*.tar.gz sdist_only/
 
       # Nightly publishes only the sdist to PyPI (see publish.yml for rationale).
+      # Auth via PyPI Trusted Publishing (OIDC) — no username/password needed;
+      # requires id-token: write (above) and a publisher registered on PyPI for
+      # this repo + workflow file. See RELEASE.md.
       - name: Publish sdist to PyPI
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.python-version == '3.10' }}
         uses: pypa/gh-action-pypi-publish@release/v1.8
         with:
           skip-existing: true
           packages-dir: sdist_only
-        env:
-          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
-          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
