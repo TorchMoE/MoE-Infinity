@@ -83,7 +83,8 @@ moe_infinity/
 │   ├── sequence.py            SequenceData, SequenceStatus, SamplingParams
 │   ├── sampler.py             Token sampling (temperature, top_p, top_k, stop)
 │   ├── stream.py              StreamManager for SSE streaming responses
-│   ├── prefix_cache.py        Prefix-cache hit detection
+│   ├── prefix_contract.py     Shared PrefixLease / PrefixMatch / provider
+│   ├── prefix_cache.py        Namespace-scoped exact-path prefix index + leases
 │   ├── validation.py          Request validation + error shaping
 │   ├── health.py              /health endpoint state
 │   ├── watchdog.py            Startup / decode timeout enforcement
@@ -226,6 +227,25 @@ as well as:
 - `kernel/` for routing and attention kernels
 - The native `_engine.so` / `_kv_cache.so` / `_paged_attn.so` / `_store.so`
   extensions (built from `core/`)
+
+### Prefix KV Reuse (opt-in, async path)
+
+When `--enable-prefix-caching` is set and the runtime is a supported Qwen3 paged
+layer registry with real FlashInfer prefill/decode, `ContinuousBatchingEngine`
+resolves a `PrefixReuseCapability`, binds the backend's single
+`LayeredPagedKVStore` into `PagedKVCache.set_block_store()` before constructing
+the `Scheduler` with a `PrefixLeaseProvider`. `serving/prefix_contract.py` is the
+sole definition site for `PrefixLease`/`PrefixMatch`/`PrefixLeaseProvider`;
+`serving/prefix_cache.py` holds the namespace-scoped exact-path index. The
+scheduler pins matching blocks with leases before eviction and admits each
+`SequenceGroup` atomically via `prepare_group`/`commit_group`; the engine
+advances `committed_kv_tokens` and publishes only block-complete committed prompt
+ranges after a successful forward. Copy-on-write keeps indexed blocks immutable.
+Any unsupported runtime, binding mismatch, or disabled flag leaves the provider
+`None` and executes the unchanged cold path with a stable disabled reason.
+`runtime/attention_backend.py` separates submitted query lengths from total KV
+lengths (`PagedBatchLengths`) so a warm suffix query is not treated as a full
+prompt.
 
 ## 4. Request Lifecycle (Continuous Batching)
 

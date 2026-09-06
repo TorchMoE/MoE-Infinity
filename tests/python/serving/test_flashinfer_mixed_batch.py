@@ -45,6 +45,8 @@ _BATCH_MODULE = _load_module(
     ROOT / "moe_infinity" / "serving" / "batch.py",
 )
 
+from moe_infinity.runtime.attention_types import PagedBatchLengths  # noqa: E402
+
 SamplingParams = _SEQUENCE_MODULE.SamplingParams
 BatchMetadata = _BATCH_MODULE.BatchMetadata
 split_prefill_decode_batch = _BATCH_MODULE.split_prefill_decode_batch
@@ -52,27 +54,34 @@ split_prefill_decode_batch = _BATCH_MODULE.split_prefill_decode_batch
 
 def _make_batch(is_prefill: list[bool]) -> BatchMetadata:
     seq_ids = [10 + idx for idx in range(len(is_prefill))]
-    seq_lengths = [idx + 1 for idx in range(len(is_prefill))]
+    query_lengths = [idx + 1 for idx in range(len(is_prefill))]
     context_lengths = [idx * 3 for idx in range(len(is_prefill))]
+    kv_seq_lengths = [
+        context_len + query_len
+        for context_len, query_len in zip(context_lengths, query_lengths)
+    ]
     block_tables = [[idx] for idx in range(len(is_prefill))]
     sampling_params = [SamplingParams() for _ in is_prefill]
 
     input_token_ids: list[int] = []
-    token_offsets = [0]
+    query_offsets = [0]
     next_token = 100
-    for seq_len in seq_lengths:
+    for seq_len in query_lengths:
         input_token_ids.extend(list(range(next_token, next_token + seq_len)))
         next_token += seq_len
-        token_offsets.append(len(input_token_ids))
+        query_offsets.append(len(input_token_ids))
 
     return BatchMetadata(
         seq_ids=seq_ids,
         input_token_ids=input_token_ids,
-        seq_lengths=seq_lengths,
-        context_lengths=context_lengths,
+        lengths=PagedBatchLengths(
+            query_lengths=query_lengths,
+            query_offsets=query_offsets,
+            context_lengths=context_lengths,
+            kv_seq_lengths=kv_seq_lengths,
+        ),
         is_prefill=is_prefill,
         block_tables=block_tables,
-        token_offsets=token_offsets,
         sampling_params=sampling_params,
     )
 
@@ -87,11 +96,11 @@ def test_split_prefill_decode_partitions_correctly() -> None:
     assert split.prefill_batch is not None
     assert split.decode_batch is not None
     assert split.prefill_batch.seq_ids == [10, 12]
-    assert split.prefill_batch.seq_lengths == [1, 3]
+    assert split.prefill_batch.query_lengths == [1, 3]
     assert split.prefill_batch.input_token_ids == [100, 103, 104, 105]
-    assert split.prefill_batch.token_offsets == [0, 1, 4]
+    assert split.prefill_batch.query_offsets == [0, 1, 4]
     assert split.decode_batch.seq_ids == [11, 13, 14]
-    assert split.decode_batch.seq_lengths == [2, 4, 5]
+    assert split.decode_batch.query_lengths == [2, 4, 5]
     assert split.decode_batch.input_token_ids == [
         101,
         102,
@@ -105,7 +114,7 @@ def test_split_prefill_decode_partitions_correctly() -> None:
         113,
         114,
     ]
-    assert split.decode_batch.token_offsets == [0, 2, 6, 11]
+    assert split.decode_batch.query_offsets == [0, 2, 6, 11]
 
 
 def test_split_all_prefill_returns_single_batch() -> None:
@@ -119,7 +128,7 @@ def test_split_all_prefill_returns_single_batch() -> None:
     assert split.decode_batch is None
     assert split.prefill_batch.seq_ids == batch.seq_ids
     assert split.prefill_batch.input_token_ids == batch.input_token_ids
-    assert split.prefill_batch.token_offsets == batch.token_offsets
+    assert split.prefill_batch.query_offsets == batch.query_offsets
 
 
 def test_split_all_decode_returns_single_batch() -> None:
@@ -133,7 +142,7 @@ def test_split_all_decode_returns_single_batch() -> None:
     assert split.decode_batch is not None
     assert split.decode_batch.seq_ids == batch.seq_ids
     assert split.decode_batch.input_token_ids == batch.input_token_ids
-    assert split.decode_batch.token_offsets == batch.token_offsets
+    assert split.decode_batch.query_offsets == batch.query_offsets
 
 
 def test_recombine_outputs_preserves_sequence_order() -> None:

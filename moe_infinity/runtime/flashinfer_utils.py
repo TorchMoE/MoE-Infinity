@@ -16,7 +16,10 @@ except Exception:
 HAS_FLASHINFER: Final[bool] = _has_flashinfer
 
 
-_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
+# Shared prefill+decode scratch: chunked append-attention split-KV scratch
+# (tmp_s/LSE/partial-O) grows with query rows and KV pages, overflowing the
+# 128 MiB FlashInfer example default on chunk 2; 256 MiB gives ~2x headroom.
+_WORKSPACE_SIZE_BYTES = 256 * 1024 * 1024
 _WORKSPACE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
