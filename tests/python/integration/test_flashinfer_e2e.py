@@ -268,6 +268,113 @@ def test_e2e_flashinfer_prefill_decode_loop(
     assert fake_decode.calls >= 1
 
 
+@pytest.mark.skipif(
+    not (HAS_FLASHINFER and torch.cuda.is_available()),
+    reason="requires FlashInfer and CUDA",
+)
+def test_e2e_flashinfer_chunked_prefill_with_active_decode() -> None:
+    device = torch.device("cuda")
+    backend = _make_backend(device=device, dtype=torch.float16)
+    engine = ContinuousBatchingEngine(
+        model=_MockPagedModel(vocab_size=97, device=device),
+        engine=_MockOffloadEngine(attention_backend=backend),
+        config={
+            **_make_engine_config(dtype="float16"),
+            "enable_chunked_prefill": True,
+            "prefill_chunk_size": 2,
+            "max_tokens_per_step": 3,
+        },
+    )
+    engine.add_request(
+        "decode", [10], SamplingParams(temperature=0.0, max_tokens=4)
+    )
+    first = engine.step()
+    assert [row.token_id for row in first] == [11]
+    engine.add_request(
+        "long",
+        [20, 21, 22, 23, 24],
+        SamplingParams(temperature=0.0, max_tokens=1),
+    )
+
+    observed = [*first]
+    while engine.has_pending_requests():
+        observed.extend(engine.step())
+
+    assert engine.get_request_n_outputs("decode") == [[11, 12, 13, 14]]
+    assert engine.get_request_n_outputs("long") == [[25]]
+    assert engine.get_stats()["num_prefill_chunks"] >= 4
+
+
+def _make_chunked_flashinfer_engine() -> ContinuousBatchingEngine:
+    device = torch.device("cuda")
+    backend = _make_backend(device=device, dtype=torch.float16)
+    return ContinuousBatchingEngine(
+        model=_MockPagedModel(vocab_size=97, device=device),
+        engine=_MockOffloadEngine(attention_backend=backend),
+        config={
+            **_make_engine_config(dtype="float16"),
+            "enable_chunked_prefill": True,
+            "prefill_chunk_size": 2,
+            "max_tokens_per_step": 2,
+        },
+    )
+
+
+def _add_parity_request(engine: ContinuousBatchingEngine) -> None:
+    engine.add_request(
+        "long",
+        [20, 21, 22, 23, 24],
+        SamplingParams(temperature=0.0, max_tokens=1),
+    )
+
+
+def _finish_and_capture_terminal(
+    engine: ContinuousBatchingEngine,
+) -> tuple[torch.Tensor, list[int]]:
+    captured: dict[str, torch.Tensor] = {}
+    original_execute = engine._execute_batch
+
+    def _capture(batch: BatchMetadata) -> torch.Tensor:
+        logits = original_execute(batch)
+        captured["logits"] = logits.detach().clone()
+        return logits
+
+    engine._execute_batch = _capture  # type: ignore[method-assign]
+    outputs: list[int] = []
+    while engine.has_pending_requests():
+        for row in engine.step():
+            outputs.append(row.token_id)
+    return captured["logits"], outputs
+
+
+@pytest.mark.skipif(
+    not (HAS_FLASHINFER and torch.cuda.is_available()),
+    reason="requires FlashInfer and CUDA",
+)
+def test_partial_prefill_preemption_preserves_logits_and_output() -> None:
+    uninterrupted = _make_chunked_flashinfer_engine()
+    resumed = _make_chunked_flashinfer_engine()
+    _add_parity_request(uninterrupted)
+    _add_parity_request(resumed)
+
+    assert uninterrupted.step() == []
+    assert resumed.step() == []
+    preempted = resumed.scheduler._preempt_oldest_running_group()
+    assert preempted == [0]
+    resumed.scheduler._recover_swapped_groups(list(resumed.scheduler._swapped))
+
+    uninterrupted_logits, uninterrupted_output = _finish_and_capture_terminal(
+        uninterrupted
+    )
+    resumed_logits, resumed_output = _finish_and_capture_terminal(resumed)
+
+    torch.testing.assert_close(resumed_logits, uninterrupted_logits)
+    assert resumed_output == uninterrupted_output
+    assert resumed.kv_cache.block_allocator.num_free_blocks == (
+        uninterrupted.kv_cache.block_allocator.num_free_blocks
+    )
+
+
 def test_e2e_serving_engine_without_flashinfer() -> None:
     device = torch.device("cpu")
     backend = _make_backend(device=device, dtype=torch.float32)
