@@ -15,7 +15,7 @@ extern void fp8_dequant_blockwise_cuda(const void* weight, const void* scale,
                                        void* out, int N, int K,
                                        cudaStream_t stream);
 
-static const int64_t kMaxTokens = 256;
+static const int64_t kMaxTokens = 8192;
 
 void ExpertNode::SetTensorsFromBlob(const torch::Device& device) {
   auto expert_type = static_cast<ExpertType>(this->expert_type);
