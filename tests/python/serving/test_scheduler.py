@@ -117,6 +117,64 @@ def test_memory_pressure_preemption() -> None:
     assert req1.sequences[0].status is SequenceStatus.SWAPPED
 
 
+def test_preemption_skips_speculative_groups_without_orphaning_them() -> None:
+    cache = _make_cache(num_blocks=3)
+    scheduler = Scheduler(cache, max_batch_size=8, max_tokens_per_step=128)
+    draft = _make_group("draft", 1, 4)
+    decode = _make_group("decode", 2, 4)
+    verify = _make_group("verify", 3, 4)
+    for group in (draft, decode, verify):
+        scheduler.add_request(group)
+    _ = scheduler.schedule()
+    draft.sequences[0].set_status(SequenceStatus.DRAFT)
+    decode.sequences[0].set_status(SequenceStatus.DECODE)
+    verify.sequences[0].set_status(SequenceStatus.DRAFT)
+    verify.sequences[0].set_status(SequenceStatus.VERIFY)
+    draft_table = cache.get_block_table(1)
+    verify_table = cache.get_block_table(3)
+
+    newcomer = _make_group("new", 4, 4)
+    scheduler.add_request(newcomer)
+    output = scheduler.schedule()
+
+    assert output.preempted_seq_ids == [2]
+    assert output.prefill_seq_ids == [4]
+    assert scheduler.get_running_seq_ids() == [1, 3, 4]
+    assert [group.request_id for group in scheduler._running] == [
+        "draft",
+        "verify",
+        "new",
+    ]
+    assert cache.get_block_table(1) == draft_table
+    assert cache.get_block_table(3) == verify_table
+
+
+def test_preemption_preserves_all_non_preemptible_running_groups() -> None:
+    cache = _make_cache(num_blocks=2)
+    scheduler = Scheduler(cache, max_batch_size=8, max_tokens_per_step=128)
+    draft = _make_group("draft", 1, 4)
+    verify = _make_group("verify", 2, 4)
+    scheduler.add_request(draft)
+    scheduler.add_request(verify)
+    _ = scheduler.schedule()
+    draft.sequences[0].set_status(SequenceStatus.DRAFT)
+    verify.sequences[0].set_status(SequenceStatus.DRAFT)
+    verify.sequences[0].set_status(SequenceStatus.VERIFY)
+
+    scheduler.add_request(_make_group("blocked", 3, 4))
+    output = scheduler.schedule()
+
+    assert output.preempted_seq_ids == []
+    assert output.prefill_seq_ids == []
+    assert [group.request_id for group in scheduler._running] == [
+        "draft",
+        "verify",
+    ]
+    assert scheduler.num_waiting == 1
+    assert cache.get_block_table(1)
+    assert cache.get_block_table(2)
+
+
 def test_abort_request() -> None:
     cache = _make_cache()
     scheduler = Scheduler(cache, max_batch_size=8, max_tokens_per_step=128)

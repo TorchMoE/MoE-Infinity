@@ -17,7 +17,7 @@ DEFAULT_CONCURRENCY = (1, 2, 4, 8)
 DEFAULT_MAX_NEW_TOKENS = 16
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Measure continuous-batching request latency."
     )
@@ -58,11 +58,144 @@ def parse_args() -> argparse.Namespace:
         help="Optional baseline_performance.py output JSON for comparison",
     )
     parser.add_argument(
+        "--gpu-only-expert-routing",
+        choices=("off", "on"),
+        default="off",
+    )
+    parser.add_argument("--warmup-rounds", type=int, default=3)
+    parser.add_argument(
+        "--routing-baseline-json",
+        default=None,
+        help="gpu-routing-latency-v1 JSON produced by an off-mode run",
+    )
+    parser.add_argument(
         "--output-json",
         default="latency_results.json",
         help="Path to write the benchmark summary JSON",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def build_model_config(args) -> dict[str, Any]:
+    return {
+        "offload_path": args.offload_dir,
+        "device_memory_ratio": 0.75,
+        "gpu_only_expert_routing": args.gpu_only_expert_routing == "on",
+        "speculative_prefetch_overlap": False,
+    }
+
+
+def gpu_routing_verdict(baseline, candidate, route_failures, fallback_count):
+    reasons = []
+    base_p99 = baseline.get("tpot_p99_ms")
+    candidate_p99 = candidate.get("tpot_p99_ms")
+    if base_p99 and candidate_p99 and candidate_p99 > base_p99 * 1.05:
+        reasons.append("tpot_p99_regression_gt_5pct")
+    base_p50 = baseline.get("tpot_p50_ms")
+    candidate_p50 = candidate.get("tpot_p50_ms")
+    if base_p50 and candidate_p50 and candidate_p50 > base_p50 * 1.02:
+        reasons.append("tpot_p50_regression_gt_2pct")
+    if route_failures:
+        reasons.append("native_route_failure")
+    if fallback_count:
+        reasons.append("unexpected_eager_fallback")
+    return {
+        "decision": "ROLLBACK" if reasons else "KEEP",
+        "reasons": reasons,
+    }
+
+
+def collect_routing_stats(model):
+    engine = getattr(model, "engine", None)
+    executor = getattr(engine, "expert_executor", None)
+    getter = getattr(executor, "get_gpu_routing_stats", None)
+    if getter is None:
+        return {
+            "route_batches": 0,
+            "route_failures": 0,
+            "fallback_count": 0,
+            "completion_events_retired": 0,
+        }
+    return {key: int(value) for key, value in getter().items()}
+
+
+def _delta_pct(candidate, baseline):
+    if not baseline:
+        return None
+    return 100.0 * (candidate / baseline - 1.0)
+
+
+def build_result_payload(*, args, measurements, baseline_measurements, routing):
+    comparison = {}
+    reasons = []
+    if baseline_measurements is not None:
+        for level, candidate in measurements.items():
+            baseline = baseline_measurements[level]
+            comparison[level] = {
+                "tpot_p50_delta_pct": _delta_pct(
+                    candidate["tpot_p50_ms"], baseline["tpot_p50_ms"]
+                ),
+                "tpot_p99_delta_pct": _delta_pct(
+                    candidate["tpot_p99_ms"], baseline["tpot_p99_ms"]
+                ),
+            }
+            level_verdict = gpu_routing_verdict(
+                baseline,
+                candidate,
+                routing["route_failures"],
+                routing["fallback_count"],
+            )
+            reasons.extend(
+                f"concurrency_{level}:{reason}"
+                for reason in level_verdict["reasons"]
+            )
+        decision = "ROLLBACK" if reasons else "KEEP"
+    else:
+        decision = "BASELINE"
+    return {
+        "schema_version": "gpu-routing-latency-v1",
+        "status": "PASS",
+        "config": {
+            "model": args.model,
+            "offload_dir": args.offload_dir,
+            "gpu_only_expert_routing": args.gpu_only_expert_routing,
+            "speculative_prefetch_overlap": False,
+            "device_memory_ratio": 0.75,
+            "concurrency": list(args.concurrency),
+            "prompt_length": args.prompt_length,
+            "max_new_tokens": args.max_new_tokens,
+            "warmup_rounds": args.warmup_rounds,
+            "num_rounds": args.num_rounds,
+        },
+        "measurement": measurements,
+        "routing": routing,
+        "comparison": comparison,
+        "verdict": {"decision": decision, "reasons": reasons},
+    }
+
+
+def load_routing_baseline(path: Path, expected_config):
+    path = Path(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != "gpu-routing-latency-v1":
+        raise ValueError(
+            "routing baseline must be gpu-routing-latency-v1, got "
+            f"{payload.get('schema_version')!r}"
+        )
+    config = payload.get("config", {})
+    for key in (
+        "model",
+        "prompt_length",
+        "max_new_tokens",
+        "concurrency",
+        "device_memory_ratio",
+    ):
+        if key in expected_config and config.get(key) != expected_config[key]:
+            raise ValueError(
+                f"routing baseline config mismatch on {key}: "
+                f"{config.get(key)!r} != {expected_config[key]!r}"
+            )
+    return payload.get("measurement", {})
 
 
 def environment_info() -> dict[str, Any]:
@@ -118,7 +251,7 @@ def build_prompt_input_ids(
 
 
 def load_model_and_tokenizer(
-    model_name: str, offload_dir: str
+    model_name: str, offload_dir: str, config: dict | None = None
 ) -> tuple[Any, Any]:
     try:
         from transformers import AutoTokenizer
@@ -137,10 +270,11 @@ def load_model_and_tokenizer(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    config = {
-        "offload_path": offload_dir,
-        "device_memory_ratio": 0.75,
-    }
+    if config is None:
+        config = {
+            "offload_path": offload_dir,
+            "device_memory_ratio": 0.75,
+        }
     model = MoE(model_name, config)
     return model, tokenizer
 
@@ -249,17 +383,26 @@ def run_sweep(
     tokenizer: Any,
     *,
     concurrency_levels: list[int],
+    warmup_rounds: int,
     num_rounds: int,
     prompt_length: int,
     max_new_tokens: int,
 ) -> dict[str, dict[str, float | None]]:
     measurements: dict[str, dict[str, float | None]] = {}
     for concurrency in concurrency_levels:
+        for _ in range(warmup_rounds):
+            _ = run_one_round(
+                model,
+                tokenizer,
+                concurrency=concurrency,
+                prompt_length=prompt_length,
+                max_new_tokens=max_new_tokens,
+            )
         all_ttft: list[float] = []
-        all_itl: list[float] = []
+        all_tpot: list[float] = []
 
         for _ in range(num_rounds):
-            ttft_samples, itl_samples = run_one_round(
+            ttft_samples, tpot_samples = run_one_round(
                 model,
                 tokenizer,
                 concurrency=concurrency,
@@ -267,15 +410,19 @@ def run_sweep(
                 max_new_tokens=max_new_tokens,
             )
             all_ttft.extend(ttft_samples)
-            all_itl.extend(itl_samples)
+            all_tpot.extend(tpot_samples)
 
         measurements[str(concurrency)] = {
+            "sample_count": len(all_tpot),
             "ttft_p50_ms": percentile(all_ttft, 50.0),
             "ttft_p90_ms": percentile(all_ttft, 90.0),
             "ttft_p99_ms": percentile(all_ttft, 99.0),
-            "itl_p50_ms": percentile(all_itl, 50.0),
-            "itl_p90_ms": percentile(all_itl, 90.0),
-            "itl_p99_ms": percentile(all_itl, 99.0),
+            "tpot_p50_ms": percentile(all_tpot, 50.0),
+            "tpot_p90_ms": percentile(all_tpot, 90.0),
+            "tpot_p99_ms": percentile(all_tpot, 99.0),
+            "itl_p50_ms": percentile(all_tpot, 50.0),
+            "itl_p90_ms": percentile(all_tpot, 90.0),
+            "itl_p99_ms": percentile(all_tpot, 99.0),
         }
     return measurements
 
@@ -324,12 +471,39 @@ def main() -> int:
         raise ValueError("--prompt-length must be > 0")
     if args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be > 0")
+    if args.warmup_rounds < 0:
+        raise ValueError("--warmup-rounds must be >= 0")
 
     concurrency_levels = [value for value in args.concurrency if value > 0]
     if not concurrency_levels:
         raise ValueError(
             "--concurrency must include at least one positive value"
         )
+
+    model_config = build_model_config(args)
+    routing_baseline = None
+    if args.gpu_only_expert_routing == "on":
+        if not args.routing_baseline_json:
+            print(
+                "on-mode requires --routing-baseline-json produced by an "
+                "off-mode run",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            routing_baseline = load_routing_baseline(
+                Path(args.routing_baseline_json),
+                expected_config={
+                    "model": args.model,
+                    "prompt_length": args.prompt_length,
+                    "max_new_tokens": args.max_new_tokens,
+                    "concurrency": list(args.concurrency),
+                    "device_memory_ratio": 0.75,
+                },
+            )
+        except (ValueError, OSError) as error:
+            print(f"routing baseline rejected: {error}", file=sys.stderr)
+            return 2
 
     env = environment_info()
     output_path = Path(args.output_json)
@@ -366,7 +540,7 @@ def main() -> int:
 
     try:
         model, tokenizer = load_model_and_tokenizer(
-            args.model, args.offload_dir
+            args.model, args.offload_dir, model_config
         )
     except Exception as exc:
         print(f"BLOCKED: {type(exc).__name__}: {exc}")
@@ -397,44 +571,22 @@ def main() -> int:
         model,
         tokenizer,
         concurrency_levels=concurrency_levels,
+        warmup_rounds=args.warmup_rounds,
         num_rounds=args.num_rounds,
         prompt_length=args.prompt_length,
         max_new_tokens=args.max_new_tokens,
     )
 
-    comparison: dict[str, dict[str, float | None]] = {}
-    for level, result in measurements.items():
-        baseline_ttft = baseline.get("ttft_ms")
-        baseline_itl = baseline.get("per_token_latency_ms")
-        ttft_p50 = result.get("ttft_p50_ms")
-        itl_p50 = result.get("itl_p50_ms")
-
-        comparison[level] = {
-            "ttft_delta_ms_vs_baseline": (
-                None
-                if baseline_ttft is None or ttft_p50 is None
-                else ttft_p50 - baseline_ttft
-            ),
-            "itl_delta_ms_vs_baseline": (
-                None
-                if baseline_itl is None or itl_p50 is None
-                else itl_p50 - baseline_itl
-            ),
-        }
-
-    payload = {
-        "status": "PASS",
-        "environment": env,
-        "measurement": measurements,
-        "baseline": baseline,
-        "comparison": comparison,
-        "requested_model": args.model,
-        "offload_dir": args.offload_dir,
-        "num_rounds": args.num_rounds,
-        "prompt_length": args.prompt_length,
-        "max_new_tokens": args.max_new_tokens,
-    }
+    routing = collect_routing_stats(model)
+    payload = build_result_payload(
+        args=args,
+        measurements=measurements,
+        baseline_measurements=routing_baseline,
+        routing=routing,
+    )
+    payload["environment"] = env
     write_json(output_path, payload)
+    print(f"verdict: {payload['verdict']}")
     return 0
 
 

@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import ModuleType
 from typing import Protocol, cast
 
 import pytest
@@ -9,9 +10,8 @@ import torch
 ROOT = str(Path(__file__).resolve().parents[3])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-_ = sys.modules.pop("moe_infinity", None)
-_ = sys.modules.pop("moe_infinity.serving", None)
 KV_CACHE_PATH = Path(ROOT) / "moe_infinity" / "serving" / "kv_cache.py"
+_MISSING_MODULE = object()
 
 
 class BlockAllocatorProtocol(Protocol):
@@ -69,8 +69,15 @@ def _load_classes() -> (
     if spec is None or spec.loader is None:
         raise RuntimeError(f"failed to load module from {KV_CACHE_PATH}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    previous_module = sys.modules.get(module_name, _MISSING_MODULE)
+    try:
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    finally:
+        if previous_module is _MISSING_MODULE:
+            _ = sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = cast(ModuleType, previous_module)
     return (
         cast(type[BlockAllocatorProtocol], getattr(module, "BlockAllocator")),
         cast(type[PagedKVCacheProtocol], getattr(module, "PagedKVCache")),

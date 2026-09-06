@@ -58,6 +58,27 @@ class SampledAcceptance(NamedTuple):
     final_token: int  # residual correction (reject) or bonus (full accept)
 
 
+def _validate_generator_device(
+    generator: Optional[torch.Generator], probability_device: torch.device
+) -> None:
+    """Require an explicit request generator on the probability tensor device."""
+    if generator is None:
+        return
+    generator_device = torch.device(generator.device)
+    probability_device = torch.device(probability_device)
+    same_device_type = generator_device.type == probability_device.type
+    compatible_index = (
+        generator_device.index is None
+        or probability_device.index is None
+        or generator_device.index == probability_device.index
+    )
+    if not (same_device_type and compatible_index):
+        raise ValueError(
+            f"generator device {generator_device} does not match "
+            f"probability device {probability_device}"
+        )
+
+
 def warped_probs(
     logits: torch.Tensor,
     temperature: float = 1.0,
@@ -136,13 +157,19 @@ def acceptance_sampled(
     for seeded determinism; ``None`` uses the global torch RNG (seed it with
     ``torch.manual_seed``).
     """
+    _validate_generator_device(generator, target_probs.device)
     num_drafts = int(drafts.shape[0])
     for i in range(num_drafts):
         token = int(drafts[i])
         q = float(draft_probs[i, token])
         p = float(target_probs[i, token])
         accept_prob = min(1.0, p / q) if q > 0 else 0.0
-        if float(torch.rand((), generator=generator)) < accept_prob:
+        if (
+            float(
+                torch.rand((), device=target_probs.device, generator=generator)
+            )
+            < accept_prob
+        ):
             continue
         correction = torch.multinomial(
             residual_distribution(target_probs[i], draft_probs[i]),

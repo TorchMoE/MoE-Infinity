@@ -71,8 +71,9 @@ struct GpuTimer {
   /// Stop the timer
   void stop() { CUDA_CHECK(cudaEventRecord(_stop, _stream_id)); }
 
-  /// Return the elapsed time (in milliseconds)
-  float elapsed_millis() {
+  /// Timing-only API. Blocks the calling CPU thread until `_stop` completes.
+  /// Forbidden in ExpertDispatcher and MoEMLP production paths.
+  float elapsed_millis_blocking() {
     float elapsed = 0.0;
     CUDA_CHECK(cudaEventSynchronize(_stop));
     CUDA_CHECK(cudaEventElapsedTime(&elapsed, _start, _stop));
@@ -92,6 +93,8 @@ int kNumDevices();
 int CudaMemcpy(void* dst, const void* src, size_t count, cudaMemcpyKind kind);
 int CudaMemcpyAsync(void* dst, const void* src, size_t count,
                     cudaMemcpyKind kind, cudaStream_t stream = 0);
+// Explicitly blocking copy for initialization/debug paths only. Never call from
+// ExpertDispatcher, GPUFetchFunc, GPUExecFunc, OutputFunc, or MoEMLP::forward.
 void BlockingCudaCopy(int device, void* dst, const void* src, size_t size,
                       cudaMemcpyKind kind, cudaStream_t stream);
 

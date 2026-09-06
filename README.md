@@ -40,8 +40,8 @@ This open-sourced version is HuggingFace-friendly and differs from the version r
 - **Fast.** Activation-aware expert caching, prefetching, tracing, fused CUDA kernels, CUDA graph capture, Marlin INT4 GEMM, and FP4/MXFP4 expert paths keep the hot path lean.
 - **HuggingFace-native.** The `MoE` class remains the current in-process synchronous API, but `MoE.generate()` emits `DeprecationWarning` and is scheduled for removal. Use `MoE.serve()` for continuous batching; it starts an async HTTP service and is not a drop-in in-process return API.
 - **Production serving.** OpenAI-compatible HTTP server with continuous batching, paged KV cache, request scheduling with preemption, streaming (SSE), runtime hot reload, watchdog/health monitoring, and crash-recovery logging. A prefix-cache flag and cache scaffolding exist, but the current OpenAI request path does not actively reuse cached prefixes; see [docs/serving.md](docs/serving.md#prefix-caching).
-- **Acceleration-aware.** Automatically integrates with [FlashAttention](https://github.com/Dao-AILab/flash-attention) and [FlashInfer](https://flashinfer.ai/) when installed, with graceful fallback to built-in kernels.
-- **DFlash.** The experimental direct speculator API supports batch-1 greedy and sampled draft/verify without a stable API promise; deprecated `MoE.generate()` and continuous serving delegate only greedy singleton requests. Batch>1 is currently greedy-only on the bare HuggingFace target path. Route-ahead is an executor-path capability, not evidence of a validated target/drafter pair; see the model-by-model status in [docs/dflash.md](docs/dflash.md#compatibility).
+- **Acceleration-aware.** Automatically integrates with [FlashAttention](https://github.com/Dao-AILab/flash-attention) and uses FlashInfer where the selected standard paged-attention backend supports it, with graceful fallback to built-in kernels. DeepSeek MLA currently uses the correct PyTorch fallback and does not claim FlashInfer acceleration.
+- **DFlash.** One session semantic core now covers direct, deprecated-sync, and serving draft/verify decisions. The experimental direct bare-HF API supports batch-1/batch>1 greedy, sampled, and mixed rows. Physical rich batching is capability-gated; unsupported MLA/hybrid wrappers run grouped per-request sessions. Serving keeps Stage 4a dynamic fallback, with default-off Stage 4b paged MLA limited to eligible greedy batch-1 DeepSeek V2/V3. Pairing and executor route-ahead evidence remain separate; see [docs/dflash.md](docs/dflash.md).
 - **Multi-GPU.** Single-server multi-GPU with round-robin expert distribution, per-GPU caching, and an in-memory N-way tensor-parallel shard loader; see [docs/multi-gpu.md](docs/multi-gpu.md) and [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Supported Models
@@ -123,7 +123,7 @@ sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build
 
 # 2. Build tools + PyTorch. Match PyTorch's CUDA build to your CUDA toolkit
 #    (pick the index URL for your CUDA version from https://pytorch.org).
-pip install "setuptools>=78.1.1,<82" wheel ninja py-cpuinfo
+pip install "setuptools>=78.1.1,<82" "setuptools-scm>=8" wheel ninja py-cpuinfo
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 
 # 3. CUTLASS headers (header-only; no separate build required)
@@ -157,7 +157,7 @@ Post-installation, MoE-Infinity will automatically use FlashAttention when avail
 
 ### Enable FlashInfer (Optional)
 
-Install [FlashInfer](https://flashinfer.ai/) for optimized paged attention kernels during prefill and decode.
+Install [FlashInfer](https://flashinfer.ai/) for optional optimized standard paged-attention kernels during prefill and decode. It does not currently accelerate DeepSeek MLA.
 
 ```bash
 # Install the FlashInfer Python package (JIT-compiles kernels to match your Torch/CUDA):
@@ -168,7 +168,7 @@ pip install -e '.[flashinfer]'
 
 Check the [FlashInfer installation guide](https://docs.flashinfer.ai/installation.html) for prebuilt-wheel options matching specific CUDA/PyTorch versions.
 
-Post-installation, MoE-Infinity will automatically detect and use FlashInfer when available. When FlashInfer is not installed, MoE-Infinity gracefully falls back to its built-in attention kernels with no behavior change.
+Post-installation, MoE-Infinity will detect and use FlashInfer where the selected backend supports it. When FlashInfer is not installed, it falls back to built-in attention kernels with no behavior change.
 
 ## Usage and Examples
 
@@ -263,7 +263,19 @@ model = MoE("zai-org/GLM-5.2-FP8", {
 
 ## DFlash
 
-See [docs/dflash.md](docs/dflash.md) for the batch-1 greedy/sampled flow, the current batch>1 greedy-only constraint, and the compatibility matrix that separates DFlash pairing validation from route-ahead executor wiring.
+See [docs/dflash.md](docs/dflash.md) for unified session semantics, direct
+greedy/sampled/mixed batching, per-row RNG and scalar-generator correlation,
+dense reconstruction, output padding and `last_generated_lengths`, grouped
+versus physical rich execution, Stage 4a/4b ownership, and the separate pairing
+versus executor evidence matrix. No real DeepSeek DFlash pair or GPT-OSS
+executor route-ahead is implied.
+
+No-download rollout gate:
+
+```bash
+python benchmarks/dflash/validate_unified_execution.py --fixture tiny \
+  --require-cache-invariants --require-order-invariance
+```
 
 ### Benchmarking
 

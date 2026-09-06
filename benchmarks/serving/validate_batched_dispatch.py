@@ -167,9 +167,42 @@ def analyze_dispatch_interface_payload() -> dict[str, object]:
         ),
     }
 
-    missing = [k for k, v in markers.items() if v < 0]
+    native_branch = ""
+    native_start = expert_executor_text.find("if use_native_routing:")
+    if native_start >= 0:
+        native_end = expert_executor_text.find("else:", native_start)
+        native_branch = expert_executor_text[native_start:native_end]
+
+    native_markers = {
+        "native_branch_has_blocking_host_extract": any(
+            needle in native_branch
+            for needle in (".cpu(", ".numpy(", ".item(", ".tolist(")
+        ),
+        "native_dispatch_binding_line": _find_line(
+            expert_executor_text,
+            "self.expert_dispatcher.dispatch_experts(layer_id)",
+        ),
+        "native_take_active_line": _find_line(
+            expert_executor_text,
+            "self.expert_dispatcher.take_last_active_experts()",
+        ),
+    }
+    markers.update(native_markers)
+
+    missing = [
+        k
+        for k, v in markers.items()
+        if isinstance(v, int) and not isinstance(v, bool) and v < 0
+    ]
     if missing:
         raise RuntimeError(f"Missing expected source markers: {missing}")
+    if native_markers["native_branch_has_blocking_host_extract"]:
+        raise RuntimeError(
+            "native gpu routing branch performs a blocking host extract"
+        )
+    for line_key in ("native_dispatch_binding_line", "native_take_active_line"):
+        if native_markers[line_key] < 0:
+            raise RuntimeError(f"Missing expected native marker: {line_key}")
 
     return {
         "supports_token_batched_input": True,
