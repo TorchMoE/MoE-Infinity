@@ -229,13 +229,39 @@ class ContinuousBatchingEngine:
         num_layers = self._get_int_config("num_layers")
         num_kv_heads = self._get_int_config("num_kv_heads")
         head_dim = self._get_int_config("head_dim")
+
+        self._kv_format_decision = self._resolve_kv_cache_format_decision(
+            model=model,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+        effective_format = self._kv_format_decision.effective_format.name.value
         num_blocks = self._resolve_num_blocks(
             block_size=block_size,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            format_name=effective_format,
         )
 
+        from moe_infinity.runtime.kv_cache_format import (
+            allocate_layered_paged_kv_store,
+        )
+
+        kv_store_owner_id = f"serving-engine:{id(self)}"
+        kv_store = allocate_layered_paged_kv_store(
+            owner_id=kv_store_owner_id,
+            format_name=effective_format,
+            num_layers=num_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            execution_dtype=self.dtype,
+            device=self.device,
+        )
+        self.kv_store = kv_store
+        self.kv_store_owner_id = kv_store_owner_id
         swap_settings = self._resolve_kv_swap_settings()
         backend, pool, fallback_reason = build_kv_transfer_resources(
             swap_settings,
@@ -285,6 +311,8 @@ class ContinuousBatchingEngine:
             max_inflight_bytes=swap_settings.kv_swap_max_inflight_bytes,
             checksum=swap_settings.kv_swap_checksum,
             storage=backend_storage,
+            store=kv_store,
+            owner_id=kv_store_owner_id,
         )
 
         provider = self._maybe_bind_prefix_cache(capability)
@@ -1619,6 +1647,9 @@ class ContinuousBatchingEngine:
             ),
             "cuda_graph": cuda_graph_stats,
         }
+        format_stats = getattr(self, "kv_cache_format_stats", None)
+        if callable(format_stats):
+            stats.update(format_stats())
         prefix_stats = getattr(self, "_prefix_cache_stats", None)
         if callable(prefix_stats):
             stats.update(prefix_stats())
@@ -1636,6 +1667,7 @@ class ContinuousBatchingEngine:
                 config[key] = value
             else:
                 config[key] = str(value)
+        config.update(self.kv_cache_format_stats())
         return config
 
     def update_config(self, updates: dict[str, object]) -> dict[str, object]:
@@ -1658,6 +1690,7 @@ class ContinuousBatchingEngine:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
+        format_name: str = "native",
     ) -> int:
         explicit_num_blocks = self.config.get("num_kv_blocks")
         if explicit_num_blocks is not None:
@@ -1675,6 +1708,7 @@ class ContinuousBatchingEngine:
                 num_heads=num_kv_heads,
                 head_dim=head_dim,
                 dtype=self.dtype,
+                format_name=format_name,
             )
 
         if num_blocks > 0:
@@ -1684,6 +1718,81 @@ class ContinuousBatchingEngine:
     def _fallback_num_blocks(self, block_size: int) -> int:
         max_tokens_per_step = self._get_int_config("max_tokens_per_step", 1)
         return max(1, ceil(max_tokens_per_step / max(1, block_size)))
+
+    def _resolve_kv_cache_format_decision(
+        self, *, model: object, num_kv_heads: int, head_dim: int
+    ):
+        from moe_infinity.kernel.paged_attention_ops import (
+            probe_native_int8_binding,
+        )
+        from moe_infinity.runtime import flashinfer_utils
+        from moe_infinity.runtime.kv_cache_format import (
+            KVCacheBackendCapabilities,
+            KVCacheModelInfo,
+            model_info_from_config,
+            resolve_kv_cache_format,
+        )
+
+        requested = str(self.config.get("kv_cache_format", "native"))
+        allow_fallback = bool(self.config.get("kv_cache_allow_fallback", True))
+        model_config = getattr(model, "config", None)
+        if model_config is not None:
+            model_info = model_info_from_config(model_config)
+            if model_info.num_attention_heads <= 0:
+                model_info = KVCacheModelInfo(
+                    num_attention_heads=num_kv_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    is_mla=model_info.is_mla,
+                )
+        else:
+            model_info = KVCacheModelInfo(
+                num_attention_heads=num_kv_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                is_mla=False,
+            )
+        native_available, native_reason = probe_native_int8_binding()
+        sdpa_available = callable(
+            getattr(
+                __import__("torch.nn.functional", fromlist=["x"]),
+                "scaled_dot_product_attention",
+                None,
+            )
+        )
+        backend_preference = (
+            "flashinfer" if flashinfer_utils.HAS_FLASHINFER else "auto"
+        )
+        capabilities = KVCacheBackendCapabilities(
+            flashinfer_available=bool(flashinfer_utils.HAS_FLASHINFER),
+            native_int8_binding_available=native_available,
+            sdpa_available=sdpa_available,
+            native_int8_unavailable_reason=native_reason,
+        )
+        return resolve_kv_cache_format(
+            requested=requested,
+            model=model_info,
+            device=self.device,
+            backend_preference=backend_preference,
+            capabilities=capabilities,
+            allow_fallback=allow_fallback,
+        )
+
+    def kv_cache_format_stats(self) -> dict[str, object]:
+        decision = getattr(self, "_kv_format_decision", None)
+        if decision is None:
+            return {
+                "requested_kv_cache_format": "native",
+                "effective_kv_cache_format": "native",
+                "kv_cache_execution_backend": "native",
+                "kv_cache_format_decision_reason": None,
+            }
+        return {
+            "requested_kv_cache_format": decision.requested_format.name.value,
+            "effective_kv_cache_format": decision.effective_format.name.value,
+            "kv_cache_execution_backend": decision.execution_backend,
+            "kv_cache_format_decision_reason": decision.reason,
+        }
 
     def _bind_layered_paged_kv_store(self) -> None:
         from moe_infinity.runtime.attention_backend import (

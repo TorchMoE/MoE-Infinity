@@ -2114,7 +2114,10 @@ def _build_engine_config(
     validate_chunked_prefill_config(config)
     if args.enable_prefix_caching:
         config["enable_prefix_caching"] = True
-
+    config["kv_cache_format"] = getattr(args, "kv_cache_format", "native")
+    config["kv_cache_allow_fallback"] = getattr(
+        args, "kv_cache_allow_fallback", True
+    )
     config["kv_swap_mode"] = getattr(args, "kv_swap_mode", "sync")
     config["kv_swap_host_memory_bytes"] = getattr(
         args, "kv_swap_host_memory_bytes", 512 * 1024 * 1024
@@ -2189,6 +2192,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1000,
         help="maximum number of prefix cache entries (startup-only, >= 1)",
+    )
+    parser.add_argument(
+        "--kv-cache-format",
+        choices=("native", "int8_sym"),
+        default="native",
+        help="KV cache storage format (default: native).",
+    )
+    parser.add_argument(
+        "--no-kv-cache-format-fallback",
+        dest="kv_cache_allow_fallback",
+        action="store_false",
+        default=True,
+        help="Refuse a native fallback when the requested KV format is unsupported.",
     )
     parser.add_argument(
         "--kv-swap-mode",

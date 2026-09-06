@@ -419,6 +419,28 @@ Fill this in for every benchmark run:
 | Metrics captured | `ttft_ms, itl_p50_ms, decode_toks_per_s, peak_gpu_memory_mb` |
 | Notes | `host-only, nsys, FlashInfer on, sampled off` |
 
+## KV-cache quantization long-context matrix
+
+`benchmarks/serving/kv_cache_quantization.py` runs a `native` vs `int8_sym`
+A/B matrix over context lengths and batch sizes, writing a JSON array with
+separate storage/transfer/execution precision fields plus TTFT, decode
+tokens/s, ITL p50/p99, peak allocated/reserved bytes, descriptor and measured
+cache bytes, D2H/H2D swap bytes, and scratch peak bytes.
+
+```bash
+python benchmarks/serving/kv_cache_quantization.py \
+  --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+  --context-lengths 128 2048 8192 32768 --batch-sizes 1 4 16 \
+  --decode-tokens 128 --warmups 2 --repeats 5 --strict-fallback \
+  --output-json artifacts/kv-cache-quantization/qwen3.json
+```
+
+`--strict-fallback` fails the run if the requested and effective formats
+differ, so a silent fallback cannot be reported as a quantized result. The
+writer creates the artifact's parent directory automatically. Rollout gates:
+INT8 measured storage ratio `<= 0.52`, lower peak memory at 8K/32K, and 2K
+decode throughput at least 90% of native. Performance misses block rollout but
+never relax the correctness/quality tolerances.
 ### Chunked-prefill TTFT/TPOT tails
 
 Start two identical paged-attention servers: baseline without the feature and

@@ -46,6 +46,51 @@ config layer with names like `offload_dir`, `device_memory_ratio`, and
 | `enable_attention_offload` | `bool` | `False` | `True` / `False` | Enables attention offload scaffolding. | Stock code does not yet branch on this flag. The actual backend object is created inside `big_modeling`. Experimental. |
 | `enable_kv_cache_offload` | `bool` | `False` | `True` / `False` | Enables KV cache offload scaffolding in the native engine. | Registers offload handlers when a native KV manager is present, but tensor wiring is still partial. Experimental. |
 | `attention_backend` | `str` | `"default"` | any string accepted by parsing, only `default` has a documented meaning today | Legacy reserved field for attention backend selection. | The stock runtime does not consume this string. The active backend object comes from `big_modeling`. Reserved. |
+| `kv_cache_format` | `str` | `native` | `native` / `int8_sym` | KV-cache storage format. Default: `native` preserves the model cache dtype. | `int8_sym` is an opt-in symmetric INT8 storage path; validated for ordinary MHA/GQA only. Validated by `KVCacheFormat.parse`. Opt-in. |
+| `kv_cache_allow_fallback` | `bool` | `True` | `True` / `False` | Allow a visible native fallback when the requested KV format is unsupported. | When `False`, an unsupported `int8_sym` request raises before allocation instead of falling back. Opt-in. |
+
+## KV-cache storage format (`kv_cache_format`)
+
+`kv_cache_format` selects how paged K/V are stored (default: `native`), which
+keeps the model cache dtype and is the only path enabled by default.
+
+`int8_sym` is an opt-in, correctness-gated symmetric INT8 storage format. It
+stores each K and V element as signed INT8 with one FP16 scale per
+`(layer, page, KV head, token)`, calibrated online from the per-token/per-head
+absolute maximum. It does **not** claim any universal 2-bit KV support;
+[KIVI](https://arxiv.org/abs/2402.02750) and
+[KVQuant](https://arxiv.org/abs/2401.18079) motivate the approach and the
+quality gates only.
+
+### Precision contract
+
+The three precisions are reported separately so a fallback is never mistaken
+for a quantized run:
+
+| Concern | `native` | `int8_sym` |
+| --- | --- | --- |
+| Storage precision | model cache dtype (`fp16`/`bf16`/`fp32`) | INT8 payload + FP16 scales |
+| Transfer precision | same native tensor bytes | synchronously copied INT8 payload and FP16 scales; no D2H/H2D dequantization |
+| Attention execution precision | model dtype, FP32 accumulator | model-dtype output, scales promoted to FP32, FP32 QK/softmax/V accumulation |
+
+### Memory
+
+For the canonical `(block_size=16, num_kv_heads=8, head_dim=128)` page,
+`int8_sym` uses `32,768` payload bytes + `512` scale bytes = `33,280` bytes,
+versus `65,536` native FP16 bytes, a ratio of `0.5078125`.
+
+### Scope, MLA, and fallback
+
+`int8_sym` is validated for ordinary MHA/GQA. MLA models (DeepSeek/GLM latent
+attention, detected from `kv_lora_rank`/`qk_nope_head_dim`/`qk_rope_head_dim`)
+are **not** validated: with `kv_cache_allow_fallback=True` an MLA request falls
+back to `native` with reason `mla_not_validated`; with fallback disabled the
+server raises at startup before cache allocation. When a CUDA INT8 kernel
+binding is unavailable the format still runs through a validated FP32
+dequantized SDPA path; FlashInfer stays active for `native` stores but an
+`int8_sym` request bypasses FlashInfer (reason
+`flashinfer_no_int8_sym_contract`) without changing the effective storage
+format.
 
 ## Memory ratio rules
 

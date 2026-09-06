@@ -35,9 +35,23 @@ class KVCacheOffloadCoordinator:
         self._transfer_backend = transfer_backend or SyncKVTransferBackend()
         self._transfer_scheduler: _SchedulerLike | None = None
         self._cpu_cache: dict[str, KVTensors] = {}
+        self._kv_store: object | None = None
 
     def set_kv_tensors(self, kv_tensors: KVTensors) -> None:
         self._kv_tensors = kv_tensors
+
+    def set_kv_store(self, store: object) -> None:
+        self._kv_store = store
+        tensors = getattr(store, "tensors", None)
+        if tensors is None:
+            raise ValueError(
+                "KVCacheOffloadCoordinator.set_kv_store requires a store "
+                "exposing packed payload/scale tensors"
+            )
+        if len(tensors) == 1:
+            self._kv_tensors = tensors[0]
+        else:
+            self._kv_tensors = (tensors[0], tensors[1])
 
     def register_with_scheduler(self, scheduler: _SchedulerLike) -> None:
         self._transfer_scheduler = scheduler

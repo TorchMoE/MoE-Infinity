@@ -198,3 +198,22 @@ FOREACH(SRC ${TORCH_SRC_LIST})
   #   target_link_libraries(${SRC_NAME} thrust)
   # ENDIF()
 ENDFOREACH()
+
+# Dedicated INT8 paged-attention decode test. This target explicitly compiles
+# and links only the reusable helper source (paged_attention_int8.cu) so it
+# never pulls in the broad ${KERNEL_SRC} glob (which contains paged_attention.cu
+# and its PYBIND11_MODULE).
+add_executable(
+  test_kv_cache_quantization
+  test_kv_cache_quantization.cu
+  ${CMAKE_SOURCE_DIR}/../../extensions/kernel/paged_attention_int8.cu
+)
+target_link_libraries(
+  test_kv_cache_quantization
+  cutlass ${CUDA_LIBRARIES} ${torch_python_LIBRARY} ${Python3_LIBRARIES} ${TORCH_LIBRARIES}
+)
+target_include_directories(
+  test_kv_cache_quantization PRIVATE
+  ${CONDA_INCLUDE_DIRS} ${TORCH_INCLUDE_DIRS} ${Python3_INCLUDE_DIRS}
+  ${CMAKE_SOURCE_DIR}/../../extensions/kernel
+)

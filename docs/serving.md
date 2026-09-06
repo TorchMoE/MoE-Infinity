@@ -56,6 +56,8 @@ Stable options from `api_server_v2.py`:
 | `--enable-prefix-caching` | off | Enable correctness-preserving prefix KV reuse (Qwen3 + FlashInfer) |
 | `--prefix-cache-max-entries` | 1000 | Max prefix-index entries (startup-only, >= 1) |
 | `--enable-prefix-caching` | off | Enable prefix-cache bookkeeping flag |
+| `--kv-cache-format` | `native` | KV storage format: `native` or `int8_sym` (opt-in) |
+| `--no-kv-cache-format-fallback` | off | Refuse a native fallback when `int8_sym` is unsupported |
 | `--enable-decode-cuda-graphs` | off | Permit decode graph qualification; unsafe runtimes still run eagerly |
 | `--decode-cuda-graph-batch-sizes` | `1 2 4 8 16 32` | Positive capture/replay batch buckets |
 | `--decode-cuda-graph-context-sizes` | `128 256 512 1024 2048 4096` | Positive native-paged context buckets |
@@ -73,6 +75,38 @@ Internal / deprecated:
   `MoE.serve(...)` is the continuous-batching HTTP transition path, not a
   drop-in in-process call replacement.
 - `--max-waiting-requests` and `--max-n` feed internal module state used by middleware.
+
+## KV-cache quantization (opt-in)
+
+`--kv-cache-format int8_sym` opts into symmetric INT8 KV storage. It is
+disabled by default; `native` remains the default and one-setting rollback.
+See [Configuration](./configuration.md) for the storage/transfer/execution
+precision contract, memory formula, and MLA fallback behavior.
+
+```bash
+# Opt in to INT8 KV storage
+python -m moe_infinity.entrypoints.openai.api_server_v2 \
+    --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+    --host 127.0.0.1 --kv-cache-format int8_sym
+
+# Strict qualification: refuse any fallback
+python -m moe_infinity.entrypoints.openai.api_server_v2 \
+    --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+    --host 127.0.0.1 --kv-cache-format int8_sym \
+    --no-kv-cache-format-fallback
+
+# Immediate rollback; native remains the default
+python -m moe_infinity.entrypoints.openai.api_server_v2 \
+    --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+    --host 127.0.0.1 --kv-cache-format native
+```
+
+Engine stats and `/v1/config` expose `requested_kv_cache_format`,
+`effective_kv_cache_format`, `kv_cache_execution_backend`, and
+`kv_cache_format_decision_reason` so operators can confirm the effective
+format and detect a fallback. If `effective_kv_cache_format` reports `native`
+after requesting `int8_sym`, the request fell back (for example
+`mla_not_validated`) and storage is not quantized.
 
 ## Python Startup
 

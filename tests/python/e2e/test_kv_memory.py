@@ -271,3 +271,39 @@ def test_kv_memory_peak_reduced_under_offload(memory_bundle) -> None:
         f"{baseline_peak} (baseline_swaps={baseline_swaps}, "
         f"offload_swaps={offload_swaps})"
     )
+
+
+def test_int8_storage_bytes_and_ratio_match_descriptor() -> None:
+    from moe_infinity.runtime.kv_cache_format import (
+        KVCacheFormat,
+        allocate_layered_paged_kv_store,
+    )
+
+    block_size, kv_heads, head_dim = 16, 8, 128
+    int8_page = KVCacheFormat.parse("int8_sym").page_size_bytes(
+        block_size=block_size, num_kv_heads=kv_heads, head_dim=head_dim
+    )
+    native_page = KVCacheFormat.parse("native").page_size_bytes(
+        block_size=block_size,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        execution_dtype=torch.float16,
+    )
+    assert int8_page == 33_280
+    assert native_page == 65_536
+    assert int8_page / native_page == pytest.approx(0.5078125)
+    assert int8_page / native_page <= 0.52
+
+    num_layers, num_blocks = 2, 4
+    store = allocate_layered_paged_kv_store(
+        owner_id="mem-int8",
+        format_name="int8_sym",
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        execution_dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    assert store.nbytes == num_layers * num_blocks * int8_page

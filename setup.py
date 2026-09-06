@@ -277,6 +277,7 @@ _KV_CACHE_SOURCES = [
 
 _PAGED_ATTN_SOURCES = [
     "extensions/kernel/paged_attention.cu",
+    "extensions/kernel/paged_attention_int8.cu",
 ]
 
 _MARLIN_SOURCES = [
