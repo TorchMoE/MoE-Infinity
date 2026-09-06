@@ -4,7 +4,11 @@ from moe_infinity.runtime.attention_backend import (
     AttentionBackend,
     PagedAttentionBackend,
 )
-from moe_infinity.runtime.attention_types import AttentionMetadata, KVCacheSpec
+from moe_infinity.runtime.attention_types import (
+    AttentionMetadata,
+    KVCacheSpec,
+    PagedBatchLengths,
+)
 
 
 def _make_backend() -> PagedAttentionBackend:
@@ -51,7 +55,12 @@ def test_prefill_forward() -> None:
 
     metadata = AttentionMetadata(
         block_tables=torch.zeros((1, 1), dtype=torch.int32),
-        seq_lens=torch.tensor([4], dtype=torch.int32),
+        lengths=PagedBatchLengths(
+            query_lengths=torch.tensor([4], dtype=torch.int32),
+            query_offsets=torch.tensor([0, 4], dtype=torch.int32),
+            context_lengths=torch.tensor([0], dtype=torch.int32),
+            kv_seq_lengths=torch.tensor([4], dtype=torch.int32),
+        ),
         max_seq_len=4,
         num_prefill_tokens=4,
         num_decode_tokens=0,
@@ -79,7 +88,12 @@ def test_decode_forward_cpu() -> None:
     query = torch.randn(1, 4, 8)
     metadata = AttentionMetadata(
         block_tables=torch.tensor([[0]], dtype=torch.int32),
-        seq_lens=torch.tensor([4], dtype=torch.int32),
+        lengths=PagedBatchLengths(
+            query_lengths=torch.tensor([1], dtype=torch.int32),
+            query_offsets=torch.tensor([0, 1], dtype=torch.int32),
+            context_lengths=torch.tensor([3], dtype=torch.int32),
+            kv_seq_lengths=torch.tensor([4], dtype=torch.int32),
+        ),
         max_seq_len=4,
         num_prefill_tokens=0,
         num_decode_tokens=1,

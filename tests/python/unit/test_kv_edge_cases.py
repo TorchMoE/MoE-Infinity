@@ -189,3 +189,43 @@ def test_capture_kv_with_none_past_kv_values_noop() -> None:
     )
 
     assert getattr(engine, "_captured_kv") == {}
+
+
+def test_ensure_sequence_capacity_grows_only_at_page_boundaries() -> None:
+    cache = _make_kv_cache(num_blocks=4)
+
+    cache.ensure_sequence_capacity(seq_id=9, total_tokens=3)
+    assert cache.get_num_reserved_tokens(9) == 3
+    assert cache.get_block_table(9) == [0]
+
+    cache.ensure_sequence_capacity(seq_id=9, total_tokens=4)
+    assert cache.get_block_table(9) == [0]
+    cache.ensure_sequence_capacity(seq_id=9, total_tokens=5)
+    assert cache.get_num_reserved_tokens(9) == 5
+    assert cache.get_block_table(9) == [0, 1]
+
+
+def test_ensure_sequence_capacity_is_idempotent_and_never_shrinks() -> None:
+    cache = _make_kv_cache(num_blocks=4)
+    cache.ensure_sequence_capacity(seq_id=10, total_tokens=5)
+    free_after_first_reservation = cache.block_allocator.num_free_blocks
+
+    cache.ensure_sequence_capacity(seq_id=10, total_tokens=5)
+    assert cache.block_allocator.num_free_blocks == free_after_first_reservation
+    with pytest.raises(ValueError, match="cannot shrink"):
+        cache.ensure_sequence_capacity(seq_id=10, total_tokens=4)
+
+
+def test_reservation_failure_leaves_no_partial_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = _make_kv_cache(num_blocks=4)
+    monkeypatch.setattr(
+        cache.block_allocator,
+        "allocate",
+        lambda count: (_ for _ in ()).throw(RuntimeError("allocation failed")),
+    )
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        cache.ensure_sequence_capacity(seq_id=11, total_tokens=5)
+    assert cache.has_sequence(11) is False
+    assert cache.block_allocator.num_free_blocks == 4
