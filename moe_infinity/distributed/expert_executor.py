@@ -94,6 +94,27 @@ def _layer_expert_nbytes(prefetcher, layer_id, expert_ids):
     return entry or None
 
 
+def _executor_evidence(**kwargs):
+    # Lazy for the same package-cycle reason as ``_load_route_ahead_impl``.
+    from moe_infinity.spec_decode.protocols import ExecutorEvidence
+
+    return ExecutorEvidence(**kwargs)
+
+
+def _prefetcher_hit_rate(prefetcher):
+    getter = getattr(prefetcher, "get_hit_rate", None)
+    if not callable(getter):
+        return None
+    try:
+        value = getter()
+    except Exception:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    rate = float(value)
+    return rate if 0.0 <= rate <= 1.0 else None
+
+
 class DistributedExpertExecutor:
     def __init__(self, archer_config: ArcherConfig):
         self.archer_config = archer_config
@@ -103,7 +124,17 @@ class DistributedExpertExecutor:
         self._speculative_prefetch_overlap = bool(
             getattr(archer_config, "speculative_prefetch_overlap", False)
         )
+        self._gpu_only_expert_routing = bool(
+            getattr(archer_config, "gpu_only_expert_routing", False)
+        )
+        self._last_dispatch_used_native_routing = False
+        self._gpu_route_fallback_count = 0
         self._pending_prefetch = None
+        self._pending_prefetch_failure_safe = False
+        self.last_executor_evidence = _executor_evidence(
+            wiring_reachable=True,
+            fallback_reason="context_inactive",
+        )
 
     def set_expert_dispatcher(self, expert_dispatcher):
         global _expert_dispatcher
@@ -166,6 +197,12 @@ class DistributedExpertExecutor:
         """
         ctx, union_experts_from_mask = _load_route_ahead_impl()
         if not ctx.is_active():
+            available_prefetcher = prefetcher or self.prefetcher
+            self.last_executor_evidence = _executor_evidence(
+                wiring_reachable=True,
+                prefetcher_present=available_prefetcher is not None,
+                fallback_reason="context_inactive",
+            )
             return False, []
         stats = ctx.current_stats()
         route_prefetcher = prefetcher
@@ -175,9 +212,24 @@ class DistributedExpertExecutor:
             route_prefetcher = self.prefetcher
         mask_2d = router_mask.reshape(-1, num_expert)
         union_expert_ids = union_experts_from_mask(mask_2d)
+        row_union: set[tuple[int, int, int]] = set()
+        row_offsets = ctx.current_row_offsets()
+        if row_offsets and row_offsets[-1] == int(mask_2d.shape[0]):
+            for row in range(len(row_offsets) - 1):
+                row_ids = union_experts_from_mask(
+                    mask_2d[row_offsets[row] : row_offsets[row + 1]]
+                )
+                row_union.update(
+                    (row, int(layer_id), int(expert_id))
+                    for expert_id in row_ids
+                )
         fired = False
+        fallback_reason = None
         issued_generations: list = []
-        predicted_ids = []
+        predicted_ids: list = []
+        expert_nbytes = _layer_expert_nbytes(
+            route_prefetcher, layer_id, union_expert_ids
+        )
         if route_prefetcher is not None and union_expert_ids:
             # A0 section 2/5 (A4 guard): pin exactly ONE layer's union per
             # dispatch -- ``ReplaceCacheCandidates`` is global and clears the
@@ -198,29 +250,130 @@ class DistributedExpertExecutor:
                 predicted_ids = list(admitted)
                 fired = True
             else:
-                route_prefetcher.fetch_experts_lock_cache(
-                    layer_id, union_expert_ids
-                )
-                route_prefetcher.speculative_prefetch(
-                    layer_id,
-                    expert_ids=union_expert_ids,
-                    prefetch_layer_id=layer_id,
-                )
-                predicted_ids = union_expert_ids
-                fired = True
+                try:
+                    route_prefetcher.fetch_experts_lock_cache(
+                        layer_id, union_expert_ids
+                    )
+                    route_prefetcher.speculative_prefetch(
+                        layer_id,
+                        expert_ids=union_expert_ids,
+                        prefetch_layer_id=layer_id,
+                    )
+                    predicted_ids = union_expert_ids
+                    fired = True
+                except Exception as exc:
+                    # Route-ahead is cache-warming observation only. A prefetch
+                    # failure must preserve the legacy expert dispatch path.
+                    fallback_reason = f"prefetch_exception:{type(exc).__name__}"
+        elif not union_expert_ids:
+            fallback_reason = "empty_actual_union"
+        else:
+            fallback_reason = "prefetcher_missing"
+
+        prefetched_bytes = (
+            sum(expert_nbytes.values())
+            if fired and expert_nbytes is not None
+            else 0
+        )
+        cache_hit_rate = _prefetcher_hit_rate(route_prefetcher)
+        self.last_executor_evidence = _executor_evidence(
+            wiring_reachable=True,
+            prefetcher_present=route_prefetcher is not None,
+            attempted_layers=(int(layer_id),),
+            fired_layers=((int(layer_id),) if fired else ()),
+            actual_expert_union=frozenset(
+                (int(layer_id), int(expert_id))
+                for expert_id in union_expert_ids
+            ),
+            actual_expert_union_by_row=frozenset(row_union),
+            prefetched_bytes=prefetched_bytes,
+            coverage=(1.0 if fired or not union_expert_ids else 0.0),
+            cache_hit_rate=cache_hit_rate,
+            fallback_reason=fallback_reason,
+        )
         if stats is not None:
             # A5 read-only observation: predicted == the pinned union when
             # the prefetch fired, else [] (coverage 0 for this layer).
             reported_ids = predicted_ids if fired else []
-            stats.observe_layer(
-                layer_id,
-                reported_ids,
-                mask_2d,
-                expert_nbytes=_layer_expert_nbytes(
-                    route_prefetcher, layer_id, reported_ids
-                ),
-            )
+            observe_attempt = getattr(stats, "observe_executor_attempt", None)
+            if callable(observe_attempt):
+                try:
+                    observe_attempt(
+                        layer_id,
+                        union_expert_ids,
+                        actual_ids_by_row=row_union,
+                        prefetcher_present=route_prefetcher is not None,
+                        fired=fired,
+                        fallback_reason=fallback_reason,
+                        prefetched_bytes=prefetched_bytes,
+                        cache_hit_rate=cache_hit_rate,
+                    )
+                except Exception:
+                    # Observer failures are isolated from expert dispatch.
+                    pass
+            try:
+                stats.observe_layer(
+                    layer_id,
+                    reported_ids,
+                    mask_2d,
+                    expert_nbytes=(expert_nbytes if fired else None),
+                )
+            except Exception:
+                # Observer failures are isolated from expert dispatch.
+                pass
         return fired, issued_generations
+
+    def _can_use_gpu_only_routing(self, router_mask) -> bool:
+        if not self._gpu_only_expert_routing:
+            return False
+        if not torch.is_tensor(router_mask) or not router_mask.is_cuda:
+            return False
+        if not hasattr(self.expert_dispatcher, "dispatch_experts"):
+            return False
+        if not hasattr(self.expert_dispatcher, "take_last_active_experts"):
+            return False
+        route_ahead_ctx, _ = _load_route_ahead_impl()
+        if route_ahead_ctx.is_active():
+            return False
+        return True
+
+    def _dispatch_eager_local(self, layer_id, router_mask, num_expert):
+        expert_count = (
+            torch.sum(router_mask.view((-1, num_expert)), dim=0)
+            .cpu()
+            .numpy()
+            .flatten()
+        )
+        expert_list = (
+            np.arange(num_expert).astype(int)[expert_count > 0].tolist()
+        )
+        # Exact-route correction must precede every expert enqueue below so
+        # queued false positives for this layer are canceled before dispatch;
+        # routing itself is never changed (expert_list stays authoritative).
+        if self._overlap_policy_active(self.prefetcher):
+            self.prefetcher.correct_to_native_route(layer_id, expert_list)
+        self.expert_dispatcher.set_expected_queue(len(expert_list))
+        total_gpus = torch.cuda.device_count()
+        for expert_id in expert_list:
+            self.expert_dispatcher.enqueue_expert(
+                layer_id, expert_id, expert_id % total_gpus, False
+            )
+        self.expert_dispatcher.notify_fetch_start()
+        return expert_list
+
+    def get_gpu_routing_stats(self):
+        stats = {
+            "route_batches": 0,
+            "route_failures": 0,
+            "last_active_experts": 0,
+            "last_route_handoff_us": 0,
+            "completion_events_retired": 0,
+        }
+        getter = getattr(self.expert_dispatcher, "get_routing_stats", None)
+        if getter is not None:
+            stats.update({key: int(value) for key, value in getter().items()})
+        stats["fallback_count"] = int(self._gpu_route_fallback_count)
+        return stats
 
     def dispatch_local(
         self,
@@ -241,26 +394,16 @@ class DistributedExpertExecutor:
         with routing_nvtx_ctx:
             with routing_profiler_ctx:
                 num_expert = router_mask.shape[-1]
-                expert_count = (
-                    torch.sum(router_mask.view((-1, num_expert)), dim=0)
-                    .cpu()
-                    .numpy()
-                    .flatten()
+                native_requested = bool(
+                    self._gpu_only_expert_routing
+                    and torch.is_tensor(router_mask)
+                    and router_mask.is_cuda
                 )
-
-                expert_list = (
-                    np.arange(num_expert).astype(int)[expert_count > 0].tolist()
-                )
-                expected_wait_cnt = len(expert_list)
+                use_native_routing = self._can_use_gpu_only_routing(router_mask)
+                expert_list = None
 
         if prefetcher is None:
             prefetcher = self.prefetcher
-
-        # Exact-route correction must precede every expert enqueue below so
-        # queued false positives for this layer are canceled before dispatch;
-        # routing itself is never changed (native expert_list stays authoritative).
-        if self._overlap_policy_active(prefetcher):
-            prefetcher.correct_to_native_route(layer_id, expert_list)
 
         invocation_id = None
         if self._dispatcher_timing_ready(prefetcher):
@@ -271,7 +414,6 @@ class DistributedExpertExecutor:
             self.expert_dispatcher.set_inputs(
                 hidden_states, router_mask.bool(), router_weights
             )
-        self.expert_dispatcher.set_expected_queue(expected_wait_cnt)
 
         # Route-ahead pin + enqueue must precede every enqueue_expert below
         # (A0 section 2). Inactive context: no-op, legacy flow unchanged.
@@ -279,6 +421,9 @@ class DistributedExpertExecutor:
             self._maybe_route_ahead_prefetch(
                 layer_id, router_mask, num_expert, prefetcher
             )
+        )
+        route_ahead_attempted = bool(
+            self.last_executor_evidence.attempted_layers
         )
 
         dispatch_nvtx_ctx = _nvtx_ctx("expert_dispatch")
@@ -289,13 +434,34 @@ class DistributedExpertExecutor:
         )
         with dispatch_nvtx_ctx:
             with dispatch_profiler_ctx:
-                total_gpus = torch.cuda.device_count()
-                for expert_id in expert_list:
-                    gpu_id = expert_id % total_gpus
-                    self.expert_dispatcher.enqueue_expert(
-                        layer_id, expert_id, gpu_id, False
-                    )
-        self.expert_dispatcher.notify_fetch_start()
+                if use_native_routing:
+                    with _nvtx_ctx("gpu_route_submit"):
+                        with (
+                            profiler.time(
+                                "gpu_route_submit", layer=layer_id, expert=-1
+                            )
+                            if profiler is not None
+                            else nullcontext()
+                        ):
+                            self.expert_dispatcher.dispatch_experts(layer_id)
+                else:
+                    if native_requested:
+                        self._gpu_route_fallback_count += 1
+                    with _nvtx_ctx("gpu_route_fallback"):
+                        with (
+                            profiler.time(
+                                "gpu_route_fallback",
+                                layer=layer_id,
+                                expert=-1,
+                            )
+                            if profiler is not None
+                            else nullcontext()
+                        ):
+                            expert_list = self._dispatch_eager_local(
+                                layer_id, router_mask, num_expert
+                            )
+
+        self._last_dispatch_used_native_routing = use_native_routing
 
         generations = list(issued_generations)
         if route_ahead_handled:
@@ -316,6 +482,13 @@ class DistributedExpertExecutor:
                 and generation is not None
             ):
                 generations.append(generation)
+            if route_ahead_attempted:
+                try:
+                    self.trigger_speculative_prefetch(layer_id, router_logits)
+                except Exception:
+                    pass
+            else:
+                self.trigger_speculative_prefetch(layer_id, router_logits)
             pending_router_logits = None
         else:
             pending_router_logits = router_logits
@@ -328,6 +501,7 @@ class DistributedExpertExecutor:
             generations,
             invocation_id,
         )
+        self._pending_prefetch_failure_safe = route_ahead_attempted
 
     def wait_dispatch_local(self):
         profiler = _profiler_instance()
@@ -340,6 +514,14 @@ class DistributedExpertExecutor:
 
         pending = getattr(self, "_pending_prefetch", None)
         self._pending_prefetch = None
+        failure_safe = self._pending_prefetch_failure_safe
+        self._pending_prefetch_failure_safe = False
+
+        def _call_optional(target, name, *args, **kwargs):
+            hook = getattr(target, name, None)
+            if callable(hook):
+                return hook(*args, **kwargs)
+            return None
 
         def finalize_policy(wait_succeeded: bool) -> None:
             (
@@ -354,11 +536,20 @@ class DistributedExpertExecutor:
                 if pending is not None
                 else (None, -1, [], None, [], None)
             )
+            if expert_list is None and self._last_dispatch_used_native_routing:
+                expert_list = list(
+                    self.expert_dispatcher.take_last_active_experts()
+                )
+                if self._overlap_policy_active(prefetcher):
+                    prefetcher.correct_to_native_route(layer_id, expert_list)
             compute_samples = []
             try:
                 if prefetcher is not None and not wait_succeeded:
-                    prefetcher.abort_prefetch_generations(
-                        generations, reason="wait_expert_error"
+                    _call_optional(
+                        prefetcher,
+                        "abort_prefetch_generations",
+                        generations,
+                        reason="wait_expert_error",
                     )
                 if prefetcher is not None and invocation_id is not None:
                     drained = self.expert_dispatcher.drain_compute_samples()
@@ -368,36 +559,61 @@ class DistributedExpertExecutor:
                         if sample.invocation_id == invocation_id
                         and sample.layer_id == layer_id
                     ]
-                    prefetcher.record_stale_compute_samples(
-                        len(drained) - len(compute_samples)
+                    _call_optional(
+                        prefetcher,
+                        "record_stale_compute_samples",
+                        len(drained) - len(compute_samples),
                     )
                 if prefetcher is None:
                     return
                 if wait_succeeded and compute_samples:
-                    prefetcher.observe_compute_samples(compute_samples)
+                    _call_optional(
+                        prefetcher, "observe_compute_samples", compute_samples
+                    )
                 if wait_succeeded:
-                    prefetcher.correct_prefetch(layer_id + 1, expert_list)
+                    if failure_safe:
+                        try:
+                            prefetcher.correct_prefetch(
+                                layer_id + 1, expert_list
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        prefetcher.correct_prefetch(layer_id + 1, expert_list)
                     if router_logits is not None:
-                        self.trigger_speculative_prefetch(
-                            layer_id, router_logits
-                        )
+                        if failure_safe:
+                            try:
+                                self.trigger_speculative_prefetch(
+                                    layer_id, router_logits
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            self.trigger_speculative_prefetch(
+                                layer_id, router_logits
+                            )
             finally:
                 if prefetcher is not None:
-                    prefetcher.drain_native_prefetch_samples()
+                    _call_optional(prefetcher, "drain_native_prefetch_samples")
 
         with wait_nvtx_ctx:
             with wait_profiler_ctx:
-                try:
-                    result = self.expert_dispatcher.wait_expert()
-                except BaseException:
+                completion_profiler_ctx = (
+                    profiler.time("expert_completion_handoff", expert=-1)
+                    if profiler is not None
+                    else nullcontext()
+                )
+                with completion_profiler_ctx:
                     try:
-                        finalize_policy(False)
+                        result = self.expert_dispatcher.wait_expert()
                     except BaseException:
-                        pass
-                    raise
-                else:
-                    finalize_policy(True)
-                    return result
+                        try:
+                            finalize_policy(False)
+                        except BaseException:
+                            pass
+                        raise
+        finalize_policy(True)
+        return result
 
     def dispatch(self, hidden_states, router_mask, layer_id):
         num_expert = router_mask.shape[-1]

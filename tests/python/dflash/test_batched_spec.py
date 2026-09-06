@@ -20,9 +20,9 @@ Pins the Track-C contract on the tiny CPU fixtures:
 
 Plus the C0 batched pure ops (``acceptance_lengths`` /
 ``committed_tokens_ragged`` / ``build_block_with_prefixes``) against their
-per-row v1 counterparts, and the dispatch guard rails (sampled batch>1 and
-MoE-rich batch>1 raise ``NotImplementedError``; right-padded/non-monotone
-masks raise ``ValueError``).
+per-row v1 counterparts, and the dispatch guard rails (sampled bare-HF
+batch>1 uses physical execution while MoE-rich batch>1 uses independent
+request sessions; right-padded/non-monotone masks raise ``ValueError``).
 
 Trace convention (batched): one ``NativeStepTrace`` per ACTIVE row per step;
 ``accept`` is that row's effective accept (``cc_b - 1``) and ``start`` the
@@ -529,26 +529,43 @@ def test_batch_one_via_batched_path_with_stop_ids_equals_legacy():
 # ---------------------------------------------------------------------------
 
 
-def test_batched_sampled_raises_not_implemented():
+def test_batched_sampled_bare_hf_is_supported():
     spec, _ = _tiny_spec()
     ids = torch.tensor([PROMPT_A, PROMPT_A])
-    with pytest.raises(NotImplementedError, match="greedy-only"):
-        spec.generate(ids, max_new_tokens=4, temperature=0.7)
+    output = spec.generate(
+        ids,
+        max_new_tokens=4,
+        temperature=0.7,
+        generator=torch.Generator().manual_seed(17),
+    )
+    assert output.shape == (2, len(PROMPT_A) + 4)
+    assert spec.last_generated_lengths == [4, 4]
 
 
-def test_batched_moe_rich_target_raises_not_implemented():
+def test_batched_moe_rich_target_uses_independent_request_sessions():
     from moe_infinity.entrypoints.big_modeling import MoE
 
     spec, target = _tiny_spec()
     shell = MoE.__new__(MoE)
     shell.model = target
+    shell._configure_hook = lambda _input_ids: None
+    shell._cached_past_key_values = None
+    shell._native_attention_backend = None
+    shell._resolve_native_input_device = lambda: torch.device("cpu")
     spec = DFlashSpeculator.from_models(
         shell, spec.draft, config=spec.config, device="cpu"
     )
 
     ids = torch.tensor([PROMPT_A, PROMPT_A])
-    with pytest.raises(NotImplementedError, match="bare HF target"):
-        spec.generate(ids, max_new_tokens=4)
+    output = spec.generate(ids, max_new_tokens=[2, 4])
+
+    assert output.shape == (2, ids.shape[1] + 4)
+    assert torch.equal(output[:, : ids.shape[1]], ids)
+    assert spec.last_generated_lengths == [2, 4]
+    assert [trace.request_id for trace in spec.last_session_traces] == [
+        "direct-0",
+        "direct-1",
+    ]
 
 
 def test_right_padded_attention_mask_rejected():

@@ -1,2 +1,15 @@
 recursive-include core *.cpp *.h *.cc
 recursive-include extensions/kernel *.cu *.h
+
+# With setuptools-scm installed, the sdist file-finder defaults to including
+# every git-tracked file. Prune large directories that are not needed to build
+# or install the package from source, keeping the published sdist lean.
+prune docs
+prune benchmarks
+prune examples
+prune tests
+prune docker
+prune scripts
+prune results
+prune logs
+prune .github

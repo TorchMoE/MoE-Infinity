@@ -54,6 +54,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -69,7 +71,7 @@ jobs:
             | pip install -r /dev/stdin 2>&1 || true
 
       - name: Install test tools
-        run: pip install pytest pytest-xdist pytest-timeout
+        run: pip install pytest pytest-xdist pytest-timeout "setuptools-scm>=8"
 
       - name: Install package (no CUDA extensions)
         run: pip install --no-build-isolation --no-deps -e .
@@ -79,6 +81,11 @@ jobs:
           pytest tests/python/unit tests/python/serving \
             -m "not gpu and not multi_gpu and not slow and not perf and not network" \
             -x --timeout=120 -v
+
+      - name: Run DFlash unified validation E2E
+        run: |
+          pytest tests/python/integration/test_dflash_unified_validation_e2e.py \
+            -v
 
       - name: Install contextpilot
         run: pip install contextpilot
@@ -92,6 +99,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
@@ -100,7 +109,7 @@ jobs:
 
       - name: Install build tools
         run: |
-          pip install "setuptools>=78.1.1,<82" wheel build
+          pip install "setuptools>=78.1.1,<82" "setuptools-scm>=8" wheel build
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Build sdist

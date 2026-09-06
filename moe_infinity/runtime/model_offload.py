@@ -554,6 +554,26 @@ class OffloadEngine(object):
         self._captured_kv: dict[int, tuple[object, ...]] = {}
         self.model = None
 
+    def decode_graph_capability(self):
+        from moe_infinity.runtime.attention_types import DecodeGraphCapability
+
+        if getattr(self, "forward_hooks", None) or getattr(
+            self, "backward_hooks", None
+        ):
+            return DecodeGraphCapability(False, "active_model_hooks")
+        if getattr(self, "archer_engine", None) is not None:
+            return DecodeGraphCapability(False, "archer_callbacks")
+        if getattr(self, "expert_dispatcher", None) is not None:
+            return DecodeGraphCapability(False, "expert_dispatcher")
+        if getattr(self, "expert_prefetcher", None) is not None:
+            return DecodeGraphCapability(False, "transfer_scheduler")
+        if (
+            self._enable_kv_cache_offload
+            or getattr(self, "_kv_cache_manager", None) is not None
+        ):
+            return DecodeGraphCapability(False, "kv_offload")
+        return DecodeGraphCapability(True, "eligible")
+
     def get_attention_backend(self):
         """Return the registered attention backend, or None if not configured.
 

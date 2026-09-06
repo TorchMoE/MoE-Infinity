@@ -94,6 +94,8 @@ class MemoryManager:
             self.device
         )
         self._last_budget = None
+        self._cuda_graph_pool_bytes = 0
+        self._cuda_graph_scratch_kv_bytes = 0
 
     def compute_budget(self, model_memory_bytes: int) -> MemoryBudget:
         if model_memory_bytes < 0:
@@ -151,6 +153,14 @@ class MemoryManager:
             self.device_memory_ratio * self.kv_cache_ratio
         )
 
+    def set_cuda_graph_usage(
+        self, *, graph_pool_bytes: int, scratch_kv_bytes: int
+    ) -> None:
+        if graph_pool_bytes < 0 or scratch_kv_bytes < 0:
+            raise ValueError("CUDA graph memory usage must be non-negative")
+        self._cuda_graph_pool_bytes = graph_pool_bytes
+        self._cuda_graph_scratch_kv_bytes = scratch_kv_bytes
+
     def report(self) -> dict[str, Union[str, int, float]]:
         budget = self._last_budget
         if budget is None:
@@ -166,6 +176,11 @@ class MemoryManager:
             "activation_reserve_ratio": budget.activation_reserve_ratio,
             "expert_cache_bytes": budget.expert_cache_bytes,
             "kv_cache_bytes": budget.kv_cache_bytes,
+            "cuda_graph_pool_bytes": self._cuda_graph_pool_bytes,
+            "cuda_graph_scratch_kv_bytes": self._cuda_graph_scratch_kv_bytes,
+            "cuda_graph_total_bytes": (
+                self._cuda_graph_pool_bytes + self._cuda_graph_scratch_kv_bytes
+            ),
         }
 
     @staticmethod
