@@ -26,7 +26,7 @@ def _make_layered_store(
         num_blocks=num_blocks,
         block_size=4,
         num_kv_heads=2,
-        head_dim=8,
+        head_dim=64,
         execution_dtype=torch.float32,
         device=torch.device("cpu"),
     )
@@ -75,7 +75,7 @@ class _FakeDecodeWrapper:
 def _spec() -> KVCacheSpec:
     return KVCacheSpec(
         num_kv_heads=2,
-        head_dim=8,
+        head_dim=64,
         dtype=torch.float32,
         block_size=4,
     )
@@ -151,7 +151,7 @@ def test_flashinfer_kv_cache_layout_nhd_with_mocked_module(
         device=torch.device("cpu"),
     )
     assert backend._fi_kv_cache is not None
-    assert backend._fi_kv_cache.shape == (10, 2, 4, 2, 8)
+    assert backend._fi_kv_cache.shape == (10, 2, 4, 2, 64)
 
 
 def test_flashinfer_prefill_metadata_is_int32_with_mocked_module(
@@ -164,9 +164,9 @@ def test_flashinfer_prefill_metadata_is_int32_with_mocked_module(
         device=torch.device("cpu"),
     )
 
-    query = torch.randn(4, 4, 8)
-    key = torch.randn(4, 2, 8)
-    value = torch.randn(4, 2, 8)
+    query = torch.randn(4, 4, 64)
+    key = torch.randn(4, 2, 64)
+    value = torch.randn(4, 2, 64)
     out = backend.forward(
         query=query,
         key=key,
@@ -174,7 +174,7 @@ def test_flashinfer_prefill_metadata_is_int32_with_mocked_module(
         attention_metadata=_prefill_metadata(num_tokens=4),
     )
 
-    assert out.shape == (4, 4, 8)
+    assert out.shape == (4, 4, 64)
     assert backend._fi_prefill is not None
     assert backend._fi_prefill.plan_args is not None
     plan_args = backend._fi_prefill.plan_args[0]
@@ -194,8 +194,8 @@ def test_flashinfer_decode_metadata_is_int32_with_mocked_module(
         device=torch.device("cpu"),
     )
 
-    key = torch.randn(4, 2, 8)
-    value = torch.randn(4, 2, 8)
+    key = torch.randn(4, 2, 64)
+    value = torch.randn(4, 2, 64)
     backend.write_kv_flashinfer(
         key=key,
         value=value,
@@ -203,12 +203,12 @@ def test_flashinfer_decode_metadata_is_int32_with_mocked_module(
     )
 
     out = backend.forward(
-        query=torch.randn(1, 4, 8),
+        query=torch.randn(1, 4, 64),
         key=key[:1],
         value=value[:1],
         attention_metadata=_decode_metadata(seq_len=4),
     )
-    assert out.shape == (1, 4, 8)
+    assert out.shape == (1, 4, 64)
     assert backend._fi_decode is not None
     assert backend._fi_decode.plan_args is not None
     plan_args = backend._fi_decode.plan_args[0]
@@ -227,7 +227,7 @@ def test_write_kv_flashinfer_writes_expected_layout(
         device=torch.device("cpu"),
     )
 
-    key = torch.arange(3 * 2 * 8, dtype=torch.float32).reshape(3, 2, 8)
+    key = torch.arange(3 * 2 * 64, dtype=torch.float32).reshape(3, 2, 64)
     value = key + 1000.0
     slot_mapping = torch.tensor([0, 3, 4], dtype=torch.long)
 
@@ -260,12 +260,12 @@ def test_fallback_prefill_without_flashinfer(
     )
 
     out = backend.forward(
-        query=torch.randn(4, 4, 8),
-        key=torch.randn(4, 2, 8),
-        value=torch.randn(4, 2, 8),
+        query=torch.randn(4, 4, 64),
+        key=torch.randn(4, 2, 64),
+        value=torch.randn(4, 2, 64),
         attention_metadata=_prefill_metadata(num_tokens=4),
     )
-    assert out.shape == (4, 4, 8)
+    assert out.shape == (4, 4, 64)
     assert backend._fi_prefill is None
 
 
@@ -282,17 +282,17 @@ def test_fallback_decode_without_flashinfer(
         num_gpu_blocks=10,
         device=torch.device("cpu"),
     )
-    key = torch.randn(4, 2, 8)
-    value = torch.randn(4, 2, 8)
+    key = torch.randn(4, 2, 64)
+    value = torch.randn(4, 2, 64)
     backend.write_kv(key=key, value=value, slot_mapping=torch.arange(4))
 
     out = backend.forward(
-        query=torch.randn(1, 4, 8),
+        query=torch.randn(1, 4, 64),
         key=key[:1],
         value=value[:1],
         attention_metadata=_decode_metadata(seq_len=4),
     )
-    assert out.shape == (1, 4, 8)
+    assert out.shape == (1, 4, 64)
     assert backend._fi_decode is None
 
 
@@ -318,9 +318,9 @@ def test_flashinfer_qo_indptr_uses_chunk_queries_not_total_kv(
         is_prefill=True,
     )
     backend.forward(
-        query=torch.randn(5, 4, 8),
-        key=torch.randn(5, 2, 8),
-        value=torch.randn(5, 2, 8),
+        query=torch.randn(5, 4, 64),
+        key=torch.randn(5, 2, 64),
+        value=torch.randn(5, 2, 64),
         attention_metadata=metadata,
     )
 
@@ -337,7 +337,7 @@ def _make_serving_cache(num_blocks: int, block_size: int) -> PagedKVCache:
         block_size=block_size,
         num_layers=1,
         num_heads=2,
-        head_dim=8,
+        head_dim=64,
         dtype=torch.float32,
         device=torch.device("cpu"),
     )
@@ -352,8 +352,8 @@ def test_layered_store_checkpoint_restores_both_layouts(
     )
     backend.create_layered_store(layer_count=1)
     checkpoint = backend.block_store.checkpoint([1])
-    key = torch.full((2, 2, 8), 7.0)
-    value = torch.full((2, 2, 8), 9.0)
+    key = torch.full((2, 2, 64), 7.0)
+    value = torch.full((2, 2, 64), 9.0)
     slots = torch.tensor([4, 5])
     backend.write_kv(key, value, slots)
     backend.write_kv_flashinfer(key, value, slots)
@@ -377,7 +377,7 @@ def test_swap_exports_and_restores_runtime_backend_storage(
     cache = _make_serving_cache(num_blocks=4, block_size=4)
     cache.set_block_store(backend.block_store, owner=backend)
     cache.allocate_sequence(3, num_tokens=4)
-    key = torch.arange(64, dtype=torch.float32).reshape(4, 2, 8)
+    key = torch.arange(4 * 2 * 64, dtype=torch.float32).reshape(4, 2, 64)
     value = key + 100.0
     backend.write_kv(key, value, torch.arange(4))
     backend.write_kv_flashinfer(key, value, torch.arange(4))
@@ -388,10 +388,10 @@ def test_swap_exports_and_restores_runtime_backend_storage(
 
     restored = backend.block_store.export_blocks(cache.get_block_table(3))
     torch.testing.assert_close(
-        restored.fi_kv_cache[0, :, 0], key.reshape(1, 4, 2, 8)
+        restored.fi_kv_cache[0, :, 0], key.reshape(1, 4, 2, 64)
     )
     torch.testing.assert_close(
-        restored.fi_kv_cache[0, :, 1], value.reshape(1, 4, 2, 8)
+        restored.fi_kv_cache[0, :, 1], value.reshape(1, 4, 2, 64)
     )
 
 
@@ -430,7 +430,7 @@ def make_recording_backend(monkeypatch: pytest.MonkeyPatch):
         flashinfer_utils, "get_workspace", lambda device: torch.empty(1)
     )
     spec = KVCacheSpec(
-        num_kv_heads=2, head_dim=8, dtype=torch.float16, block_size=16
+        num_kv_heads=2, head_dim=64, dtype=torch.float16, block_size=16
     )
     backend = PagedAttentionBackend(
         spec, num_gpu_blocks=16, device=torch.device("cpu")
@@ -463,7 +463,7 @@ def make_slots(
 
 
 def make_q(tokens: int) -> torch.Tensor:
-    return torch.zeros(tokens, 2, 8, dtype=torch.float16)
+    return torch.zeros(tokens, 2, 64, dtype=torch.float16)
 
 
 make_k = make_q
@@ -523,7 +523,7 @@ def test_export_import_checkpoint_restore_cover_every_layer(
 ) -> None:
     _enable_fake_flashinfer(monkeypatch)
     backend = attention_backend_module.PagedAttentionBackend(
-        spec=KVCacheSpec(2, 8, torch.float16, 4),
+        spec=KVCacheSpec(2, 64, torch.float16, 4),
         num_gpu_blocks=4,
         device=torch.device("cpu"),
     )
@@ -556,7 +556,7 @@ def test_flashinfer_workspace_reuse_across_batches() -> None:
     backend = attention_backend_module.PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=2,
-            head_dim=16,
+            head_dim=64,
             dtype=torch.float16,
             block_size=4,
         ),
@@ -581,9 +581,9 @@ def test_flashinfer_workspace_reuse_across_batches() -> None:
         is_prefill=True,
     )
 
-    query = torch.randn(4, 4, 16, dtype=torch.float16, device="cuda")
-    key = torch.randn(4, 2, 16, dtype=torch.float16, device="cuda")
-    value = torch.randn(4, 2, 16, dtype=torch.float16, device="cuda")
+    query = torch.randn(4, 4, 64, dtype=torch.float16, device="cuda")
+    key = torch.randn(4, 2, 64, dtype=torch.float16, device="cuda")
+    value = torch.randn(4, 2, 64, dtype=torch.float16, device="cuda")
 
     workspace0 = backend._fi_workspace
     backend.forward(

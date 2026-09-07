@@ -286,7 +286,7 @@ def _make_transactional_backend(
     backend = PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=2,
-            head_dim=8,
+            head_dim=64,
             dtype=torch.float16,
             block_size=block_size,
         ),

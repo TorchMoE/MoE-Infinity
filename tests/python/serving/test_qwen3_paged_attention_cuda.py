@@ -25,7 +25,7 @@ def test_real_qwen3_paged_attention_runs_chunk_through_flashinfer() -> None:
         hidden_size=32,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=8,
+        head_dim=64,
         num_hidden_layers=1,
         intermediate_size=64,
         moe_intermediate_size=16,
@@ -38,14 +38,14 @@ def test_real_qwen3_paged_attention_runs_chunk_through_flashinfer() -> None:
         .eval()
     )
     backend = PagedAttentionBackend(
-        spec=KVCacheSpec(2, 8, torch.float16, 4),
+        spec=KVCacheSpec(2, 64, torch.float16, 4),
         num_gpu_blocks=4,
         num_layers=1,
         device=device,
     )
     assert backend._flashinfer_enabled()
     backend.register_layers([LayerRegistration(0, id(attention))])
-    prefix_k = torch.randn(4, 2, 8, device=device, dtype=torch.float16)
+    prefix_k = torch.randn(4, 2, 64, device=device, dtype=torch.float16)
     prefix_v = torch.randn_like(prefix_k)
     prefix_slots = torch.arange(4, device=device)
     backend.write_kv(prefix_k, prefix_v, prefix_slots, layer_idx=0)
@@ -67,8 +67,8 @@ def test_real_qwen3_paged_attention_runs_chunk_through_flashinfer() -> None:
         is_prefill=True,
     )
     hidden = torch.randn(1, 2, 32, device=device, dtype=torch.float16)
-    cos = torch.ones(1, 2, 8, device=device, dtype=torch.float16)
-    sin = torch.zeros(1, 2, 8, device=device, dtype=torch.float16)
+    cos = torch.ones(1, 2, 64, device=device, dtype=torch.float16)
+    sin = torch.zeros(1, 2, 64, device=device, dtype=torch.float16)
     Qwen3PagedAttention.set_paged_context(backend, metadata)
     try:
         output, weights = attention(

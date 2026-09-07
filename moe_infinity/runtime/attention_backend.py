@@ -34,6 +34,8 @@ from moe_infinity.runtime.kv_cache_format import (
     resolve_kv_cache_format,
 )
 
+_FLASHINFER_SUPPORTED_HEAD_DIMS = frozenset({64, 128})
+
 __all__ = [
     "FlashInferPlanMetadata",
     "LayerRegistration",
@@ -427,7 +429,15 @@ class PagedAttentionBackend:
         self._fi_kv_cache = None
         self._fi_prefill = None
         self._fi_decode = None
-        if not self._is_int8 and flashinfer_utils.HAS_FLASHINFER:
+        # MLA runs with a padded head_dim (256); FlashInfer's paged wrappers
+        # JIT-compile per head_dim on first use and stall the request there, so
+        # only small standard dims use FlashInfer. MLA falls back to SDPA
+        # prefill + the precompiled paged_attention_v1 kernel (both handle 256).
+        if (
+            not self._is_int8
+            and flashinfer_utils.HAS_FLASHINFER
+            and spec.head_dim in _FLASHINFER_SUPPORTED_HEAD_DIMS
+        ):
             flashinfer_module = cast(
                 Any,
                 flashinfer_utils.get_flashinfer_module(),
