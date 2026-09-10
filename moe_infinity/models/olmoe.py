@@ -66,4 +66,8 @@ class SyncOlmoeMoEBlock(nn.Module):
         final_hidden_states = final_hidden_states.view(
             batch_size, sequence_length, hidden_dim
         ).to(hidden_states.dtype)
-        return final_hidden_states, router_logits
+        # transformers v5 decoder layers consume self.mlp(...) as a bare
+        # tensor: `hidden_states = residual + hidden_states`. Returning the
+        # v4 (tensor, router_logits) tuple makes that addition raise
+        # `TypeError: unsupported operand type(s) for +: 'Tensor' and 'tuple'`.
+        return final_hidden_states

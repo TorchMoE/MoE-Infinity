@@ -63,7 +63,7 @@ def test_parse_expert_type_new_models():
 
     for arch_prefix, expected_type in [
         ("DbrxForCausalLM", 4),
-        ("OlmoeForCausalLM", 4),
+        ("OlmoeForCausalLM", 5),
         ("JambaForCausalLM", 4),
     ]:
         config = SimpleNamespace(architectures=[arch_prefix])
