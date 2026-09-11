@@ -10,6 +10,8 @@
 
 #include <limits>
 
+#include "paged_attention_int8.cuh"
+
 namespace archer {
 namespace attention {
 
@@ -250,4 +252,6 @@ void paged_attention_v1(torch::Tensor& out, const torch::Tensor& query,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("paged_attention_v1", &paged_attention_v1,
         "PagedAttention V1 forward pass");
+  m.def("paged_attention_int8_v1", &paged_attention_int8_v1,
+        "INT8 symmetric paged attention forward pass");
 }

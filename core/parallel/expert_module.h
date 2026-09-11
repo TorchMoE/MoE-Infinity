@@ -194,7 +194,9 @@ torch::Tensor launch_fused_moe_ffn(torch::Tensor hidden,  // [M, K]
 
 struct MoEMLP : public torch::nn::Module {
   explicit MoEMLP(int dtype, int expert_type);
-  torch::Tensor forward(torch::Tensor hidden_states, cudaStream_t stream);
+  torch::Tensor forward(torch::Tensor hidden_states, cudaStream_t stream,
+                        cudaEvent_t kernel_start = nullptr,
+                        cudaEvent_t kernel_stop = nullptr);
 
   void SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids);
   void DequantMxfp4Params(cudaStream_t stream);

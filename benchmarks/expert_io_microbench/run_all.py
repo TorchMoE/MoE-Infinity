@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scenario",
-        choices=("all", "routing", "transfer", "compute", "bubble"),
+        choices=("all", "routing", "transfer", "compute", "bubble", "overlap"),
         default="all",
         help="Run all scenarios or a single scenario",
     )
@@ -460,6 +460,47 @@ def scenario_list(selection: str) -> list[str]:
     return [selection]
 
 
+def run_overlap_scenario(
+    *,
+    model: str,
+    offload_dir: str,
+    warmup: int,
+    iters: int,
+    device_memory_ratio: float,
+) -> dict[str, Any]:
+    script_path = Path(__file__).resolve().parent / "bench_overlap_prefetch.py"
+    with tempfile.TemporaryDirectory(prefix="io_microbench_overlap_") as td:
+        temp_output = Path(td) / "overlap.json"
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--model",
+            model,
+            "--offload-dir",
+            offload_dir,
+            "--policies",
+            "off",
+            "observe",
+            "enforce",
+            "--warmup",
+            str(warmup),
+            "--iters",
+            str(iters),
+            "--device-memory-ratio",
+            str(device_memory_ratio),
+            "--output-json",
+            str(temp_output),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            return {
+                "error": "overlap benchmark failed",
+                "stderr": proc.stderr[-2000:],
+            }
+        with temp_output.open() as handle:
+            return json.load(handle)
+
+
 def run_one_script(
     *,
     scenario: str,
@@ -634,15 +675,24 @@ def main() -> int:
     try:
         for scenario in selected:
             try:
-                scenarios[scenario] = run_one_script(
-                    scenario=scenario,
-                    model=args.model,
-                    offload_dir=actual_offload_dir,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    device_memory_ratio=args.device_memory_ratio,
-                    host_only=(mode == "host-only"),
-                )
+                if scenario == "overlap":
+                    scenarios[scenario] = run_overlap_scenario(
+                        model=args.model,
+                        offload_dir=actual_offload_dir,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        device_memory_ratio=args.device_memory_ratio,
+                    )
+                else:
+                    scenarios[scenario] = run_one_script(
+                        scenario=scenario,
+                        model=args.model,
+                        offload_dir=actual_offload_dir,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        device_memory_ratio=args.device_memory_ratio,
+                        host_only=(mode == "host-only"),
+                    )
             except Exception as exc:
                 scenarios[scenario] = {
                     "error": f"{type(exc).__name__}: {exc}",

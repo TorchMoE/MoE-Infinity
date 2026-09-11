@@ -166,6 +166,90 @@ class ArcherConfig:
             "help": "Positive maximum prefetch bypasses before promotion."
         },
     )
+    overlap_prefetch_policy: str = field(
+        default="off",
+        metadata={
+            "help": "off, observe, or enforce overlap-window byte admission for speculative expert prefetch."
+        },
+    )
+    overlap_prefetch_ewma_alpha: float = field(
+        default=0.2,
+        metadata={
+            "help": "EWMA smoothing factor in (0, 1] for compute/bandwidth/queue/issue calibration."
+        },
+    )
+    overlap_prefetch_safety_factor: float = field(
+        default=0.8,
+        metadata={
+            "help": "Fraction in (0, 1] of measured compute time usable as the transfer overlap window."
+        },
+    )
+    overlap_prefetch_cold_start_experts: int = field(
+        default=1,
+        metadata={
+            "help": "Max experts admitted before both a compute and a transfer sample exist."
+        },
+    )
+    overlap_prefetch_max_window_bytes: int = field(
+        default=256 * 1024 * 1024,
+        metadata={
+            "help": "Upper bound on the per-layer admitted prefetch window in bytes."
+        },
+    )
+    overlap_prefetch_max_inflight_bytes: int = field(
+        default=512 * 1024 * 1024,
+        metadata={
+            "help": "Upper bound on outstanding speculative prefetch bytes."
+        },
+    )
+    kv_cache_format: str = field(
+        default="native",
+        metadata={
+            "help": "KV storage format: native or int8_sym; default preserves model dtype."
+        },
+    )
+    kv_cache_allow_fallback: bool = field(
+        default=True,
+        metadata={
+            "help": "Allow a visible native fallback when requested KV format is unsupported."
+        },
+    )
+    kv_swap_mode: str = field(
+        default="sync",
+        metadata={
+            "help": "Serving KV swap backend: 'sync' (blocking pageable copies, default) or 'async' (bounded event-driven pinned transfers)."
+        },
+    )
+    kv_swap_host_memory_bytes: int = field(
+        default=512 * 1024 * 1024,
+        metadata={
+            "help": "Hard cap on pinned host memory for async KV swap. Accepted but inactive in sync mode."
+        },
+    )
+    kv_swap_max_inflight_bytes: int = field(
+        default=256 * 1024 * 1024,
+        metadata={
+            "help": "Hard cap on in-flight (incomplete-event) async KV transfer bytes. Accepted but inactive in sync mode."
+        },
+    )
+    kv_swap_checksum: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable opt-in CRC32 validation of swapped KV payloads before H2D submission."
+        },
+    )
+    kv_swap_max_retries: int = field(
+        default=2,
+        metadata={
+            "help": "Maximum async swap-in retries before terminal reprefill."
+        },
+    )
+    kv_swap_allow_sync_fallback: bool = field(
+        default=True,
+        metadata={
+            "help": "When async is requested but CUDA/pinned allocation is unavailable at init, fall back to sync instead of raising."
+        },
+    )
 
     @staticmethod
     def _validate_gpu_routing_overlap(
@@ -294,6 +378,72 @@ class ArcherConfig:
         if self.expert_policy_starvation_limit <= 0:
             raise ValueError(
                 f"expert_policy_starvation_limit must be > 0, got {self.expert_policy_starvation_limit}"
+            )
+        valid_policies = ("off", "observe", "enforce")
+        if self.overlap_prefetch_policy not in valid_policies:
+            raise ValueError(
+                f"overlap_prefetch_policy must be one of {valid_policies}, got {self.overlap_prefetch_policy!r}"
+            )
+        if not 0.0 < self.overlap_prefetch_ewma_alpha <= 1.0:
+            raise ValueError(
+                f"overlap_prefetch_ewma_alpha must be in (0, 1], got {self.overlap_prefetch_ewma_alpha}"
+            )
+        if not 0.0 < self.overlap_prefetch_safety_factor <= 1.0:
+            raise ValueError(
+                f"overlap_prefetch_safety_factor must be in (0, 1], got {self.overlap_prefetch_safety_factor}"
+            )
+        if self.overlap_prefetch_cold_start_experts < 0:
+            raise ValueError(
+                f"overlap_prefetch_cold_start_experts must be >= 0, got {self.overlap_prefetch_cold_start_experts}"
+            )
+        if self.overlap_prefetch_max_window_bytes < 0:
+            raise ValueError(
+                f"overlap_prefetch_max_window_bytes must be >= 0, got {self.overlap_prefetch_max_window_bytes}"
+            )
+        if self.overlap_prefetch_max_inflight_bytes < 0:
+            raise ValueError(
+                f"overlap_prefetch_max_inflight_bytes must be >= 0, got {self.overlap_prefetch_max_inflight_bytes}"
+            )
+        if (
+            self.overlap_prefetch_policy == "enforce"
+            and self.overlap_prefetch_max_window_bytes
+            > self.overlap_prefetch_max_inflight_bytes
+        ):
+            raise ValueError(
+                f"overlap_prefetch_max_window_bytes ({self.overlap_prefetch_max_window_bytes}) must be <= "
+                f"overlap_prefetch_max_inflight_bytes ({self.overlap_prefetch_max_inflight_bytes}) when policy is enforce"
+            )
+        if (
+            self.gpu_only_expert_routing
+            and self.overlap_prefetch_policy != "off"
+        ):
+            raise ValueError(
+                "gpu_only_expert_routing cannot be combined with overlap "
+                "prefetch (overlap_prefetch_policy=observe|enforce) in the "
+                "first release"
+            )
+        from moe_infinity.runtime.kv_cache_format import KVCacheFormat
+
+        KVCacheFormat.parse(self.kv_cache_format)
+        if self.kv_swap_mode not in ("sync", "async"):
+            raise ValueError(
+                f"kv_swap_mode must be 'sync' or 'async', got {self.kv_swap_mode!r}"
+            )
+        if self.kv_swap_host_memory_bytes <= 0:
+            raise ValueError(
+                f"kv_swap_host_memory_bytes must be > 0, got {self.kv_swap_host_memory_bytes}"
+            )
+        if self.kv_swap_max_inflight_bytes <= 0:
+            raise ValueError(
+                f"kv_swap_max_inflight_bytes must be > 0, got {self.kv_swap_max_inflight_bytes}"
+            )
+        if self.kv_swap_max_inflight_bytes > self.kv_swap_host_memory_bytes:
+            raise ValueError(
+                f"kv_swap_max_inflight_bytes ({self.kv_swap_max_inflight_bytes}) must not exceed kv_swap_host_memory_bytes ({self.kv_swap_host_memory_bytes})"
+            )
+        if self.kv_swap_max_retries < 0:
+            raise ValueError(
+                f"kv_swap_max_retries must be >= 0, got {self.kv_swap_max_retries}"
             )
         if (
             type(self.max_resident_paged_speculative_sessions) is not int

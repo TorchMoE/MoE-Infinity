@@ -39,6 +39,17 @@ def test_page_size_bytes_bf16_matches_fp16():
     assert fp16_spec.page_size_bytes == 4096
 
 
+def test_page_size_bytes_int8_sym() -> None:
+    spec = KVCacheSpec(
+        num_kv_heads=8,
+        head_dim=128,
+        dtype=torch.float16,
+        block_size=16,
+        format_name="int8_sym",
+    )
+    assert spec.page_size_bytes == 33280
+
+
 def test_attention_metadata_creation():
     block_tables = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
     slot_mapping = torch.tensor([0, 1, 2, 3], dtype=torch.int64)

@@ -85,6 +85,50 @@ The decision-profile runner toggles `cudaProfilerStart` and `cudaProfilerStop` a
 - `sync_overhead.sync_pct_of_step` shows how much of each step disappears into synchronization.
 - `bandwidth_analysis.top_bottlenecks` from `run_all.py` ranks the worst components by share of step time.
 
+## Overlap-aware expert prefetch
+
+`bench_overlap_prefetch.py` runs the same deterministic prompt, seed, warmup,
+token count, and iteration count for `off`, `observe`, and `enforce` in separate
+processes (native topology is process-global), resets the cache between measured
+arms, and compares output ids exactly against the `off` oracle. It reports
+p50/p95 per-token latency plus budget/admission/completion/coverage/waste/late/
+cancel/reject bytes and the EWMAs. Results are labeled `MEASURED`; the benchmark
+asserts no speedup and fails only on correctness mismatch, malformed or missing
+metrics, queue-accounting inconsistency, or crashes.
+
+```bash
+python benchmarks/expert_io_microbench/bench_overlap_prefetch.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /path/to/existing/offload \
+  --policies off observe enforce --warmup 3 --iters 10 --max-new-tokens 32 \
+  --output-json /tmp/overlap-prefetch.json
+```
+
+`run_all.py --scenario overlap` shells out to the same benchmark and merges its
+JSON without altering the routing/transfer/compute/bubble scenarios.
+
+The nsys decision profile understands the policy directly:
+
+```bash
+nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi \
+  -o /tmp/overlap-prefetch-enforce \
+  python benchmarks/expert_io_microbench/run_decision_profile.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /path/to/existing/offload --hardware-tag local \
+  --mode host-only --speculative-prefetch --speculative-prefetch-overlap \
+  --overlap-prefetch-policy enforce \
+  --output-json /tmp/overlap-prefetch-profile.json
+```
+
+### Interpretation
+
+A candidate rollout compares the measured latency and throughput distributions
+together with the effectiveness metrics (coverage, waste, late bytes,
+cancellation, queue rejection) on each target model and hardware combination.
+No universal threshold or speedup is promised: absence of a required NVTX/IO
+range is `BLOCKED`, not a fabricated zero. Compare `off` against `observe` for
+decision overhead and output equality first, then `enforce` for the full
+admission effect.
 ## GPU-only expert routing A/B and Nsight runbook
 
 Run both modes with the same checkout, checkpoint, offload tree, GPU visibility, cache ratio, prompt, output length, and greedy decoding:

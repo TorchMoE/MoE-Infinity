@@ -26,6 +26,157 @@
 #include <sstream>
 #include <thread>
 
+#include <chrono>
+#include <cstdint>
+
+namespace {
+
+inline std::int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// Per-worker pool of timing-enabled start/stop event pairs plus a
+// timing-enabled epoch, all created lazily after cudaSetDevice and never drawn
+// from the disabled-timing kCudaEventPool. Mirrors the free/pending/quarantined
+// discipline proven by
+// tests/cpp/unit/parallel/test_expert_timing_lifecycle.cpp: a normal pair
+// retires only after cudaEventQuery(stop)==cudaSuccess; an exception path
+// records a timing-disabled fence on the same stream and holds the pair until a
+// fence query or stream synchronization proves the prior work complete.
+struct WorkerTiming {
+  struct PendingSample {
+    ExpertComputeSample sample;
+    std::int64_t forward_return_host_ns = 0;
+    std::int64_t output_complete_host_ns = 0;
+  };
+  struct Pair {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    cudaEvent_t fence = nullptr;
+    enum class State { kFree, kPending, kQuarantined } state = State::kFree;
+    PendingSample pending;
+  };
+
+  bool initialized = false;
+  cudaEvent_t epoch = nullptr;
+  std::int64_t epoch_host_ns = 0;
+  cudaStream_t stream = nullptr;
+  std::vector<Pair> pairs;
+
+  void LazyInit(cudaStream_t s, int num_pairs) {
+    if (initialized) return;
+    stream = s;
+    if (cudaEventCreateWithFlags(&epoch, cudaEventDefault) != cudaSuccess) {
+      epoch = nullptr;
+      initialized = true;
+      return;
+    }
+    cudaEventRecord(epoch, stream);
+    cudaStreamSynchronize(stream);
+    epoch_host_ns = SteadyNowNs();
+    pairs.resize(num_pairs);
+    for (auto& pair : pairs) {
+      if (cudaEventCreateWithFlags(&pair.start, cudaEventDefault) !=
+              cudaSuccess ||
+          cudaEventCreateWithFlags(&pair.stop, cudaEventDefault) !=
+              cudaSuccess) {
+        pair.start = nullptr;
+        pair.stop = nullptr;
+      }
+    }
+    initialized = true;
+  }
+
+  Pair* AcquireFree() {
+    for (auto& pair : pairs) {
+      if (pair.state == Pair::State::kFree && pair.start != nullptr &&
+          pair.stop != nullptr) {
+        return &pair;
+      }
+    }
+    return nullptr;
+  }
+
+  void Quarantine(Pair& pair) {
+    pair.state = Pair::State::kQuarantined;
+    pair.fence = nullptr;
+    cudaEvent_t fence = nullptr;
+    if (cudaEventCreateWithFlags(&fence, cudaEventDisableTiming) ==
+        cudaSuccess) {
+      if (cudaEventRecord(fence, stream) == cudaSuccess) {
+        pair.fence = fence;
+      } else {
+        cudaEventDestroy(fence);
+      }
+    }
+  }
+
+  void Poll(std::vector<ExpertComputeSample>* out) {
+    for (auto& pair : pairs) {
+      if (pair.state == Pair::State::kPending) {
+        cudaError_t status = cudaEventQuery(pair.stop);
+        if (status == cudaErrorNotReady) continue;
+        if (status == cudaSuccess && epoch != nullptr) {
+          float start_ms = 0.0f;
+          float stop_ms = 0.0f;
+          float dur_ms = 0.0f;
+          cudaEventElapsedTime(&start_ms, epoch, pair.start);
+          cudaEventElapsedTime(&stop_ms, epoch, pair.stop);
+          cudaEventElapsedTime(&dur_ms, pair.start, pair.stop);
+          ExpertComputeSample s = pair.pending.sample;
+          s.kernel_start_offset_ns = static_cast<std::int64_t>(start_ms * 1e6);
+          s.kernel_end_offset_ns = static_cast<std::int64_t>(stop_ms * 1e6);
+          s.kernel_duration_ns = static_cast<std::int64_t>(dur_ms * 1e6);
+          s.forward_return_host_ns =
+              pair.pending.forward_return_host_ns - epoch_host_ns;
+          s.output_complete_host_ns =
+              pair.pending.output_complete_host_ns - epoch_host_ns;
+          s.output_delay_ns =
+              s.output_complete_host_ns - s.forward_return_host_ns;
+          out->push_back(s);
+        }
+        pair.state = Pair::State::kFree;
+      } else if (pair.state == Pair::State::kQuarantined) {
+        if (pair.fence != nullptr) {
+          cudaError_t status = cudaEventQuery(pair.fence);
+          if (status == cudaErrorNotReady) continue;
+          if (status == cudaSuccess) {
+            cudaEventDestroy(pair.fence);
+            pair.fence = nullptr;
+            pair.state = Pair::State::kFree;
+            continue;
+          }
+        }
+        if (cudaStreamSynchronize(stream) == cudaSuccess) {
+          if (pair.fence != nullptr) {
+            cudaEventDestroy(pair.fence);
+            pair.fence = nullptr;
+          }
+          pair.state = Pair::State::kFree;
+        }
+      }
+    }
+  }
+
+  void Destroy() {
+    for (auto& pair : pairs) {
+      bool proven = pair.state == Pair::State::kFree ||
+                    pair.state == Pair::State::kPending;
+      if (!proven && cudaStreamSynchronize(stream) != cudaSuccess) {
+        continue;
+      }
+      if (pair.start != nullptr) cudaEventDestroy(pair.start);
+      if (pair.stop != nullptr) cudaEventDestroy(pair.stop);
+      if (pair.fence != nullptr) cudaEventDestroy(pair.fence);
+    }
+    if (epoch != nullptr) cudaEventDestroy(epoch);
+  }
+};
+
+}  // namespace
+
 extern void fp8_dequant_blockwise_cuda(const void* weight, const void* scale,
                                        void* out, int N, int K,
                                        cudaStream_t stream);
@@ -214,6 +365,7 @@ void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id,
                   phase <= static_cast<int>(ExpertPhase::MIXED),
               "invalid expert phase: ", phase);
   args.phase = static_cast<ExpertPhase>(phase);
+  args.invocation_id = current_invocation_id_;
   args.generation = current_generation_.load(std::memory_order_acquire);
   Enqueue(args);
 }
@@ -264,6 +416,7 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
     exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
     exec_args.evict = false;
     exec_args.hit = true;
+    exec_args.invocation_id = args.invocation_id;
     exec_args.generation = args.generation;
     if (kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled()) {
       kExpertResidencyManager->RecordAccess(expert_node->node, args.phase,
@@ -481,6 +634,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
             exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
                 expert_node->node, LeaseKind::DEMAND);
           }
+          exec_args.invocation_id = args.invocation_id;
           cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
           cache_access_count_.fetch_add(1, std::memory_order_relaxed);
           exec_args.transfer_event = nullptr;
@@ -676,6 +830,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
         }
         exec_args.hit = cache_hit;
         exec_args.generation = args.generation;
+        exec_args.invocation_id = args.invocation_id;
         exec_args.cache_slot_reserved = failure.cache_slot_reserved;
         exec_args.cache_key_inserted = failure.cache_key_inserted;
         cache_access_count_.fetch_add(1, std::memory_order_relaxed);
@@ -696,6 +851,8 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
   cudaSetDevice(gpu_id);
   cudaStream_t stream = exec_streams_[thread_idx];
 
+  thread_local WorkerTiming timing;
+
   while (!main_thread_stop_flag_.load(std::memory_order_acquire)) {
     ExecArgs args;
     if (!exec_queue_[gpu_id].Pop(args)) {
@@ -706,6 +863,19 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
       continue;
     }
 
+    bool timing_enabled =
+        overlap_timing_enabled_.load(std::memory_order_acquire);
+    if (timing_enabled) {
+      timing.LazyInit(stream, 4);
+      std::vector<ExpertComputeSample> ready;
+      timing.Poll(&ready);
+      if (!ready.empty()) {
+        std::lock_guard<std::mutex> lock(compute_samples_mutex_);
+        for (auto& s : ready) compute_samples_.push_back(s);
+      }
+    }
+
+    WorkerTiming::Pair* timing_pair = nullptr;
     FailureContext failure{
         args.expert_node,        gpu_id,     args.cache_slot_reserved,
         args.cache_key_inserted, args.evict,
@@ -760,15 +930,42 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
         modules_[thread_idx]->DequantMxfp4Params(stream);
       }
 
+      cudaEvent_t kernel_start = nullptr;
+      cudaEvent_t kernel_stop = nullptr;
+      if (timing_enabled && args.invocation_id != 0) {
+        timing_pair = timing.AcquireFree();
+        if (timing_pair != nullptr) {
+          kernel_start = timing_pair->start;
+          kernel_stop = timing_pair->stop;
+          timing_pair->pending.sample = ExpertComputeSample{};
+          timing_pair->pending.sample.invocation_id = args.invocation_id;
+          timing_pair->pending.sample.layer_id = args.expert_node->layer_idx;
+          timing_pair->pending.sample.expert_id = args.expert_node->expert_idx;
+          timing_pair->pending.sample.gpu_id = gpu_id;
+        }
+      }
+
       torch::Tensor output;
       {
 #ifndef NVTX_DISABLE
         nvtx3::scoped_range r("expert_compute");
 #endif
-        output = modules_[thread_idx]->forward(input, stream);
+        output = modules_[thread_idx]->forward(input, stream, kernel_start,
+                                               kernel_stop);
       }
+      std::int64_t forward_return_host_ns = SteadyNowNs();
       OutputFunc(args, output, token_mask, gpu_id, stream);
+      std::int64_t output_complete_host_ns = SteadyNowNs();
+
+      if (timing_pair != nullptr) {
+        timing_pair->pending.forward_return_host_ns = forward_return_host_ns;
+        timing_pair->pending.output_complete_host_ns = output_complete_host_ns;
+        timing_pair->state = WorkerTiming::Pair::State::kPending;
+      }
     } catch (...) {
+      if (timing_pair != nullptr) {
+        timing.Quarantine(*timing_pair);
+      }
       if (args.transfer_event != nullptr) {
         kCudaEventPool->Release(args.transfer_event);
         args.transfer_event = nullptr;
@@ -783,6 +980,8 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
       FailDispatch(args.generation, std::current_exception(), {failure});
     }
   }
+
+  timing.Destroy();
 }
 
 bool ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
@@ -982,6 +1181,7 @@ torch::Tensor ExpertDispatcher::WaitHiddenStates() {
 void ExpertDispatcher::SetInputs(const torch::Tensor& hidden_states,
                                  const torch::Tensor& router_mask,
                                  const torch::Tensor& router_weight) {
+  current_invocation_id_ = 0;
   TORCH_CHECK(!route_pending_.load(std::memory_order_acquire) &&
                   pending_.load(std::memory_order_acquire) == 0,
               "SetInputs: previous dispatch is still active");
@@ -1432,4 +1632,24 @@ void ExpertDispatcher::RetirementFunc() {
                                    args.evict}});
     }
   }
+}
+
+std::uint64_t ExpertDispatcher::SetInputsWithInvocation(
+    const torch::Tensor& hidden_states, const torch::Tensor& router_mask,
+    const torch::Tensor& router_weight) {
+  SetInputs(hidden_states, router_mask, router_weight);
+  current_invocation_id_ =
+      invocation_counter_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  return current_invocation_id_;
+}
+
+void ExpertDispatcher::SetOverlapComputeTimingEnabled(bool enabled) {
+  overlap_timing_enabled_.store(enabled, std::memory_order_release);
+}
+
+std::vector<ExpertComputeSample> ExpertDispatcher::DrainComputeSamples() {
+  std::lock_guard<std::mutex> lock(compute_samples_mutex_);
+  std::vector<ExpertComputeSample> drained;
+  drained.swap(compute_samples_);
+  return drained;
 }

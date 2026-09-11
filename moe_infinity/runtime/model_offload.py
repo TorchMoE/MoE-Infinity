@@ -1199,6 +1199,9 @@ class OffloadEngine(object):
                 self.expert_prefetcher.expert_nbytes_map = (
                     _make_expert_nbytes_map(model, self.config)
                 )
+                self.expert_prefetcher.configure_overlap_policy(
+                    self.archer_config
+                )
 
                 # for deepseek and glm, we need to set the expert_tensor_map for the model
                 first_k_dense_replace = 0
