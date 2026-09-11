@@ -55,7 +55,8 @@ MODEL_MAPPING_TYPES = {
     "qwen3": 5,
     "dbrx": 4,
     "olmoe": 4,
-    "jamba": 4,
+    # JambaMLP registers gate_proj, up_proj, down_proj (not w1, w2, w3).
+    "jamba": 5,
 }
 
 # DeepSeek-V4 support depends on a transformers build that ships
