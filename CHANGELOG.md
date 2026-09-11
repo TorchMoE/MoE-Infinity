@@ -42,6 +42,7 @@ All notable changes to MoE-Infinity will be documented in this file.
 - GPT-OSS resident-load path now materializes MXFP4 blocks, scales, router, biases, and attention sinks instead of leaving placeholder tensors in place.
 - GLM FP8 store and reload parity now stays stable across fresh stores and reloads.
 - PyPI publishing for both stable (`publish.yml`) and nightly (`publish-test.yml`): stable releases now take their version from the pushed git tag instead of always publishing `0.0.1`, and nightly sdists carry their version in `PKG-INFO` so `pip install --pre moe-infinity` no longer fails with a `MetadataInconsistent` version mismatch on rebuild.
+- `MOE_DISABLE_FUSED_KERNELS=1` no longer raises `TypeError` on decode: `fused_decode_attention` now has its own eager fallback instead of delegating to `paged_attention_fwd`, which takes a different KV cache layout and a required `num_kv_heads` argument.
 
 ### Known Limitations
 
