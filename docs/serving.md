@@ -68,6 +68,7 @@ Stable options from `api_server_v2.py`:
 | `--enable-pyspy-dump` | off | Scaffolded flag; currently accepted and stored, but no py-spy dump is triggered |
 | `--enable-contextpilot` | off | Enable ContextPilot middleware |
 | `--contextpilot-debug` | off | Enable ContextPilot fault-injection/admin hooks |
+| `--phase-specific-expert-policy` / `--no-phase-specific-expert-policy` | off | Enable or explicitly disable phase-specific admission, prefetch, eviction, and mixed-batch ordering over the shared expert cache |
 
 Internal / deprecated:
 
@@ -420,6 +421,37 @@ The optional `/contextpilot/toggle`, `/contextpilot/inject-fault`, and
 serving table. The fault-injection route is debug-only and requires
 `--contextpilot-debug`.
 
+## Phase-specific expert policy
+
+The opt-in policy keeps one expert store and one GPU cache; it does not create
+prefill and decode pools. `ExpertResidencyManager` is the sole enabled-mode
+authority for persistent membership, resident bytes, leases, candidate
+protection, eviction reservations, and policy counters. Dispatcher and
+prefetch telemetry are views of that shared snapshot.
+
+With `--phase-specific-expert-policy`, a mixed serving batch executes decode
+rows first and prefill rows second, once each, then restores original output
+order. With `--no-phase-specific-expert-policy` (the default), a non-paged mixed
+batch remains one combined forward and a paged mixed batch retains prefill-then-
+decode order.
+
+To roll back, restart with `--no-phase-specific-expert-policy`. For in-process
+configuration, set `"phase_specific_expert_policy": false`. Subordinate policy
+keys may remain in JSON because they are inert while the master gate is false.
+No cache deletion or offload-store migration is required: phase is not stored
+in tensor IDs, topology, or checkpoint metadata.
+
+Before disabling after a regression, capture `/admin/stats`, `/metrics`, the
+effective config, and the benchmark JSON. Check `starvation_promotions`,
+`prefetch_rejected`, TTFT, and TPOT, and do not change `device_memory_ratio`
+between A/B runs. See [Configuration](configuration.md#phase-specific-expert-policy-fields),
+[Benchmarking](benchmarking.md#phase-specific-expert-policy-matrix), and
+[Troubleshooting](troubleshooting.md#phase-specific-expert-policy-regression-or-rollback).
+
+Adaptive expert precision is not parallel-merge composable with this fixed-size
+manager. Land this policy first, then rebase adaptive precision onto the same
+lease/accounting transactions and add combined tests before co-enabling them.
+
 ## Watchdogs and Diagnostics
 
 - `--startup-timeout` is disabled by default.
@@ -438,6 +470,54 @@ If you need timeout debugging, use the watchdog logs and the troubleshooting gui
 - `400`: invalid `n` / `best_of` / other request validation.
 - `finish_reason="error"`: JSON-object validation failure.
 - Penalties and `logit_bias` are accepted by the request models but are not applied in sampling.
+# Adaptive-memory rollout and rollback
+
+`adaptive_memory_enabled` is disabled by default. It reallocates only within a
+fixed per-GPU budget and preserves a hard free-memory reserve.
+
+Roll out in stages:
+
+1. **Stage 0:** keep the feature off and collect fixed-split telemetry only.
+2. **Stage 1:** replay deterministic traces in CI; require zero budget/minimum
+   violations and identical repeated decisions.
+3. **Stage 2:** enable one CUDA canary. Alert on reserve rejection, resize
+   failure, fallback, output mismatch, or increased OOM/preemption rate.
+4. **Stage 3:** use a small production percentage and compare distributions;
+   one run is not evidence of a gain.
+5. **Stage 4:** broaden opt-in only with model- and workload-specific evidence.
+
+Rollback with `POST /v1/config {"adaptive_memory_enabled": false}`. The
+transaction closes scheduler and dispatcher admissions, drains request,
+transfer, fetch, execute, and task-pool queues, and synchronizes every relevant
+CUDA completion event before changing storage. It then attempts each device's
+static targets, publishes the physical effective split, and resumes admissions.
+If exact restoration cannot fit, requests resume at the last safe split and
+stats report `static_restore_deferred`. Restarting with the flag absent or false
+is the final rollback.
+
+An expert donation becomes irreversible after reserved victims move to host and
+release GPU storage. If receiver growth then fails, the result is
+`partial_donor_committed`: the smaller expert target and unchanged KV target are
+published honestly. Normal misses may reload those experts later.
+
+Native swap and transfer endpoints carry their owning `device_id`; device 1 is
+`cuda:1` and is never routed through a hard-coded `cuda:0`. Device-local drain
+waits ignore unrelated GPUs.
+
+Per-device Prometheus metrics use a bounded `device="<index>"` label:
+
+- `moe_adaptive_memory_enabled`
+- `moe_adaptive_memory_fallback_static`
+- `moe_adaptive_memory_expert_target_bytes`
+- `moe_adaptive_memory_kv_target_blocks`
+- `moe_adaptive_memory_resize_attempts_total`
+- `moe_adaptive_memory_resize_failures_total`
+- `moe_adaptive_memory_reserve_rejections_total`
+- `moe_adaptive_memory_expert_miss_cost`
+- `moe_adaptive_memory_kv_pressure_cost`
+
+Reasons remain in `/admin/stats`, not labels. Policy knobs other than the enable
+flag require restart.
 
 ## KV swap lifecycle and recovery
 

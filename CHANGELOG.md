@@ -4,8 +4,15 @@ All notable changes to MoE-Infinity will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- The non-MLA paged KV cache now allocates one plane per decoder layer
+  (previously all layers aliased one plane). Memory use for the paged KV
+  cache grows by the layer count; deployments tuned to the undersized cache
+  may need a lower `device_memory_ratio`.
+
 ### Added
 
+- Opt-in phase-specific expert admission, prefetch, eviction, and telemetry over one shared residency manager, with the legacy policy retained by default and one-flag rollback requiring no offload-store migration.
 - Opt-in `int8_sym` KV-cache storage format (`kv_cache_format`, default `native`): symmetric INT8 payload plus one FP16 scale per `(layer, page, KV head, token)`, with a native CUDA decode kernel, a validated FP32 dequantized SDPA fallback, single-owner `LayeredPagedKVStore` lifecycle, capability-gated selection with visible native/MLA fallback, numerical/logit/storage quality gates, a long-context A/B benchmark matrix, and a one-setting (`--kv-cache-format native`) rollback. No universal low-bit KV support is claimed.
 - Documentation hub at `docs/README.md` for users, operators, contributors, and project-history readers.
 - DFlash documentation that distinguishes direct batch-1 greedy and sampled draft/verify from the greedy-gated `MoE.generate` and serving integrations, explains the current batch>1 greedy-only constraint, and limits continuous-batching and route-ahead claims to validated paths.
@@ -15,6 +22,8 @@ All notable changes to MoE-Infinity will be documented in this file.
 - Direct bare-HF batch-1/batch>1 greedy, sampled, and mixed-row execution with dense reconstruction, right-padded output, and `last_generated_lengths`.
 - Stage 4a persistent serving sessions and default-off Stage 4b engine-owned DeepSeek V2/V3 MLA pages for eligible greedy batch-1 requests.
 - No-download unified-execution benchmark/validator and compatibility assertions that fail closed on sampling, ordering, cache invariant, or ownership failures.
+- Documented GLM-5.3 (`zai-org/GLM-5.3`) as running through the existing GlmMoeDsa path (same base as GLM-5.2), with a config-resolution regression test (`tests/python/unit/test_glm53_registry.py`).
+- GLM-5.3-Flash (`zai-org/GLM-5.3-Flash`) glm5_next family support: guarded registry entry, nested text_config parsing, `SyncGlm5NextMoEBlock`, and offload runtime wiring (routed FP8 experts offloaded; KDA/DSA/mHC/vision resident, text-only).
 
 ### Changed
 
@@ -34,6 +43,7 @@ All notable changes to MoE-Infinity will be documented in this file.
 - GPT-OSS resident-load path now materializes MXFP4 blocks, scales, router, biases, and attention sinks instead of leaving placeholder tensors in place.
 - GLM FP8 store and reload parity now stays stable across fresh stores and reloads.
 - PyPI publishing for both stable (`publish.yml`) and nightly (`publish-test.yml`): stable releases now take their version from the pushed git tag instead of always publishing `0.0.1`, and nightly sdists carry their version in `PKG-INFO` so `pip install --pre moe-infinity` no longer fails with a `MetadataInconsistent` version mismatch on rebuild.
+- `MOE_DISABLE_FUSED_KERNELS=1` no longer raises `TypeError` on decode: `fused_decode_attention` now has its own eager fallback instead of delegating to `paged_attention_fwd`, which takes a different KV cache layout and a required `num_kv_heads` argument.
 
 ### Known Limitations
 

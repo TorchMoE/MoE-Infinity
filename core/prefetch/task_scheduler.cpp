@@ -472,30 +472,43 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
 
     std::uint32_t max_priority = 1000;
     std::unique_lock<std::mutex> lock(unified_mutex_);
-    for (std::uint32_t i = 0; i < NUM_PRIORITY; ++i) {
-      if (!unified_queue_[i].empty()) {
-        max_priority = i;
-        break;
-      }
-    }
-
-    if (max_priority == 1000) {
-      lock.unlock();
-      SKIP_TO_NEXT_ITERATION
-    }
-
-    // Find a task that can be executed on the current GPU
+    const bool managed =
+        kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled();
     TaskPtr task = nullptr;
-    for (auto& t : unified_queue_[max_priority]) {
-      if (t->dst_device.index() == gpu_id) {
-        task = t;
-        break;
+    std::uint32_t selected_class = 1000;
+    for (std::uint32_t i = 0; i < NUM_PRIORITY; ++i) {
+      for (const auto& queued : unified_queue_[i]) {
+        if (queued->dst_device.index() != gpu_id) continue;
+        const std::uint32_t service_class =
+            managed ? ServiceClass(queued->priority, queued->bypasses,
+                                   kExpertResidencyManager->StarvationLimit())
+                    : queued->priority;
+        if (task == nullptr || service_class < selected_class ||
+            (service_class == selected_class && i < max_priority)) {
+          task = queued;
+          max_priority = i;
+          selected_class = service_class;
+        }
       }
     }
 
     if (task == nullptr) {
       lock.unlock();
       SKIP_TO_NEXT_ITERATION
+    }
+
+    if (managed) {
+      const auto limit = kExpertResidencyManager->StarvationLimit();
+      if (task->priority > kRouteAheadPriority && task->bypasses >= limit) {
+        kExpertResidencyManager->RecordStarvationPromotion();
+      }
+      for (std::uint32_t i = 1; i < NUM_PRIORITY; ++i) {
+        for (auto& queued : unified_queue_[i]) {
+          if (queued != task && queued->dst_device.index() == gpu_id) {
+            queued->bypasses += 1;
+          }
+        }
+      }
     }
 
     auto node = task->node;
@@ -516,7 +529,26 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
 
     lock.unlock();
 
-    if (!task->on_demand) {
+    ResidencyTicket residency_ticket;
+    if (!task->on_demand && managed) {
+      residency_ticket = kExpertResidencyManager->BeginAdmission(
+          node, gpu_id, task->phase,
+          kExpertResidencyManager->AdmissionFor(task->phase),
+          AdmissionSource::PREFETCH);
+      if (!residency_ticket.valid ||
+          residency_ticket.outcome == AdmissionOutcome::ALREADY_RESIDENT ||
+          residency_ticket.transient) {
+        if (residency_ticket.valid && residency_ticket.id != 0) {
+          kExpertResidencyManager->AbortAdmission(residency_ticket);
+        }
+        continue;
+      }
+      if (residency_ticket.reserved_victim != nullptr &&
+          !kExpertResidencyManager->EvictReserved(residency_ticket)) {
+        kExpertResidencyManager->AbortAdmission(residency_ticket);
+        continue;
+      }
+    } else if (!task->on_demand) {
       bool success = RemoveCachedSparseNode(node);
       if (!success) {
         DLOG_TRACE("{} evict failed, move to CPU", task->DebugString());
@@ -529,6 +561,14 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
       nvtx3::scoped_range r("task_execute");
 #endif
       SetNodeDevice(task);
+    }
+
+    if (!task->on_demand && managed) {
+      if (node->device.is_cuda()) {
+        kExpertResidencyManager->CommitAdmission(residency_ticket);
+      } else {
+        kExpertResidencyManager->AbortAdmission(residency_ticket);
+      }
     }
 
     if (task->on_demand) {
@@ -596,6 +636,104 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
   }
 }
 
+PrefetchAdmission ArcherTaskPool::AdmitPrefetchTasks(
+    const std::vector<std::pair<NodePtr, std::int64_t>>& costed_nodes,
+    std::uint32_t priority, std::uint64_t generation, std::int64_t layer_id,
+    std::int64_t max_inflight_bytes) {
+  PrefetchAdmission admission;
+  std::vector<TaskPtr> to_enqueue;
+
+  {
+    std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
+    for (const auto& entry : costed_nodes) {
+      const NodePtr& node = entry.first;
+      std::int64_t bytes = entry.second;
+      if (node == nullptr || bytes <= 0) continue;
+      auto tensor_id = static_cast<std::uint32_t>(node->id);
+      if (!prefetch_accounting_.TryAdmit(tensor_id, bytes,
+                                         max_inflight_bytes)) {
+        continue;
+      }
+      tensor_generation_[tensor_id] = generation;
+      tensor_layer_[tensor_id] = layer_id;
+
+      auto task = std::make_shared<Task>();
+      task->on_demand = false;
+      task->node = node;
+      task->priority = priority;
+      task->src_device = node->device;
+      task->dst_device = node->default_device;
+      task->request_id = 0;
+      task->generation = generation;
+      task->layer_id = layer_id;
+      task->scheduled_bytes = bytes;
+      task->enqueue_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+
+      admission.accepted_tensor_ids.push_back(tensor_id);
+      admission.accepted_bytes += bytes;
+      to_enqueue.push_back(task);
+    }
+    admission.inflight_bytes = prefetch_accounting_.inflight_bytes();
+  }
+
+  for (auto& task : to_enqueue) {
+    if (task->src_device == task->dst_device) {
+      task->node->state = 0;
+      task->node->cv.notify_all();
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(unified_mutex_);
+    unified_queue_[task->priority].push_back(task);
+  }
+
+  return admission;
+}
+
+std::int64_t ArcherTaskPool::CancelQueuedPrefetch(
+    std::uint64_t generation, std::int64_t layer_id,
+    const std::unordered_set<std::uint32_t>& keep_tensor_ids) {
+  std::int64_t canceled = 0;
+  std::lock_guard<std::mutex> account_lock(prefetch_accounting_mutex_);
+  std::lock_guard<std::mutex> queue_lock(unified_mutex_);
+  for (std::uint32_t i = 1; i < NUM_PRIORITY; ++i) {
+    auto& queue = unified_queue_[i];
+    queue.erase(
+        std::remove_if(
+            queue.begin(), queue.end(),
+            [&](const TaskPtr& t) {
+              if (t == nullptr || t->node == nullptr) return false;
+              if (t->generation != generation || t->layer_id != layer_id)
+                return false;
+              auto tensor_id = static_cast<std::uint32_t>(t->node->id);
+              if (keep_tensor_ids.count(tensor_id) > 0) return false;
+              std::int64_t bytes = prefetch_accounting_.CancelQueued(tensor_id);
+              if (bytes > 0) {
+                canceled += bytes;
+                t->node->exec_state.store(NodeExecState::IDLE,
+                                          std::memory_order_release);
+              }
+              return true;
+            }),
+        queue.end());
+  }
+  return canceled;
+}
+
+std::vector<PrefetchSample> ArcherTaskPool::DrainPrefetchSamples() {
+  std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
+  std::vector<PrefetchSample> drained;
+  drained.swap(prefetch_samples_);
+  return drained;
+}
+
+std::int64_t ArcherTaskPool::GetInflightPrefetchBytes() {
+  std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
+  return prefetch_accounting_.inflight_bytes();
+}
+
 std::string ArcherTaskPool::DebugString(
     const std::vector<std::deque<TaskPtr>>& queue) {
   std::stringstream ss;
@@ -617,3 +755,148 @@ std::string ArcherTaskPool::DebugString(
   }
   return ss.str();
 }
+
+std::vector<NodePtr> ArcherTaskPool::SnapshotResizeExclusions(int device_id) {
+  std::unordered_set<NodePtr> nodes_exec;
+  {
+    std::lock_guard<std::mutex> lock(exec_mutex_);
+    for (auto& [id, task] : exec_queue_) {
+      if (task && task->node) {
+        nodes_exec.insert(task->node);
+      }
+    }
+  }
+
+#ifdef MOE_BUILD_TESTS
+  if (after_exec_snapshot_hook_for_test_) {
+    after_exec_snapshot_hook_for_test_();
+  }
+#endif
+
+  {
+    std::lock_guard<std::mutex> lock(candidates_mutex_);
+    for (auto& node : candidates_) {
+      nodes_exec.insert(node);
+    }
+  }
+
+  (void)device_id;
+  return std::vector<NodePtr>(nodes_exec.begin(), nodes_exec.end());
+}
+
+SparseVictimReservation ArcherTaskPool::ReserveSparseCacheVictims(
+    int device_id, std::int64_t target_bytes) {
+  auto exclusions = SnapshotResizeExclusions(device_id);
+  std::unordered_set<Node*> excluded;
+  for (auto& node : exclusions) {
+    excluded.insert(node.get());
+  }
+
+  auto nodes = kTopologyHandle->GetSparseNodes();
+
+  std::int64_t resident_bytes = 0;
+  NodePtrList device_nodes;
+  for (auto& n : nodes) {
+    if (n->device.is_cuda() && n->device.index() == device_id) {
+      resident_bytes += n->byte_size;
+      device_nodes.push_back(n);
+    }
+  }
+
+  std::vector<NodePtr> reserved;
+  std::int64_t remaining = resident_bytes;
+  for (auto& n : device_nodes) {
+    if (remaining <= target_bytes) break;
+    if (excluded.count(n.get()) != 0) continue;
+    if (n->pending_dispatches.load(std::memory_order_acquire) != 0) continue;
+    auto expected = NodeExecState::IDLE;
+    if (!n->exec_state.compare_exchange_strong(expected,
+                                               NodeExecState::RESIZE_RESERVED,
+                                               std::memory_order_acq_rel)) {
+      continue;
+    }
+    reserved.push_back(n);
+    remaining -= n->byte_size;
+  }
+
+  if (remaining > target_bytes) {
+    for (auto& n : reserved) {
+      n->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
+    }
+    return {0,
+            device_id,
+            target_bytes,
+            resident_bytes,
+            false,
+            "pinned_or_in_flight",
+            {}};
+  }
+
+  std::lock_guard<std::mutex> lock(reservation_mutex_);
+  std::uint64_t id = next_reservation_id_++;
+  SparseVictimReservation reservation{
+      id, device_id, target_bytes, resident_bytes, true, "reserved", reserved};
+  reservations_[id] = reservation;
+  return reservation;
+}
+
+void ArcherTaskPool::CancelSparseCacheReservation(std::uint64_t id) {
+  SparseVictimReservation reservation;
+  {
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    auto it = reservations_.find(id);
+    if (it == reservations_.end()) return;
+    reservation = it->second;
+    reservations_.erase(it);
+  }
+  for (auto& n : reservation.victims) {
+    auto expected = NodeExecState::RESIZE_RESERVED;
+    n->exec_state.compare_exchange_strong(expected, NodeExecState::IDLE,
+                                          std::memory_order_acq_rel);
+  }
+}
+
+SparseCacheResizeResult ArcherTaskPool::CommitSparseCacheReservation(
+    std::uint64_t id) {
+  SparseVictimReservation reservation;
+  {
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    auto it = reservations_.find(id);
+    if (it == reservations_.end()) {
+      return {ResizeOutcome::REJECTED, -1, 0, 0, "unknown_reservation"};
+    }
+    reservation = it->second;
+    reservations_.erase(it);
+  }
+
+  for (auto& n : reservation.victims) {
+    n->SetDevice(n->default_host);
+    n->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
+  }
+
+  auto nodes = kTopologyHandle->GetSparseNodes();
+  std::int64_t resident_bytes = 0;
+  for (auto& n : nodes) {
+    if (n->device.is_cuda() && n->device.index() == reservation.device_id) {
+      resident_bytes += n->byte_size;
+    }
+  }
+
+  kTopologyHandle->SetSparseCacheLimitOverride(reservation.device_id,
+                                               reservation.target_bytes);
+
+  return {ResizeOutcome::COMMITTED, reservation.device_id,
+          reservation.target_bytes, resident_bytes, "committed"};
+}
+
+#ifdef MOE_BUILD_TESTS
+void ArcherTaskPool::SetAfterExecSnapshotHookForTest(
+    std::function<void()> hook) {
+  after_exec_snapshot_hook_for_test_ = std::move(hook);
+}
+
+std::vector<NodePtr> ArcherTaskPool::SnapshotResizeExclusionsForTest(
+    int device_id) {
+  return SnapshotResizeExclusions(device_id);
+}
+#endif

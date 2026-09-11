@@ -143,6 +143,23 @@ class _FlashinferModuleLike(Protocol):
     ]
 
 
+class _ResizeReceiptLike(Protocol):
+    def ensure_usable(self, *, device_id: int) -> None: ...
+
+    def retain(self, *objects: object) -> None: ...
+
+    def consume(self) -> None: ...
+
+    def cancel(self) -> None: ...
+
+
+def _flashinfer_usable_on(module: object, device: torch.device | None) -> bool:
+    if device is not None and device.type == "cuda":
+        return True
+    module_name = getattr(module, "__name__", "")
+    return not module_name.startswith("flashinfer")
+
+
 @dataclass(frozen=True)
 class SequenceAllocationPlan:
     seq_id: int
@@ -503,7 +520,9 @@ class PagedKVCache:
         self._fi_decode = None
         if flashinfer_utils.HAS_FLASHINFER:
             flashinfer_module = flashinfer_utils.get_flashinfer_module()
-            if flashinfer_module is not None:
+            if flashinfer_module is not None and _flashinfer_usable_on(
+                flashinfer_module, self.device
+            ):
                 try:
                     fi_module = cast(_FlashinferModuleLike, flashinfer_module)
                     workspace = flashinfer_utils.get_workspace(self.device)
@@ -2017,6 +2036,206 @@ class PagedKVCache:
                     dtype=self._kv_cache.dtype,
                 )
         self._swapped_out_sequences.discard(seq_id)
+
+    def resize_physical_num_blocks(
+        self, new_num_blocks: int, receipt: object
+    ) -> None:
+        """Physically resize the paged KV store to ``new_num_blocks`` blocks.
+
+        Drain-only: every sequence table must already hold zero GPU block IDs
+        (the scheduler frees them during quiescence). A same-device, unconsumed
+        receipt whose completion events have synchronized is required before any
+        storage is touched. dtype/layout/device are preserved exactly.
+
+        The complete candidate bundle (new tensor, new allocator, and, under
+        FlashInfer, independently constructed fresh prefill/decode wrappers) is
+        built before publication. On any failure the original bundle is restored
+        atomically; the old tensor/allocator/wrappers are retained on the
+        receipt until a post-publication CUDA event proves no kernel references
+        them.
+        """
+        if new_num_blocks <= 0:
+            raise ValueError(
+                f"new_num_blocks must be > 0, got {new_num_blocks}"
+            )
+
+        self._require_resize_receipt(receipt).ensure_usable(
+            device_id=self._device_index()
+        )
+
+        referenced = [
+            seq_id
+            for seq_id, table in self._sequence_tables.items()
+            if table.has_blocks()
+        ]
+        if referenced:
+            self._require_resize_receipt(receipt).cancel()
+            raise RuntimeError(
+                "cannot resize: referenced KV blocks are still resident for "
+                f"sequences {sorted(referenced)}"
+            )
+
+        old_kv_cache = self._kv_cache
+        old_allocator = self.block_allocator
+        old_num_blocks = self.num_blocks
+        old_prefill = self._fi_prefill
+        old_decode = self._fi_decode
+
+        new_kv_cache = torch.zeros(
+            (
+                self.num_layers,
+                new_num_blocks,
+                2,
+                self.block_size,
+                self.num_heads,
+                self.head_dim,
+            ),
+            dtype=self._kv_cache.dtype,
+            device=self._kv_cache.device,
+        )
+        new_allocator = BlockAllocator(
+            num_blocks=new_num_blocks,
+            block_size=self.block_size,
+            device=self.device
+            if self.device is not None
+            else old_allocator.device,
+        )
+
+        new_prefill = old_prefill
+        new_decode = old_decode
+        if self._use_flashinfer:
+            fi_module = cast(
+                _FlashinferModuleLike,
+                flashinfer_utils.get_flashinfer_module(),
+            )
+            workspace = self._fi_workspace
+            new_prefill = fi_module.BatchPrefillWithPagedKVCacheWrapper(
+                workspace,
+                "NHD",
+            )
+            new_decode = fi_module.BatchDecodeWithPagedKVCacheWrapper(
+                workspace,
+                "NHD",
+            )
+
+        self._kv_cache = new_kv_cache
+        self.block_allocator = new_allocator
+        self.num_blocks = new_num_blocks
+        self._fi_prefill = new_prefill
+        self._fi_decode = new_decode
+
+        self._retain_old_bundle(
+            receipt, old_kv_cache, old_prefill, old_decode, old_allocator
+        )
+
+        try:
+            self._replan_after_resize()
+        except Exception:
+            self._kv_cache = old_kv_cache
+            self.block_allocator = old_allocator
+            self.num_blocks = old_num_blocks
+            self._fi_prefill = old_prefill
+            self._fi_decode = old_decode
+            self._reopen_admissions(receipt)
+            self._replan_after_resize()
+            self._cancel_resize_receipt(receipt)
+            raise
+
+        self._consume_resize_receipt(receipt)
+
+    def _replan_after_resize(self) -> None:
+        if not self._flashinfer_enabled():
+            return
+        self._compute_attention(*self._resize_replan_prefill_inputs())
+        self._compute_attention(*self._resize_replan_decode_inputs())
+
+    def _resize_replan_prefill_inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = torch.zeros(
+            (1, self.num_heads, 2, self.head_dim),
+            dtype=self._kv_cache.dtype,
+            device=self._kv_cache.device,
+        )
+        key = torch.zeros(
+            (
+                1,
+                self.num_heads,
+                self.num_blocks * self.block_size,
+                self.head_dim,
+            ),
+            dtype=self._kv_cache.dtype,
+            device=self._kv_cache.device,
+        )
+        return query, key, key.clone()
+
+    def _resize_replan_decode_inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        query = torch.zeros(
+            (1, self.num_heads, 1, self.head_dim),
+            dtype=self._kv_cache.dtype,
+            device=self._kv_cache.device,
+        )
+        key = torch.zeros(
+            (
+                1,
+                self.num_heads,
+                self.num_blocks * self.block_size,
+                self.head_dim,
+            ),
+            dtype=self._kv_cache.dtype,
+            device=self._kv_cache.device,
+        )
+        return query, key, key.clone()
+
+    def _device_index(self) -> int:
+        device = self._kv_cache.device
+        return device.index if device.index is not None else 0
+
+    @staticmethod
+    def _require_resize_receipt(receipt: object) -> _ResizeReceiptLike:
+        if not (
+            hasattr(receipt, "ensure_usable")
+            and hasattr(receipt, "retain")
+            and hasattr(receipt, "consume")
+        ):
+            raise TypeError(
+                "resize_num_blocks requires a quiescence ResizeReceipt"
+            )
+        return cast("_ResizeReceiptLike", receipt)
+
+    def _retain_old_bundle(
+        self,
+        receipt: object,
+        old_kv_cache: torch.Tensor,
+        old_prefill: object,
+        old_decode: object,
+        old_allocator: BlockAllocator,
+    ) -> None:
+        self._require_resize_receipt(receipt).retain(
+            old_kv_cache, old_prefill, old_decode, old_allocator
+        )
+
+    @staticmethod
+    def _reopen_admissions(receipt: object) -> None:
+        if hasattr(receipt, "admissions_paused"):
+            try:
+                receipt.admissions_paused = False  # type: ignore[attr-defined]
+            except AttributeError:
+                pass
+
+    @staticmethod
+    def _consume_resize_receipt(receipt: object) -> None:
+        consume = getattr(receipt, "consume", None)
+        if callable(consume):
+            consume()
+
+    @staticmethod
+    def _cancel_resize_receipt(receipt: object) -> None:
+        cancel = getattr(receipt, "cancel", None)
+        if callable(cancel):
+            cancel()
 
     def _swap_in_released(self, seq_id: int, block_table: BlockTable) -> None:
         chunk = self._swapped_page_chunks.get(seq_id)

@@ -152,6 +152,44 @@ class IOProfiler:
         with self._lock:
             self._events.append(event)
 
+    _RESERVED_EVENT_KEYS: tuple[str, ...] = (
+        "ts_ns",
+        "stage",
+        "layer",
+        "expert",
+        "dur_ns",
+        "bytes",
+    )
+
+    def record(
+        self,
+        stage: str,
+        *,
+        layer: int | None = None,
+        expert: int | None = None,
+        bytes: int = 0,
+        fields: dict[str, object] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        event: dict[str, object] = {
+            "ts_ns": time.time_ns(),
+            "stage": stage,
+            "layer": layer,
+            "expert": expert,
+            "dur_ns": 0,
+            "bytes": bytes,
+        }
+        if fields:
+            for key in fields:
+                if key in self._RESERVED_EVENT_KEYS:
+                    raise ValueError(
+                        f"overlap-prefetch field {key!r} may not overwrite a reserved event key"
+                    )
+            event.update(fields)
+        self._emit_event(event)
+
     def time(
         self,
         stage: str,

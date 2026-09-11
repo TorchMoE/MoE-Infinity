@@ -143,6 +143,47 @@ def test_generation_loop_passes_metadata_to_forward() -> None:
     assert all(meta.is_prefill is False for meta in observed[1:])
 
 
+def test_offload_wiring_observes_one_prefill_then_decode_phases() -> None:
+    from moe_infinity.memory.expert_policy import ExpertPhase
+
+    observed: list[AttentionMetadata] = []
+
+    def mock_forward(
+        token_ids: list[int],
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        observed.append(metadata)
+        logits = torch.full((len(token_ids), 64), -1e9, dtype=torch.float32)
+        logits[:, 5] = 0.0
+        return logits
+
+    spec = KVCacheSpec(
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        block_size=4,
+    )
+    mgr = KVCacheManager(num_gpu_blocks=16, num_cpu_blocks=32, block_size=4)
+    engine = GenerationEngine(
+        kv_cache_manager=mgr,
+        kv_spec=spec,
+        num_layers=2,
+        vocab_size=64,
+        model_forward_fn=mock_forward,
+        eos_token_id=2,
+    )
+
+    _ = engine.generate(prompt_token_ids=[1, 3], request_id="rid")
+
+    phases = [
+        ExpertPhase.PREFILL if meta.is_prefill else ExpertPhase.DECODE
+        for meta in observed
+    ]
+    assert phases[0] is ExpertPhase.PREFILL
+    assert phases.count(ExpertPhase.PREFILL) == 1
+    assert all(phase is ExpertPhase.DECODE for phase in phases[1:])
+
+
 def _native_model_config() -> types.SimpleNamespace:
     return types.SimpleNamespace(
         num_hidden_layers=1,

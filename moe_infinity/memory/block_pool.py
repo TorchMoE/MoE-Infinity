@@ -145,3 +145,14 @@ class BlockPool:
 
     def total_blocks(self) -> int:
         return len(self._blocks)
+
+    def referenced_block_ids(self) -> list[int]:
+        return [block.block_id for block in self._blocks if block.ref_cnt > 0]
+
+    def removable_tail_ids(self, target_blocks: int) -> list[int]:
+        if target_blocks < 0 or target_blocks > len(self._blocks):
+            raise ValueError("target_blocks must be within the pool")
+        tail = self._blocks[target_blocks:]
+        if self.referenced_block_ids():
+            return []
+        return [block.block_id for block in tail]

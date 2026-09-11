@@ -45,6 +45,8 @@ class _FakeDecodeWrapper:
 
 
 def _load_module(module_name: str):
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     spec = importlib.util.spec_from_file_location(module_name, KV_CACHE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

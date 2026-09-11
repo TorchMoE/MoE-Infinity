@@ -208,7 +208,10 @@ class MoE:
             engine_config.trace_capacity,
             model_config,
             attention_backend=attention_backend,
-            enable_attention_offload=attention_backend is not None,
+            enable_attention_offload=(
+                bool(getattr(engine_config, "enable_attention_offload", True))
+                and attention_backend is not None
+            ),
             kv_cache_manager=kv_cache_manager,
             enable_kv_cache_offload=(
                 bool(
@@ -384,6 +387,23 @@ class MoE:
                 hidden_size = max(1, num_attention_heads * 128)
             head_dim = max(1, hidden_size // max(1, num_attention_heads))
 
+        qk_rope_head_dim = self._resolve_model_int_attr(
+            model_config, "qk_rope_head_dim"
+        )
+        qk_nope_head_dim = self._resolve_model_int_attr(
+            model_config, "qk_nope_head_dim"
+        )
+        if qk_rope_head_dim is not None and qk_nope_head_dim is not None:
+            from moe_infinity.models.deepseek_v2_paged_attention import (
+                DeepseekV2PagedAttention,
+            )
+
+            mla_spec = DeepseekV2PagedAttention.get_kv_cache_spec_for_config(
+                model_config
+            )
+            head_dim = mla_spec["head_dim"]
+            num_kv_heads = mla_spec["num_kv_heads"]
+
         vocab_size = self._resolve_model_int_attr(model_config, "vocab_size")
         if vocab_size is None:
             vocab_size = 32000
@@ -430,6 +450,8 @@ class MoE:
         )
         num_cpu_blocks = max(32, num_gpu_blocks * 2)
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device_id = int(device.index or 0)
         from moe_infinity.models.deepseek_mla_attention import (
             is_deepseek_mla_eligible,
         )
@@ -445,6 +467,7 @@ class MoE:
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=kv_spec.block_size,
+            device_id=device_id,
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mla_cache = None
@@ -467,6 +490,7 @@ class MoE:
                     spec=kv_spec,
                     num_gpu_blocks=num_gpu_blocks,
                     device=device,
+                    num_layers=max(1, int(num_layers)),
                 )
             except Exception:
                 attention_backend = None
@@ -527,6 +551,7 @@ class MoE:
         scheduler = Scheduler(
             kv_cache_manager=kv_cache_manager,
             transfer_scheduler=transfer_scheduler,
+            device_id=device_id,
         )
 
         generation_engine = GenerationEngine(

@@ -44,6 +44,10 @@ def test_complete_subclass_can_instantiate():
         def wait(self, _transfer_id: str, _timeout_ms: float = 5000.0) -> bool:
             return True
 
+        def wait_for_device(self, device_id: int, timeout_ms: float) -> bool:
+            _ = (device_id, timeout_ms)
+            return True
+
         def get_pending_count(self) -> dict[TransferType, int]:
             return {TransferType.KV_SWAP_IN: 0}
 
@@ -64,6 +68,7 @@ def test_complete_subclass_can_instantiate():
                 priority=TransferPriority.NORMAL,
                 source_device="cpu",
                 target_device="cuda:0",
+                device_id=0,
             )
         )
         == "t1"
@@ -85,6 +90,9 @@ def test_bandwidth_budget_validation_in_subclass():
             return True
 
         def wait(self, _transfer_id: str, _timeout_ms: float = 5000.0) -> bool:
+            return True
+
+        def wait_for_device(self, _device_id: int, _timeout_ms: float) -> bool:
             return True
 
         def get_pending_count(self) -> dict[TransferType, int]:
