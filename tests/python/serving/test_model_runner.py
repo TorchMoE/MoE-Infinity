@@ -216,6 +216,36 @@ def test_execute_empty_batch_skips_forward() -> None:
     assert logits.shape == (0, 7)
 
 
+def test_execute_scopes_homogeneous_phase(monkeypatch) -> None:
+    from moe_infinity.memory.expert_policy import (
+        ExpertPhase,
+        current_expert_phase,
+    )
+
+    observed = []
+    model = MockModel(vocab_size=16, rank3_logits=False)
+    original = model.forward
+
+    def forward(*args, **kwargs):
+        observed.append(current_expert_phase())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward", forward)
+    runner = ModelRunner(model, MockOffloadEngine())
+    batch = BatchMetadata(
+        seq_ids=[10, 11],
+        input_token_ids=[21, 22],
+        seq_lengths=[1, 1],
+        context_lengths=[4, 4],
+        is_prefill=[False, False],
+        block_tables=[[0], [1]],
+        token_offsets=[0, 1, 2],
+        sampling_params=[SamplingParams(), SamplingParams()],
+    )
+    _ = runner.execute(batch)
+    assert observed == [ExpertPhase.DECODE]
+
+
 def _make_identity_store(owner_id: str):
     from moe_infinity.runtime.kv_cache_format import (
         allocate_layered_paged_kv_store,

@@ -13,9 +13,22 @@
 #include "common/pytorch.h"
 #include "common/time.h"
 #include "memory/memory_pool.h"
+#include "prefetch/expert_residency.h"
 #include "task_scheduler.h"
 #include "utils/cuda_utils.h"
 #include "utils/logger.h"
+
+std::shared_ptr<ExpertResidencyManager> kExpertResidencyManager = nullptr;
+
+namespace {
+class ProductionResidencyTransferOps final : public ResidencyTransferOps {
+ public:
+  bool MoveToHost(const NodePtr& node) override {
+    node->SetDevice(node->default_host, true, nullptr);
+    return true;
+  }
+};
+}  // namespace
 
 ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                                            const double device_memory_ratio)
@@ -33,6 +46,8 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
   kTaskPool = std::make_unique<ArcherTaskPool>();
   kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
   kHostMemoryPool = std::make_unique<HostMemoryPool>();
+  kExpertResidencyManager = std::make_shared<ExpertResidencyManager>(
+      std::make_shared<ProductionResidencyTransferOps>());
   kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
   DLOG_TRACE("Free Device Memory ",
              kDeviceMemoryPool->GetFreeMemory(CUDA_DEVICE(0)));
@@ -85,7 +100,28 @@ void ArcherPrefetchHandle::CleanUpResources() {
   kTopologyHandle.reset();
   kDeviceMemoryPool.reset();
   kHostMemoryPool.reset();
+  kExpertResidencyManager.reset();
   has_cleaned_up_resources_ = true;
+}
+
+void ArcherPrefetchHandle::ConfigureExpertPolicy(
+    bool enabled, int prefill_admission, int decode_admission,
+    double prefill_weight, double decode_weight, int starvation_limit) {
+  PhasePolicyConfig config;
+  config.enabled = enabled;
+  config.prefill_admission = static_cast<AdmissionMode>(prefill_admission);
+  config.decode_admission = static_cast<AdmissionMode>(decode_admission);
+  config.prefill_eviction_weight = prefill_weight;
+  config.decode_eviction_weight = decode_weight;
+  config.starvation_limit = static_cast<std::uint32_t>(starvation_limit);
+  if (kExpertResidencyManager) {
+    kExpertResidencyManager->ConfigurePolicy(config);
+  }
+}
+
+ExpertPolicyStats ArcherPrefetchHandle::GetExpertPolicyStats() const {
+  if (!kExpertResidencyManager) return ExpertPolicyStats{};
+  return kExpertResidencyManager->Snapshot();
 }
 
 void ArcherPrefetchHandle::ResetCache() {
@@ -243,7 +279,11 @@ void ArcherPrefetchHandle::ReplaceCacheCandidates(
     candidates.push_back(node);
   }
 
-  kTaskPool->ReplaceCacheCandidates(candidates);
+  if (kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled()) {
+    kExpertResidencyManager->ReplaceProtectedCandidates(candidates);
+  } else {
+    kTaskPool->ReplaceCacheCandidates(candidates);
+  }
 }
 void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id,
                                            int gpu_id) {
@@ -264,13 +304,18 @@ void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id,
 }
 
 void ArcherPrefetchHandle::EnqueuePrefetchTensors(
-    const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority) {
+    const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
+    int phase) {
+  TORCH_CHECK(phase >= static_cast<int>(ExpertPhase::PREFILL) &&
+                  phase <= static_cast<int>(ExpertPhase::MIXED),
+              "invalid expert phase: ", phase);
   for (std::uint32_t tensor_id : tensor_ids) {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
     auto task = std::make_shared<Task>();
     task->priority = priority;
     task->node = node;
     task->on_demand = false;
+    task->phase = static_cast<ExpertPhase>(phase);
     task->src_device = node->device;
     task->dst_device = node->default_device;
     kTaskPool->EnqueueTask(task);
@@ -433,11 +478,22 @@ void ArcherPrefetchHandle::TraceRequest(const std::uint64_t request_id,
   request_id_to_nodes_[request_id].insert(node);
 }
 
+void ArcherPrefetchHandle::ConfigureExpertCapacityAfterTopology() {
+  for (int gpu_id = 0; gpu_id < kNumDevices(); ++gpu_id) {
+    const auto device = torch::Device(torch::kCUDA, gpu_id);
+    const auto bytes = kTopologyHandle->GetSparseCacheLimit(device);
+    TORCH_CHECK(kExpertResidencyManager->ConfigureCapacity(gpu_id, bytes),
+                "failed to configure expert residency capacity for GPU ",
+                gpu_id, " with ", bytes, " bytes");
+  }
+}
+
 void ArcherPrefetchHandle::SetTopology(
     const std::vector<
         std::tuple<std::string, std::vector<std::vector<TensorID>>>>&
         topology) {
   kTopologyHandle->InitializeTopology(topology);
+  ConfigureExpertCapacityAfterTopology();
 }
 
 void ArcherPrefetchHandle::SetTopologyV2(
@@ -445,6 +501,7 @@ void ArcherPrefetchHandle::SetTopologyV2(
         std::tuple<std::string, bool, std::vector<std::vector<TensorID>>,
                    std::vector<std::uint64_t>>>& topology) {
   kTopologyHandle->InitializeTopologyV2(topology);
+  ConfigureExpertCapacityAfterTopology();
 }
 
 std::vector<std::tuple<std::uint64_t, bool, int>>

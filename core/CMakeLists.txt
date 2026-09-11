@@ -8,6 +8,7 @@ set(ARCHER_CORE_CXX_SOURCES
   # prefetch
   ${CMAKE_SOURCE_DIR}/core/prefetch/archer_prefetch_handle.cpp
   ${CMAKE_SOURCE_DIR}/core/prefetch/task_scheduler.cpp
+  ${CMAKE_SOURCE_DIR}/core/prefetch/expert_residency.cpp
   ${CMAKE_SOURCE_DIR}/core/prefetch/task_thread.cpp
   # memory
   ${CMAKE_SOURCE_DIR}/core/memory/caching_allocator.cpp

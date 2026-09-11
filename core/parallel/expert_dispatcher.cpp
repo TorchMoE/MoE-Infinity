@@ -355,12 +355,16 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
 }
 
 void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id,
-                                     bool remote) {
+                                     bool remote, int phase) {
   ExpertDispatcher::CallArgs args;
   args.layer_idx = layer_idx;
   args.expert_idx = expert_idx;
   args.gpu_id = gpu_id;
   args.remote = remote;
+  TORCH_CHECK(phase >= static_cast<int>(ExpertPhase::PREFILL) &&
+                  phase <= static_cast<int>(ExpertPhase::MIXED),
+              "invalid expert phase: ", phase);
+  args.phase = static_cast<ExpertPhase>(phase);
   args.invocation_id = current_invocation_id_;
   args.generation = current_generation_.load(std::memory_order_acquire);
   Enqueue(args);
@@ -414,7 +418,12 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
     exec_args.hit = true;
     exec_args.invocation_id = args.invocation_id;
     exec_args.generation = args.generation;
-    exec_args.invocation_id = args.invocation_id;
+    if (kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled()) {
+      kExpertResidencyManager->RecordAccess(expert_node->node, args.phase,
+                                            true);
+      exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
+          expert_node->node, LeaseKind::DEMAND);
+    }
     cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
     cache_access_count_.fetch_add(1, std::memory_order_relaxed);
     // transfer_event = nullptr: expert is already on GPU, no H2D wait needed
@@ -618,7 +627,13 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
           exec_args.evict = false;
           exec_args.hit = true;
           exec_args.generation = args.generation;
-          exec_args.invocation_id = args.invocation_id;
+          if (kExpertResidencyManager &&
+              kExpertResidencyManager->PolicyEnabled()) {
+            kExpertResidencyManager->RecordAccess(expert_node->node, args.phase,
+                                                  true);
+            exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
+                expert_node->node, LeaseKind::DEMAND);
+          }
           exec_args.invocation_id = args.invocation_id;
           cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
           cache_access_count_.fetch_add(1, std::memory_order_relaxed);
@@ -629,6 +644,29 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       }
 
       bool cache_hit = expert_node->node->device.is_cuda();
+      const bool managed =
+          kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled();
+      ResidencyTicket residency_ticket;
+
+      if (managed && !cache_hit) {
+        TORCH_CHECK(kExpertResidencyManager->IsCapacityConfigured(gpu_id),
+                    "expert residency capacity is not configured for gpu ",
+                    gpu_id);
+        while (!main_thread_stop_flag_.load(std::memory_order_acquire)) {
+          residency_ticket = kExpertResidencyManager->BeginAdmission(
+              expert_node->node, gpu_id, args.phase,
+              kExpertResidencyManager->AdmissionFor(args.phase),
+              AdmissionSource::DEMAND);
+          if (residency_ticket.valid) break;
+          std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        if (main_thread_stop_flag_.load(std::memory_order_acquire)) break;
+        if (residency_ticket.reserved_victim != nullptr) {
+          TORCH_CHECK(kExpertResidencyManager->EvictReserved(residency_ticket),
+                      "failed to evict reserved expert victim");
+        }
+        expert_node->node->is_overflow = residency_ticket.transient;
+      }
 
       // std::cerr << "ExpertDispatcher::GPUFetchFunc: gpu_id " << gpu_id
       //           << " layer_idx " << layer_idx << " expert_idx " << expert_idx
@@ -639,7 +677,8 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
                  "cache_hit ", cache_hit, "cache_size ", cache_sizes_[gpu_id],
                  " incache count ", cached_experts_[gpu_id].size());
 
-      if (!cache_hit && cache_sizes_[gpu_id] < expert_node->node->byte_size) {
+      if (!managed && !cache_hit &&
+          cache_sizes_[gpu_id] < expert_node->node->byte_size) {
         if (batch_size > 1) {
           // force fetch to GPU regardless of cache size, only for prefill
           // only one extra cache slot for prefill
@@ -744,7 +783,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
         }
       }
 
-      if (!gpu_overload_[gpu_id].load(std::memory_order_acquire)) {
+      if (!managed && !gpu_overload_[gpu_id].load(std::memory_order_acquire)) {
         cache_sizes_[gpu_id] -= expert_node->node->byte_size;
         failure.cache_slot_reserved = true;
         uint64_t key = (layer_idx << 32) + expert_idx;
@@ -775,6 +814,20 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
         exec_args.out_gpu_id = original_device.index();
         exec_args.out_dtype = c10::typeMetaToScalarType(hidden_states_.dtype());
         exec_args.evict = gpu_overload_[gpu_id].load(std::memory_order_acquire);
+        if (managed) {
+          if (residency_ticket.valid &&
+              residency_ticket.outcome != AdmissionOutcome::ALREADY_RESIDENT) {
+            TORCH_CHECK(
+                kExpertResidencyManager->CommitAdmission(residency_ticket),
+                "failed to commit expert admission");
+          }
+          kExpertResidencyManager->RecordAccess(expert_node->node, args.phase,
+                                                cache_hit);
+          exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
+              expert_node->node, LeaseKind::DEMAND);
+          exec_args.managed_transient = residency_ticket.transient;
+          exec_args.evict = residency_ticket.transient;
+        }
         exec_args.hit = cache_hit;
         exec_args.generation = args.generation;
         exec_args.invocation_id = args.invocation_id;
@@ -917,6 +970,13 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
         kCudaEventPool->Release(args.transfer_event);
         args.transfer_event = nullptr;
       }
+      if (args.residency_lease != 0 && kExpertResidencyManager) {
+        kExpertResidencyManager->ReleaseLease(args.residency_lease);
+        args.residency_lease = 0;
+      }
+      if (args.managed_transient) {
+        args.expert_node->node->is_overflow = false;
+      }
       FailDispatch(args.generation, std::current_exception(), {failure});
     }
   }
@@ -992,8 +1052,9 @@ bool ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
       }
     }
 
-    auto* retire = new ExpertRetireArgs{this, args.expert_node, args.generation,
-                                        gpu_id, args.evict};
+    auto* retire = new ExpertRetireArgs{
+        this,       args.expert_node,       args.generation,     gpu_id,
+        args.evict, args.managed_transient, args.residency_lease};
     pending_retirement_callbacks_.fetch_add(1, std::memory_order_acq_rel);
     int retirement_fault =
         static_cast<int>(DispatchFaultPoint::RETIREMENT_CALLBACK_LAUNCH);
@@ -1555,6 +1616,12 @@ void ExpertDispatcher::RetirementFunc() {
         args.expert_node->node->SetDevice(args.expert_node->node->default_host,
                                           true, nullptr);
         gpu_overload_[args.gpu_id].store(false, std::memory_order_release);
+      }
+      if (args.residency_lease != 0 && kExpertResidencyManager) {
+        kExpertResidencyManager->ReleaseLease(args.residency_lease);
+      }
+      if (args.managed_transient) {
+        args.expert_node->node->is_overflow = false;
       }
       args.expert_node->node->exec_state.store(NodeExecState::IDLE,
                                                std::memory_order_release);

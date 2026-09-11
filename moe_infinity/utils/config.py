@@ -5,6 +5,7 @@
 
 # EfficientMoE Team
 
+import math
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -111,6 +112,58 @@ class ArcherConfig:
         default="default",
         metadata={
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
+        },
+    )
+    phase_specific_expert_policy: bool = field(
+        default=False,
+        metadata={
+            "help": "Master gate for phase-specific expert admission, prefetch, and eviction policy. Default False keeps legacy behavior."
+        },
+    )
+    prefill_expert_admission: str = field(
+        default="transient_on_pressure",
+        metadata={
+            "help": "Prefill admission mode: cache or transient_on_pressure."
+        },
+    )
+    decode_expert_admission: str = field(
+        default="cache",
+        metadata={
+            "help": "Decode admission mode: cache or transient_on_pressure."
+        },
+    )
+    prefill_expert_prefetch_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Predictive prefill prefetch top-k in [0, num_experts]; zero disables."
+        },
+    )
+    decode_expert_prefetch_top_k: int = field(
+        default=2,
+        metadata={
+            "help": "Predictive decode prefetch top-k in [0, num_experts]."
+        },
+    )
+    prefill_expert_prefetch_priority: int = field(
+        default=2,
+        metadata={"help": "Native prefill prefetch band in [1, 19]."},
+    )
+    decode_expert_prefetch_priority: int = field(
+        default=1,
+        metadata={"help": "Native decode prefetch band in [1, 19]."},
+    )
+    prefill_expert_eviction_weight: float = field(
+        default=1.0,
+        metadata={"help": "Prefill eviction weight; finite and > 0."},
+    )
+    decode_expert_eviction_weight: float = field(
+        default=4.0,
+        metadata={"help": "Decode eviction weight; finite and > 0."},
+    )
+    expert_policy_starvation_limit: int = field(
+        default=8,
+        metadata={
+            "help": "Positive maximum prefetch bypasses before promotion."
         },
     )
     overlap_prefetch_policy: str = field(
@@ -294,6 +347,38 @@ class ArcherConfig:
                 f"device_memory_ratio ({self.device_memory_ratio}) + kv_cache_memory_ratio ({self.kv_cache_memory_ratio}) > 1.0"
             )
 
+        valid_admissions = ("cache", "transient_on_pressure")
+        for name in ("prefill_expert_admission", "decode_expert_admission"):
+            value = getattr(self, name)
+            if value not in valid_admissions:
+                raise ValueError(
+                    f"{name} must be one of {valid_admissions}, got {value!r}"
+                )
+        for name in (
+            "prefill_expert_prefetch_top_k",
+            "decode_expert_prefetch_top_k",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        for name in (
+            "prefill_expert_prefetch_priority",
+            "decode_expert_prefetch_priority",
+        ):
+            value = getattr(self, name)
+            if not 1 <= value <= 19:
+                raise ValueError(f"{name} must be in [1, 19], got {value}")
+        for name in (
+            "prefill_expert_eviction_weight",
+            "decode_expert_eviction_weight",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        if self.expert_policy_starvation_limit <= 0:
+            raise ValueError(
+                f"expert_policy_starvation_limit must be > 0, got {self.expert_policy_starvation_limit}"
+            )
         valid_policies = ("off", "observe", "enforce")
         if self.overlap_prefetch_policy not in valid_policies:
             raise ValueError(

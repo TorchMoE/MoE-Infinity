@@ -41,7 +41,12 @@ from transformers.modeling_utils import PreTrainedModel
 
 from moe_infinity.common import parse_expert_type
 from moe_infinity.distributed import DistributedExpertExecutor
-from moe_infinity.memory import ExpertPredictor, ExpertPrefetcher, ExpertTracer
+from moe_infinity.memory import (
+    ExpertPredictor,
+    ExpertPrefetcher,
+    ExpertTracer,
+    PhasePolicySettings,
+)
 from moe_infinity.models import (
     Qwen3MoEBlock,
     Qwen3PagedAttention,
@@ -499,6 +504,33 @@ class OffloadEngine(object):
     def reset_exposed_fetch_seconds(self) -> None:
         """Zero the exposed-fetch accumulator (per BM3 ablation arm)."""
         self._exposed_fetch_seconds = 0.0
+
+    def _configure_native_phase_policy(self) -> None:
+        phase_policy = PhasePolicySettings(
+            enabled=bool(self.archer_config.phase_specific_expert_policy),
+            prefill_admission=self.archer_config.prefill_expert_admission,
+            decode_admission=self.archer_config.decode_expert_admission,
+            prefill_prefetch_top_k=self.archer_config.prefill_expert_prefetch_top_k,
+            decode_prefetch_top_k=self.archer_config.decode_expert_prefetch_top_k,
+            prefill_prefetch_priority=self.archer_config.prefill_expert_prefetch_priority,
+            decode_prefetch_priority=self.archer_config.decode_expert_prefetch_priority,
+            prefill_eviction_weight=self.archer_config.prefill_expert_eviction_weight,
+            decode_eviction_weight=self.archer_config.decode_expert_eviction_weight,
+            starvation_limit=self.archer_config.expert_policy_starvation_limit,
+        )
+        self.expert_prefetcher.phase_policy = phase_policy
+        if not phase_policy.enabled:
+            return
+        configure = getattr(self.archer_engine, "configure_phase_policy", None)
+        if callable(configure):
+            configure(
+                phase_policy.enabled,
+                phase_policy.prefill_admission,
+                phase_policy.decode_admission,
+                phase_policy.prefill_eviction_weight,
+                phase_policy.decode_eviction_weight,
+                phase_policy.starvation_limit,
+            )
 
     @property
     def kv_occupancy_bytes(self) -> Optional[float]:
@@ -1178,6 +1210,8 @@ class OffloadEngine(object):
                         self.config.first_k_dense_replace
                     )
                     first_k_dense_replace = self.config.first_k_dense_replace
+
+                self._configure_native_phase_policy()
 
                 self.expert_executor.set_expert_dispatcher(
                     self.expert_dispatcher

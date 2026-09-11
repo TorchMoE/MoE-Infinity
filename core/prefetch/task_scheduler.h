@@ -20,6 +20,7 @@
 #include "base/noncopyable.h"
 #include "common/pytorch.h"
 #include "model/model_topology.h"
+#include "prefetch/expert_residency.h"
 
 #define SKIP_TO_NEXT_ITERATION                                \
   std::this_thread::sleep_for(std::chrono::microseconds(10)); \
@@ -233,6 +234,8 @@ struct Task {
   std::vector<NodePtr> remove_nodes;
   std::uint32_t priority;
   std::uint64_t request_id;
+  ExpertPhase phase = ExpertPhase::MIXED;
+  std::uint32_t bypasses = 0;
   torch::Device src_device = DISK_DEVICE;
   torch::Device dst_device = DISK_DEVICE;
   cudaStream_t stream = nullptr;

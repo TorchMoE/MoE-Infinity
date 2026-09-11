@@ -111,6 +111,35 @@ def test_native_engine_autocorrects_kv_cache_ratio(monkeypatch):
     assert config.kv_cache_memory_ratio == pytest.approx(0.15)
 
 
+def test_phase_policy_defaults_are_backward_compatible(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig(offload_path="/tmp", use_native_engine=False)
+    assert config.phase_specific_expert_policy is False
+    assert config.prefill_expert_admission == "transient_on_pressure"
+    assert config.decode_expert_admission == "cache"
+    assert config.prefill_expert_prefetch_top_k == 0
+    assert config.decode_expert_prefetch_top_k == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("prefill_expert_admission", "drop", "must be one of"),
+        ("decode_expert_prefetch_top_k", -1, "must be >= 0"),
+        ("decode_expert_prefetch_priority", 0, "must be in \\[1, 19\\]"),
+        ("prefill_expert_eviction_weight", 0.0, "must be finite and > 0"),
+        ("expert_policy_starvation_limit", 0, "must be > 0"),
+    ],
+)
+def test_phase_policy_rejects_invalid_values(
+    monkeypatch, field, value, message
+):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    kwargs = {"offload_path": "/tmp", "use_native_engine": False, field: value}
+    with pytest.raises(ValueError, match=message):
+        ArcherConfig(**kwargs)
+
+
 def test_overlap_prefetch_defaults_are_safe(monkeypatch):
     monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     c = ArcherConfig(offload_path="/tmp", use_native_engine=False)

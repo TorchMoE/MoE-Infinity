@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 import torch
 
+from moe_infinity.memory.expert_policy import (
+    ExpertPhase,
+    expert_phase_scope,
+)
 from moe_infinity.runtime.attention_types import (
     AttentionMetadata as RuntimeAttentionMetadata,
 )
@@ -267,6 +271,13 @@ class ModelRunner:
             "attention_mask": attention_mask,
         }
 
+    def _expert_phase(self, batch: BatchMetadata) -> ExpertPhase:
+        if batch.is_prefill and all(batch.is_prefill):
+            return ExpertPhase.PREFILL
+        if batch.is_prefill and not any(batch.is_prefill):
+            return ExpertPhase.DECODE
+        return ExpertPhase.MIXED
+
     def prepare_batch_side_effects(self, batch: BatchMetadata) -> None:
         self._configure_expert_tracing(len(batch.seq_ids))
         self._advance_request_id()
@@ -324,9 +335,10 @@ class ModelRunner:
         if past_key_values is not None:
             forward_kwargs["past_key_values"] = past_key_values
 
-        outputs = self._forward_with_optional_paged_context(
-            forward_kwargs, batch=batch
-        )
+        with expert_phase_scope(self._expert_phase(batch)):
+            outputs = self._forward_with_optional_paged_context(
+                forward_kwargs, batch=batch
+            )
 
         logits = self._extract_logits(outputs)
         if logits.dim() == 3:

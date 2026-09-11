@@ -26,11 +26,13 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from moe_infinity.memory.expert_policy import ExpertPhase
 from moe_infinity.memory.expert_prefetcher import (
     BACKGROUND_PREFETCH_PRIORITY,
     ON_DEMAND_PRIORITY,
     ROUTE_AHEAD_PRIORITY,
     ExpertPrefetcher,
+    _inert_phase_policy,
 )
 
 # Hand-checked legacy fixture: [2 tokens, 4 experts]
@@ -96,6 +98,7 @@ def _make_prefetcher(
     prefetcher.expert_nbytes_map = {}
     prefetcher.overlap_controller = None
     prefetcher._last_speculative_prediction = set()
+    prefetcher.phase_policy = _inert_phase_policy()
     return prefetcher, engine
 
 
@@ -245,6 +248,7 @@ def _make_prefetcher_without_batch(num_layers: int = 8, num_experts: int = 8):
         for expert in range(num_experts)
     }
     prefetcher._last_speculative_prediction = set()
+    prefetcher.phase_policy = _inert_phase_policy()
     return prefetcher, engine
 
 
@@ -252,7 +256,9 @@ def test_prefetch_experts_list_batches_one_native_call_when_available():
     prefetcher, engine = _make_prefetcher(num_layers=8, num_experts=8)
     prefetcher.prefetch_experts_list(3, [3, 1, 7])
     engine.prefetch_tensors.assert_called_once_with(
-        [303, 301, 307], priority=ROUTE_AHEAD_PRIORITY
+        [303, 301, 307],
+        priority=ROUTE_AHEAD_PRIORITY,
+        phase=int(ExpertPhase.MIXED),
     )
     engine.enqueue_prefetch.assert_not_called()
 

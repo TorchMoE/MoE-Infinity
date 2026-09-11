@@ -599,6 +599,79 @@ def test_engine_n_finished_when_all_complete() -> None:
     assert "req-n" not in engine._completed_request_ids
 
 
+def make_mixed_batch(prefill_tokens, decode_tokens) -> BatchMetadata:
+    tokens = [*prefill_tokens, *decode_tokens]
+    return BatchMetadata(
+        seq_ids=[1, 2],
+        input_token_ids=tokens,
+        seq_lengths=[len(prefill_tokens), len(decode_tokens)],
+        context_lengths=[0, 8],
+        is_prefill=[True, False],
+        block_tables=[[0, 1], [2, 3]],
+        token_offsets=[0, len(prefill_tokens), len(tokens)],
+        sampling_params=[SamplingParams(), SamplingParams()],
+    )
+
+
+def test_enabled_policy_executes_mixed_decode_then_prefill() -> None:
+    engine = _make_engine()
+    calls = []
+
+    def execute(batch):
+        calls.append(list(batch.is_prefill))
+        base = 100 if all(batch.is_prefill) else 200
+        return torch.arange(batch.total_tokens).unsqueeze(1) + base
+
+    engine.model_runner.execute = execute
+    engine.config["phase_specific_expert_policy"] = True
+    batch = make_mixed_batch(prefill_tokens=[11, 12], decode_tokens=[21])
+    output = engine._execute_batch(batch)
+    assert calls == [[False], [True]]
+    assert output.squeeze(1).tolist() == [100, 101, 200]
+
+
+def test_disabled_policy_keeps_nonpaged_mixed_combined() -> None:
+    engine = _make_engine()
+    calls = []
+    engine.config["phase_specific_expert_policy"] = False
+    engine.model_runner._get_paged_attention_classes = lambda: []
+    engine.model_runner.execute = lambda batch: (
+        calls.append(list(batch.is_prefill))
+        or torch.zeros((batch.total_tokens, 1))
+    )
+    batch = make_mixed_batch(prefill_tokens=[11, 12], decode_tokens=[21])
+    _ = engine._execute_batch(batch)
+    assert calls == [[True, False]]
+
+
+def test_disabled_policy_keeps_paged_prefill_then_decode() -> None:
+    engine = _make_engine()
+    calls = []
+    engine.config["phase_specific_expert_policy"] = False
+    engine.paged_attention_registry.bindings = [object()]
+    engine.model_runner.execute = lambda batch: (
+        calls.append(list(batch.is_prefill))
+        or torch.zeros((batch.total_tokens, 1))
+    )
+    batch = make_mixed_batch(prefill_tokens=[11, 12], decode_tokens=[21])
+    _ = engine._execute_batch(batch)
+    assert calls == [[True], [False]]
+
+
+def test_get_stats_reports_disabled_expert_policy_without_prefetcher() -> None:
+    engine = _make_engine()
+    stats = engine.get_stats()
+    assert "expert_policy" in stats
+    policy = stats["expert_policy"]
+    assert policy["enabled"] == 0
+    assert policy["resident_bytes"] == 0
+    assert policy["resident_experts"] == 0
+    assert policy["prefill_hits"] == 0
+    assert policy["decode_hits"] == 0
+    assert policy["transition_hits"] == 0
+    assert policy["starvation_promotions"] == 0
+
+
 def test_set_block_store_rejects_oversized_logical_capacity() -> None:
     backend = make_flashinfer_backend(num_blocks=4, num_layers=1)
     cache = make_serving_cache(num_blocks=6, num_layers=1)

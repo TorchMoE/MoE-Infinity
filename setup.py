@@ -184,6 +184,7 @@ _STORE_SOURCES = [
     # prefetch
     "core/prefetch/archer_prefetch_handle.cpp",
     "core/prefetch/task_scheduler.cpp",
+    "core/prefetch/expert_residency.cpp",
     "core/prefetch/task_thread.cpp",
     # memory
     "core/memory/caching_allocator.cpp",

@@ -1630,6 +1630,11 @@ class ContinuousBatchingEngine:
                 else None
             ),
             "memory": self.memory_manager.report(),
+            "expert_policy": (
+                self._expert_policy_stats()
+                if callable(getattr(self, "_expert_policy_stats", None))
+                else {}
+            ),
             "kv_swap": kv_swap,
             "num_prefill_chunks": getattr(self, "_num_prefill_chunks", 0),
             "chunked_prefill_requested": getattr(
@@ -1659,6 +1664,21 @@ class ContinuousBatchingEngine:
         if request_id not in self._request_failures:
             raise KeyError(f"request_id '{request_id}' has no recorded failure")
         return dict(self._request_failures[request_id])
+
+    def _expert_policy_stats(self) -> dict[str, int]:
+        from moe_infinity.memory.expert_prefetcher import disabled_policy_stats
+
+        engine = getattr(getattr(self, "model_runner", None), "engine", None)
+        prefetcher = getattr(engine, "expert_prefetcher", None)
+        getter = getattr(prefetcher, "get_policy_stats", None)
+        if callable(getter):
+            try:
+                snapshot = getter()
+            except Exception:
+                snapshot = None
+            if isinstance(snapshot, dict):
+                return snapshot
+        return disabled_policy_stats()
 
     def get_config(self) -> dict[str, object]:
         config: dict[str, object] = {}
@@ -1845,15 +1865,34 @@ class ContinuousBatchingEngine:
         has_decode = any(not p for p in batch.is_prefill)
         uses_paged = bool(self.paged_attention_registry.bindings)
 
+        phase_policy_enabled = bool(
+            self.config.get("phase_specific_expert_policy", False)
+        )
+
         if not (has_prefill and has_decode):
             if has_decode and not has_prefill:
                 return self._execute_decode_batch(batch)
             return self.model_runner.execute(batch)
 
-        if not uses_paged:
+        if not phase_policy_enabled and not uses_paged:
             return self.model_runner.execute(batch)
 
         split = split_prefill_decode_batch(batch)
+        if phase_policy_enabled:
+            # Phase policy executes the decode half first so decode-phase
+            # expert accesses are recorded before prefill floods the cache.
+            decode_logits = (
+                self._execute_decode_batch(split.decode_batch)
+                if split.decode_batch is not None
+                else None
+            )
+            prefill_logits = (
+                self.model_runner.execute(split.prefill_batch)
+                if split.prefill_batch is not None
+                else None
+            )
+            return split.recombine_outputs(prefill_logits, decode_logits)
+
         prefill_logits = None
         decode_logits = None
         if split.prefill_batch is not None:

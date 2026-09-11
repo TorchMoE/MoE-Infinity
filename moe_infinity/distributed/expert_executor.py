@@ -11,6 +11,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed.rpc as rpc
 
+from moe_infinity.memory.expert_policy import (
+    ExpertPhase,
+    current_expert_phase,
+)
 from moe_infinity.utils import ArcherConfig
 
 try:
@@ -147,9 +151,13 @@ class DistributedExpertExecutor:
     def set_prefetcher(self, prefetcher):
         self.prefetcher = prefetcher
 
-    def trigger_speculative_prefetch(self, layer_id, router_logits):
+    def trigger_speculative_prefetch(
+        self, layer_id, router_logits, phase=ExpertPhase.MIXED
+    ):
         if self.prefetcher is not None:
-            return self.prefetcher.speculative_prefetch(layer_id, router_logits)
+            return self.prefetcher.speculative_prefetch(
+                layer_id, router_logits, phase=phase
+            )
         return None
 
     @staticmethod
@@ -258,6 +266,7 @@ class DistributedExpertExecutor:
                         layer_id,
                         expert_ids=union_expert_ids,
                         prefetch_layer_id=layer_id,
+                        phase=ExpertPhase.DECODE,
                     )
                     predicted_ids = union_expert_ids
                     fired = True
@@ -337,7 +346,9 @@ class DistributedExpertExecutor:
             return False
         return True
 
-    def _dispatch_eager_local(self, layer_id, router_mask, num_expert):
+    def _dispatch_eager_local(
+        self, layer_id, router_mask, num_expert, phase=None
+    ):
         expert_count = (
             torch.sum(router_mask.view((-1, num_expert)), dim=0)
             .cpu()
@@ -355,9 +366,18 @@ class DistributedExpertExecutor:
         self.expert_dispatcher.set_expected_queue(len(expert_list))
         total_gpus = torch.cuda.device_count()
         for expert_id in expert_list:
-            self.expert_dispatcher.enqueue_expert(
-                layer_id, expert_id, expert_id % total_gpus, False
-            )
+            if phase is not None:
+                self.expert_dispatcher.enqueue_expert(
+                    layer_id,
+                    expert_id,
+                    expert_id % total_gpus,
+                    False,
+                    int(phase),
+                )
+            else:
+                self.expert_dispatcher.enqueue_expert(
+                    layer_id, expert_id, expert_id % total_gpus, False
+                )
         self.expert_dispatcher.notify_fetch_start()
         return expert_list
 
@@ -401,6 +421,8 @@ class DistributedExpertExecutor:
                 )
                 use_native_routing = self._can_use_gpu_only_routing(router_mask)
                 expert_list = None
+
+        phase = current_expert_phase()
 
         if prefetcher is None:
             prefetcher = self.prefetcher
@@ -458,7 +480,7 @@ class DistributedExpertExecutor:
                             else nullcontext()
                         ):
                             expert_list = self._dispatch_eager_local(
-                                layer_id, router_mask, num_expert
+                                layer_id, router_mask, num_expert, phase=phase
                             )
 
         self._last_dispatch_used_native_routing = use_native_routing
@@ -484,11 +506,15 @@ class DistributedExpertExecutor:
                 generations.append(generation)
             if route_ahead_attempted:
                 try:
-                    self.trigger_speculative_prefetch(layer_id, router_logits)
+                    self.trigger_speculative_prefetch(
+                        layer_id, router_logits, phase
+                    )
                 except Exception:
                     pass
             else:
-                self.trigger_speculative_prefetch(layer_id, router_logits)
+                self.trigger_speculative_prefetch(
+                    layer_id, router_logits, phase
+                )
             pending_router_logits = None
         else:
             pending_router_logits = router_logits
@@ -498,6 +524,7 @@ class DistributedExpertExecutor:
             layer_id,
             expert_list,
             pending_router_logits,
+            phase,
             generations,
             invocation_id,
         )
@@ -529,12 +556,13 @@ class DistributedExpertExecutor:
                 layer_id,
                 expert_list,
                 router_logits,
+                phase,
                 generations,
                 invocation_id,
             ) = (
                 pending
                 if pending is not None
-                else (None, -1, [], None, [], None)
+                else (None, -1, [], None, None, [], None)
             )
             if expert_list is None and self._last_dispatch_used_native_routing:
                 expert_list = list(
@@ -574,23 +602,25 @@ class DistributedExpertExecutor:
                     if failure_safe:
                         try:
                             prefetcher.correct_prefetch(
-                                layer_id + 1, expert_list
+                                layer_id + 1, expert_list, phase=phase
                             )
                         except Exception:
                             pass
                     else:
-                        prefetcher.correct_prefetch(layer_id + 1, expert_list)
+                        prefetcher.correct_prefetch(
+                            layer_id + 1, expert_list, phase=phase
+                        )
                     if router_logits is not None:
                         if failure_safe:
                             try:
                                 self.trigger_speculative_prefetch(
-                                    layer_id, router_logits
+                                    layer_id, router_logits, phase
                                 )
                             except Exception:
                                 pass
                         else:
                             self.trigger_speculative_prefetch(
-                                layer_id, router_logits
+                                layer_id, router_logits, phase
                             )
             finally:
                 if prefetcher is not None:
@@ -628,6 +658,8 @@ class DistributedExpertExecutor:
             np.arange(num_expert).astype(int)[expert_count > 0].tolist()
         )
 
+        phase = current_expert_phase()
+
         device_list = self.device_map_manager.get_target_device(expert_list)
         visited_ranks = set()
         rank_wait_cnt = {r: 0 for r in range(dist.get_world_size())}
@@ -664,13 +696,20 @@ class DistributedExpertExecutor:
             rank, gpu_id, expert_id = device_meta
             if rank == dist.get_rank():
                 self.expert_dispatcher.enqueue_expert(
-                    layer_id, expert_id, gpu_id, False
+                    layer_id, expert_id, gpu_id, False, int(phase)
                 )
             else:
                 future = rpc.rpc_async(
                     f"worker_{rank}",
                     _call_expert_dispatcher,
-                    args=("enqueue_expert", layer_id, expert_id, gpu_id, True),
+                    args=(
+                        "enqueue_expert",
+                        layer_id,
+                        expert_id,
+                        gpu_id,
+                        True,
+                        int(phase),
+                    ),
                 )
                 futures.append(future)
 

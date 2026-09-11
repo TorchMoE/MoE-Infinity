@@ -108,7 +108,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ArcherPrefetchHandle::GetNodeDefaultDevice)
       .def("get_node_device", &ArcherPrefetchHandle::GetNodeDevice)
       .def("prefetch_tensors", &ArcherPrefetchHandle::EnqueuePrefetchTensors,
-           py::arg("tensor_ids"), py::arg("priority") = kRouteAheadPriority)
+           py::arg("tensor_ids"), py::arg("priority") = kRouteAheadPriority,
+           py::arg("phase") = static_cast<int>(ExpertPhase::MIXED))
       .def("schedule_prefetch_tensors",
            &ArcherPrefetchHandle::SchedulePrefetchTensors,
            py::arg("tensor_ids"), py::arg("priority"), py::arg("generation"),
@@ -126,6 +127,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("enqueue_prefetch", &ArcherPrefetchHandle::EnqueuePrefetch)
       .def("fetch_tensors", &ArcherPrefetchHandle::FetchTensors)
       .def("clean_up_resources", &ArcherPrefetchHandle::CleanUpResources)
+      .def("configure_phase_policy",
+           &ArcherPrefetchHandle::ConfigureExpertPolicy, py::arg("enabled"),
+           py::arg("prefill_admission"), py::arg("decode_admission"),
+           py::arg("prefill_weight"), py::arg("decode_weight"),
+           py::arg("starvation_limit"))
+      .def("get_expert_policy_stats",
+           &ArcherPrefetchHandle::GetExpertPolicyStats)
       .def("reset_cache", &ArcherPrefetchHandle::ResetCache);
   //    .def("set_node_cache_priority",
   //    &ArcherPrefetchHandle::SetNodeCachePriority);

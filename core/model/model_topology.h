@@ -21,6 +21,7 @@
 #include "common/types.h"
 #include "memory/event_pool.h"
 #include "memory/memory_pool.h"
+#include "prefetch/expert_policy.h"
 
 enum NodeState {
   NODE_STATE_NONE = 0x0,
@@ -69,6 +70,8 @@ struct Node {
   NodeState io_state = NODE_STATE_NONE;
 
   bool is_overflow = false;
+
+  ExpertPolicyMetadata policy_metadata;
 
   void* host_memory_ptr = nullptr;
   void* device_memory_ptr = nullptr;

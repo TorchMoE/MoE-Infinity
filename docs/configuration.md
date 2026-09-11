@@ -193,6 +193,43 @@ dequantized SDPA path; FlashInfer stays active for `native` stores but an
 `flashinfer_no_int8_sym_contract`) without changing the effective storage
 format.
 
+### Phase-specific expert policy fields
+
+All subordinate fields in this table are inert while
+`phase_specific_expert_policy=False`. That default retains legacy admission,
+top-2 prefetch priority, eviction, starvation, and mixed-batch behavior.
+
+| Field | Type | Default | Valid values / range | Effect when enabled |
+| --- | --- | --- | --- | --- |
+| `phase_specific_expert_policy` | `bool` | `False` | `True` / `False` | Master gate for independently tunable prefill/decode policy over one shared expert store and GPU residency set. |
+| `prefill_expert_admission` | `str` | `"transient_on_pressure"` | `cache`, `transient_on_pressure` | Determines whether a prefill miss remains resident or uses the transient overflow slot under pressure. |
+| `decode_expert_admission` | `str` | `"cache"` | `cache`, `transient_on_pressure` | Determines whether a decode miss remains resident or becomes transient under pressure. |
+| `prefill_expert_prefetch_top_k` | `int` | `0` | `0..num_experts` | Number of predictive prefill experts; zero disables speculative prefill traffic. |
+| `decode_expert_prefetch_top_k` | `int` | `2` | `0..num_experts` | Number of predictive decode experts. |
+| `prefill_expert_prefetch_priority` | `int` | `2` | `1..19` | Native prefill prefetch scheduling band. |
+| `decode_expert_prefetch_priority` | `int` | `1` | `1..19` | Native decode prefetch scheduling band. |
+| `prefill_expert_eviction_weight` | `float` | `1.0` | finite and `> 0` | Weight applied to prefill reuse in deterministic victim scoring. |
+| `decode_expert_eviction_weight` | `float` | `4.0` | finite and `> 0` | Weight applied to decode reuse in deterministic victim scoring. |
+| `expert_policy_starvation_limit` | `int` | `8` | `> 0` | Maximum prefetch bypasses before one promotion opportunity; demand band 0 remains strict. |
+
+Minimal enablement:
+
+```json
+{
+  "phase_specific_expert_policy": true,
+  "prefill_expert_admission": "transient_on_pressure",
+  "decode_expert_admission": "cache",
+  "prefill_expert_prefetch_top_k": 0,
+  "decode_expert_prefetch_top_k": 2
+}
+```
+
+The phase is request metadata, not part of an expert key. Enabling this policy
+does not create separate phase pools or duplicate weights. See
+[OpenAI-compatible serving](serving.md#phase-specific-expert-policy) for runtime
+ordering and rollback, and [Benchmarking](benchmarking.md#phase-specific-expert-policy-matrix)
+for the required A/B matrix.
+
 ## Memory ratio rules
 
 `__post_init__` does not enforce a hard invariant up front.

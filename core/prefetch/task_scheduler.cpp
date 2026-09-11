@@ -472,30 +472,43 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
 
     std::uint32_t max_priority = 1000;
     std::unique_lock<std::mutex> lock(unified_mutex_);
-    for (std::uint32_t i = 0; i < NUM_PRIORITY; ++i) {
-      if (!unified_queue_[i].empty()) {
-        max_priority = i;
-        break;
-      }
-    }
-
-    if (max_priority == 1000) {
-      lock.unlock();
-      SKIP_TO_NEXT_ITERATION
-    }
-
-    // Find a task that can be executed on the current GPU
+    const bool managed =
+        kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled();
     TaskPtr task = nullptr;
-    for (auto& t : unified_queue_[max_priority]) {
-      if (t->dst_device.index() == gpu_id) {
-        task = t;
-        break;
+    std::uint32_t selected_class = 1000;
+    for (std::uint32_t i = 0; i < NUM_PRIORITY; ++i) {
+      for (const auto& queued : unified_queue_[i]) {
+        if (queued->dst_device.index() != gpu_id) continue;
+        const std::uint32_t service_class =
+            managed ? ServiceClass(queued->priority, queued->bypasses,
+                                   kExpertResidencyManager->StarvationLimit())
+                    : queued->priority;
+        if (task == nullptr || service_class < selected_class ||
+            (service_class == selected_class && i < max_priority)) {
+          task = queued;
+          max_priority = i;
+          selected_class = service_class;
+        }
       }
     }
 
     if (task == nullptr) {
       lock.unlock();
       SKIP_TO_NEXT_ITERATION
+    }
+
+    if (managed) {
+      const auto limit = kExpertResidencyManager->StarvationLimit();
+      if (task->priority > kRouteAheadPriority && task->bypasses >= limit) {
+        kExpertResidencyManager->RecordStarvationPromotion();
+      }
+      for (std::uint32_t i = 1; i < NUM_PRIORITY; ++i) {
+        for (auto& queued : unified_queue_[i]) {
+          if (queued != task && queued->dst_device.index() == gpu_id) {
+            queued->bypasses += 1;
+          }
+        }
+      }
     }
 
     auto node = task->node;
@@ -516,7 +529,26 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
 
     lock.unlock();
 
-    if (!task->on_demand) {
+    ResidencyTicket residency_ticket;
+    if (!task->on_demand && managed) {
+      residency_ticket = kExpertResidencyManager->BeginAdmission(
+          node, gpu_id, task->phase,
+          kExpertResidencyManager->AdmissionFor(task->phase),
+          AdmissionSource::PREFETCH);
+      if (!residency_ticket.valid ||
+          residency_ticket.outcome == AdmissionOutcome::ALREADY_RESIDENT ||
+          residency_ticket.transient) {
+        if (residency_ticket.valid && residency_ticket.id != 0) {
+          kExpertResidencyManager->AbortAdmission(residency_ticket);
+        }
+        continue;
+      }
+      if (residency_ticket.reserved_victim != nullptr &&
+          !kExpertResidencyManager->EvictReserved(residency_ticket)) {
+        kExpertResidencyManager->AbortAdmission(residency_ticket);
+        continue;
+      }
+    } else if (!task->on_demand) {
       bool success = RemoveCachedSparseNode(node);
       if (!success) {
         DLOG_TRACE("{} evict failed, move to CPU", task->DebugString());
@@ -529,6 +561,14 @@ void ArcherTaskPool::GPUThreadFunc(int gpu_id, int thread_id) {
       nvtx3::scoped_range r("task_execute");
 #endif
       SetNodeDevice(task);
+    }
+
+    if (!task->on_demand && managed) {
+      if (node->device.is_cuda()) {
+        kExpertResidencyManager->CommitAdmission(residency_ticket);
+      } else {
+        kExpertResidencyManager->AbortAdmission(residency_ticket);
+      }
     }
 
     if (task->on_demand) {

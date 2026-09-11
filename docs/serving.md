@@ -68,6 +68,7 @@ Stable options from `api_server_v2.py`:
 | `--enable-pyspy-dump` | off | Scaffolded flag; currently accepted and stored, but no py-spy dump is triggered |
 | `--enable-contextpilot` | off | Enable ContextPilot middleware |
 | `--contextpilot-debug` | off | Enable ContextPilot fault-injection/admin hooks |
+| `--phase-specific-expert-policy` / `--no-phase-specific-expert-policy` | off | Enable or explicitly disable phase-specific admission, prefetch, eviction, and mixed-batch ordering over the shared expert cache |
 
 Internal / deprecated:
 
@@ -419,6 +420,37 @@ The optional `/contextpilot/toggle`, `/contextpilot/inject-fault`, and
 [`docs/contextpilot/README.md`](contextpilot/README.md) rather than this core
 serving table. The fault-injection route is debug-only and requires
 `--contextpilot-debug`.
+
+## Phase-specific expert policy
+
+The opt-in policy keeps one expert store and one GPU cache; it does not create
+prefill and decode pools. `ExpertResidencyManager` is the sole enabled-mode
+authority for persistent membership, resident bytes, leases, candidate
+protection, eviction reservations, and policy counters. Dispatcher and
+prefetch telemetry are views of that shared snapshot.
+
+With `--phase-specific-expert-policy`, a mixed serving batch executes decode
+rows first and prefill rows second, once each, then restores original output
+order. With `--no-phase-specific-expert-policy` (the default), a non-paged mixed
+batch remains one combined forward and a paged mixed batch retains prefill-then-
+decode order.
+
+To roll back, restart with `--no-phase-specific-expert-policy`. For in-process
+configuration, set `"phase_specific_expert_policy": false`. Subordinate policy
+keys may remain in JSON because they are inert while the master gate is false.
+No cache deletion or offload-store migration is required: phase is not stored
+in tensor IDs, topology, or checkpoint metadata.
+
+Before disabling after a regression, capture `/admin/stats`, `/metrics`, the
+effective config, and the benchmark JSON. Check `starvation_promotions`,
+`prefetch_rejected`, TTFT, and TPOT, and do not change `device_memory_ratio`
+between A/B runs. See [Configuration](configuration.md#phase-specific-expert-policy-fields),
+[Benchmarking](benchmarking.md#phase-specific-expert-policy-matrix), and
+[Troubleshooting](troubleshooting.md#phase-specific-expert-policy-regression-or-rollback).
+
+Adaptive expert precision is not parallel-merge composable with this fixed-size
+manager. Land this policy first, then rebase adaptive precision onto the same
+lease/accounting transactions and add combined tests before co-enabling them.
 
 ## Watchdogs and Diagnostics
 

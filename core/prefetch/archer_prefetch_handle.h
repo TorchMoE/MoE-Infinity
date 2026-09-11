@@ -8,6 +8,7 @@
 #include "aio/archer_tensor_handle.h"
 #include "model/model_topology.h"
 #include "parallel/expert_dispatcher.h"
+#include "prefetch/expert_residency.h"
 #include "prefetch/task_scheduler.h"
 
 class ArcherPrefetchHandle {
@@ -30,7 +31,8 @@ class ArcherPrefetchHandle {
   void ReplaceCacheCandidates(const std::vector<std::uint32_t>& tensor_ids);
   void EnqueuePrefetch(const uint32_t tensor_id, int gpu_id);
   void EnqueuePrefetchTensors(const std::vector<std::uint32_t>& tensor_ids,
-                              std::uint32_t priority = kRouteAheadPriority);
+                              std::uint32_t priority = kRouteAheadPriority,
+                              int phase = static_cast<int>(ExpertPhase::MIXED));
 
   PrefetchAdmission SchedulePrefetchTensors(
       const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
@@ -74,10 +76,17 @@ class ArcherPrefetchHandle {
   void CleanUpResources();
   void ResetCache();
 
+  void ConfigureExpertPolicy(bool enabled, int prefill_admission,
+                             int decode_admission, double prefill_weight,
+                             double decode_weight, int starvation_limit);
+  ExpertPolicyStats GetExpertPolicyStats() const;
+
   // void SetNodeCachePriority(const std::uint64_t corr_id, const float
   // priority);
 
  private:
+  void ConfigureExpertCapacityAfterTopology();
+
   std::string prefix_;
   std::unordered_map<std::size_t, std::unordered_set<std::uint32_t>>
       node_id_to_tensor_ids_;
