@@ -147,6 +147,51 @@ latency/throughput regression judged unacceptable by the owner.
 | `wait_expert` throws with admitted work outstanding | wait-error/failing-cleanup tests | cancel owned generations and drain native samples in error/finally without masking the original error |
 | Missing/incorrect expert sizes | uncosted candidate metric | fail closed in `enforce`; never use an average |
 | Native extension version skew | capability detection | `enforce` fails closed; `off` uses the legacy API |
+| `kv_cache_format` | `str` | `native` | `native` / `int8_sym` | KV-cache storage format. Default: `native` preserves the model cache dtype. | `int8_sym` is an opt-in symmetric INT8 storage path; validated for ordinary MHA/GQA only. Validated by `KVCacheFormat.parse`. Opt-in. |
+| `kv_cache_allow_fallback` | `bool` | `True` | `True` / `False` | Allow a visible native fallback when the requested KV format is unsupported. | When `False`, an unsupported `int8_sym` request raises before allocation instead of falling back. Opt-in. |
+
+## KV-cache storage format (`kv_cache_format`)
+
+`kv_cache_format` selects how paged K/V are stored (default: `native`), which
+keeps the model cache dtype and is the only path enabled by default.
+
+`int8_sym` is an opt-in, correctness-gated symmetric INT8 storage format. It
+stores each K and V element as signed INT8 with one FP16 scale per
+`(layer, page, KV head, token)`, calibrated online from the per-token/per-head
+absolute maximum. It does **not** claim any universal 2-bit KV support;
+[KIVI](https://arxiv.org/abs/2402.02750) and
+[KVQuant](https://arxiv.org/abs/2401.18079) motivate the approach and the
+quality gates only.
+
+### Precision contract
+
+The three precisions are reported separately so a fallback is never mistaken
+for a quantized run:
+
+| Concern | `native` | `int8_sym` |
+| --- | --- | --- |
+| Storage precision | model cache dtype (`fp16`/`bf16`/`fp32`) | INT8 payload + FP16 scales |
+| Transfer precision | same native tensor bytes | synchronously copied INT8 payload and FP16 scales; no D2H/H2D dequantization |
+| Attention execution precision | model dtype, FP32 accumulator | model-dtype output, scales promoted to FP32, FP32 QK/softmax/V accumulation |
+
+### Memory
+
+For the canonical `(block_size=16, num_kv_heads=8, head_dim=128)` page,
+`int8_sym` uses `32,768` payload bytes + `512` scale bytes = `33,280` bytes,
+versus `65,536` native FP16 bytes, a ratio of `0.5078125`.
+
+### Scope, MLA, and fallback
+
+`int8_sym` is validated for ordinary MHA/GQA. MLA models (DeepSeek/GLM latent
+attention, detected from `kv_lora_rank`/`qk_nope_head_dim`/`qk_rope_head_dim`)
+are **not** validated: with `kv_cache_allow_fallback=True` an MLA request falls
+back to `native` with reason `mla_not_validated`; with fallback disabled the
+server raises at startup before cache allocation. When a CUDA INT8 kernel
+binding is unavailable the format still runs through a validated FP32
+dequantized SDPA path; FlashInfer stays active for `native` stores but an
+`int8_sym` request bypasses FlashInfer (reason
+`flashinfer_no_int8_sym_contract`) without changing the effective storage
+format.
 
 ## Memory ratio rules
 
@@ -195,3 +240,42 @@ Repo evidence:
 - `moe_infinity/distributed/expert_executor.py`
 - `moe_infinity/memory/expert_prefetcher.py`
 - `moe_infinity/runtime/attention_backend.py`
+
+## Asynchronous hierarchical KV swap
+
+Serving accepts the same six values through `ArcherConfig`, `MoE.serve()`, and
+the OpenAI server CLI:
+
+| Field | Default | Validation and behavior |
+| --- | ---: | --- |
+| `kv_swap_mode` | `"sync"` | Exactly `"sync"` or `"async"`. Async requires CUDA and sufficient locked/pinned host memory. |
+| `kv_swap_host_memory_bytes` | `536870912` (512 MiB) | Positive hard cap for async pinned host leases. Inactive in effective sync mode. |
+| `kv_swap_max_inflight_bytes` | `268435456` (256 MiB) | Positive async in-flight DMA cap and no greater than the host cap. Inactive in effective sync mode. |
+| `kv_swap_checksum` | `False` | Enables CRC32 validation of the full padded host payload before restore. |
+| `kv_swap_max_retries` | `2` | Non-negative restore retry count. |
+| `kv_swap_allow_sync_fallback` | `True` | Initialization may fall back to sync when CUDA or pinned allocation is unavailable. Corrupt bytes never fall back. |
+
+Example:
+
+```python
+model = MoE(checkpoint, {
+    "offload_path": offload_path,
+    "kv_swap_mode": "async",
+    "kv_swap_host_memory_bytes": 2 * 1024**3,
+    "kv_swap_max_inflight_bytes": 1024**3,
+    "kv_swap_checksum": False,
+    "kv_swap_max_retries": 2,
+    "kv_swap_allow_sync_fallback": True,
+})
+```
+
+The default `kv_swap_mode="sync"` deliberately retains blocking pageable
+`.detach().to("cpu").clone()` and blocking restore semantics. Each host copy is
+owned directly by a `PageableCPUBufferRecord`; sync mode never constructs,
+acquires, releases, or accounts a pinned pool. Consequently sync reports zero
+pinned capacity and in-use bytes even while pageable host copies exist.
+
+Async mode uses bounded `PinnedBufferLease` ownership only. Pool or in-flight
+cap exhaustion returns backpressure before transfer state or block ownership
+changes. To roll back, drain/restart the engine with `kv_swap_mode="sync"`;
+never switch transfer backends while tickets are in flight.

@@ -27,6 +27,39 @@ If you want the cross-framework comparison table, start with [Benchmark reproduc
 - Record the exact commit, command line, and output file path with every result.
 - For cross-framework comparisons, use the same metric on both sides. For example, compare MoE-Infinity decode throughput with llama.cpp `eval time`, not `prompt eval time`.
 
+## Async KV swap A/B benchmark
+
+`benchmarks/serving/kv_offload_benchmark.py` runs warmup outside measurement and
+records raw trial samples, request latency, generated tokens, backpressure,
+D2H/H2D bytes, pinned/GPU peaks, failures, and observed swap p50/p95/p99. Here
+p99 means per-swap observed completion latency; it includes polling delay and is
+not pure PCIe time. Each result also records all six resolved `kv_swap`
+configuration values.
+
+```bash
+python benchmarks/serving/kv_offload_benchmark.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /path/to/offload/dir \
+  --num-requests 64 --prompt-length 2048 --max-new-tokens 128 \
+  --warmup-requests 8 --trials 5 \
+  --host-memory-mib 2048 --max-inflight-mib 1024 \
+  --kv-swap-mode async --output-json /tmp/kv-swap-async.json
+
+python benchmarks/serving/kv_offload_benchmark.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /path/to/offload/dir \
+  --num-requests 64 --prompt-length 2048 --max-new-tokens 128 \
+  --warmup-requests 8 --trials 5 \
+  --host-memory-mib 2048 --max-inflight-mib 1024 \
+  --kv-swap-mode sync --output-json /tmp/kv-swap-sync.json
+```
+
+Compare the two self-contained JSON files offline and describe any difference
+as observed overlap. Results are hardware- and workload-specific; they are not
+an SLA or performance promise. The benchmark exits nonzero for transfer or
+checksum failures and leaked accounting. Unit tests validate parser,
+conversion, percentile, and schema behavior.
+
 ## Using the StopWatch utility
 
 MoE-Infinity provides a `StopWatch` class in [`examples/interface_example.py`](../examples/interface_example.py) that separates prefill from decode timing through HuggingFace `TextStreamer`.
@@ -386,6 +419,28 @@ Fill this in for every benchmark run:
 | Metrics captured | `ttft_ms, itl_p50_ms, decode_toks_per_s, peak_gpu_memory_mb` |
 | Notes | `host-only, nsys, FlashInfer on, sampled off` |
 
+## KV-cache quantization long-context matrix
+
+`benchmarks/serving/kv_cache_quantization.py` runs a `native` vs `int8_sym`
+A/B matrix over context lengths and batch sizes, writing a JSON array with
+separate storage/transfer/execution precision fields plus TTFT, decode
+tokens/s, ITL p50/p99, peak allocated/reserved bytes, descriptor and measured
+cache bytes, D2H/H2D swap bytes, and scratch peak bytes.
+
+```bash
+python benchmarks/serving/kv_cache_quantization.py \
+  --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+  --context-lengths 128 2048 8192 32768 --batch-sizes 1 4 16 \
+  --decode-tokens 128 --warmups 2 --repeats 5 --strict-fallback \
+  --output-json artifacts/kv-cache-quantization/qwen3.json
+```
+
+`--strict-fallback` fails the run if the requested and effective formats
+differ, so a silent fallback cannot be reported as a quantized result. The
+writer creates the artifact's parent directory automatically. Rollout gates:
+INT8 measured storage ratio `<= 0.52`, lower peak memory at 8K/32K, and 2K
+decode throughput at least 90% of native. Performance misses block rollout but
+never relax the correctness/quality tolerances.
 ### Chunked-prefill TTFT/TPOT tails
 
 Start two identical paged-attention servers: baseline without the feature and

@@ -120,6 +120,7 @@ class MemoryManager:
         num_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        format_name: str = "native",
     ) -> int:
         for name, value in (
             ("block_size", block_size),
@@ -130,14 +131,15 @@ class MemoryManager:
             if value <= 0:
                 raise ValueError(f"{name} must be > 0, got {value}")
 
-        bytes_per_element = torch.tensor([], dtype=dtype).element_size()
-        kv_bytes_per_block = (
-            2
-            * block_size
-            * num_layers
-            * num_heads
-            * head_dim
-            * bytes_per_element
+        from moe_infinity.runtime.kv_cache_format import KVCacheFormat
+
+        kv_bytes_per_block = num_layers * KVCacheFormat.parse(
+            format_name
+        ).page_size_bytes(
+            block_size=block_size,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            execution_dtype=dtype,
         )
 
         budget = self._last_budget

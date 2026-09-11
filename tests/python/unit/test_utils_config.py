@@ -59,6 +59,26 @@ def test_kv_cache_fields_default(monkeypatch):
     assert config.attention_backend == "default"
 
 
+def test_kv_cache_format_defaults_native(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig(offload_path="/tmp", use_native_engine=False)
+    assert config.kv_cache_format == "native"
+    assert config.kv_cache_allow_fallback is True
+
+
+def test_kv_cache_format_int8_accepted(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.warns(UserWarning):
+        config = ArcherConfig(offload_path="/tmp", kv_cache_format="int8_sym")
+    assert config.kv_cache_format == "int8_sym"
+
+
+def test_kv_cache_format_invalid_rejected(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(ValueError, match="unsupported KV cache format"):
+        ArcherConfig(offload_path="/tmp", kv_cache_format="int4")
+
+
 def test_kv_cache_memory_ratio_validation(monkeypatch):
     monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     with pytest.raises(ValueError):
