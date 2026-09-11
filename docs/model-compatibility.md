@@ -27,6 +27,7 @@ a claim that any particular DeepSeek DFlash pair has been validated.
 | Mixtral (`MixtralForCausalLM`) | implemented/experimental | implemented/experimental | No real-model serving harness recorded. |
 | Qwen3 / Qwen3.5 MoE | Qwen3 validated; Qwen3.5 tiny-fixture validated | implemented/experimental | Qwen3.5 is text-only and requires newer Transformers. |
 | GLM-5.2 (`GlmMoeDsaForCausalLM`) | validated | tiny serving harness | Built-in MTP, not DFlash. |
+| GLM-5.3 (`GlmMoeDsaForCausalLM`) | implemented/experimental | not recorded | Same base and FP8 path as GLM-5.2 (post-training only); config resolution pinned by `tests/python/unit/test_glm53_registry.py`. |
 | GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) | implemented/experimental | not recorded | New glm5_next family (transformers >= 5.16, guarded); routed experts offloaded, KDA/DSA/mHC/vision resident; no real-checkpoint harness yet. |
 | GPT-OSS (`GptOssForCausalLM`) | 20B validated | 20B validated | Resident expert implementation. |
 | DBRX / Jamba / OLMoE / NLLB-MoE | implemented/experimental | not validated | Registry/adapter evidence only. |

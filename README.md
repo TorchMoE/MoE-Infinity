@@ -58,6 +58,7 @@ MoE-Infinity supports HuggingFace MoE checkpoints registered in [`moe_infinity/c
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) | `mistralai/Mixtral-8x7B-Instruct-v0.1`, `Mixtral-8x22B` |
 | [Qwen3-MoE](https://huggingface.co/Qwen/Qwen3-30B-A3B) | `Qwen/Qwen3-30B-A3B` |
 | [Qwen3.5-MoE](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | `Qwen/Qwen3.5-35B-A3B` |
+| [GLM-5.2 / GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) | `zai-org/GLM-5.2-FP8`, `zai-org/GLM-5.3` |
 | [GLM-5.2](https://huggingface.co/zai-org/GLM-5.2-FP8) | `zai-org/GLM-5.2-FP8` |
 | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `zai-org/GLM-5.3-Flash` |
 | [GPT-OSS](https://huggingface.co/models?search=gpt-oss) | `openai/gpt-oss-*` |
@@ -87,6 +88,8 @@ validated scope and current limitations.
 > GLM-5.3-Flash (`Glm5NextForConditionalGeneration`, `model_type="glm5_next"`) requires `transformers` >= 5.16 and is registered only when that class is importable, otherwise it is skipped automatically. Its 288 routed FP8 experts per MoE layer are offloaded, while the KDA linear-attention layers, DSA indexer, mHC hyper-connections, shared expert, vision tower, and MTP weights stay resident (text-only serving). Sparse attention uses `attn_implementation="eager"`.
 
 > GLM-5.2 (`GlmMoeDsaForCausalLM`, `model_type="glm_moe_dsa"`) requires `transformers` >= 5.12 and is registered only when that class is importable, otherwise it is skipped automatically. Its 256 routed FP8 experts are offloaded, while the 3 dense layers, shared expert, MLA attention, DSA indexer, and MTP layer stay resident. The routed experts stay FP8 in the host store, and non-routed FP8 weights are dequantized to BF16 on load. Sparse attention uses `attn_implementation="eager"`. See [docs/glm-5.2.md](docs/glm-5.2.md) and [docs/model-compatibility.md](docs/model-compatibility.md).
+
+> GLM-5.3 (`zai-org/GLM-5.3`, native FP8) reuses the same `GlmMoeDsaForCausalLM` base as GLM-5.2 — all gains are post-training — so it runs through the identical registry entry and FP8 expert-offload path (config resolution is pinned by `tests/python/unit/test_glm53_registry.py`). Its chat template adds `reasoning_effort` (`low`/`high`/`max`, default `max`) and `clear_thinking`; pass them through the tokenizer's chat template as needed.
 
 ## Installation
 
