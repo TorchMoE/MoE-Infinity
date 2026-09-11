@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <exception>
 #include <iostream>
 #include <list>
@@ -258,6 +259,24 @@ struct Task {
 };
 typedef std::shared_ptr<Task> TaskPtr;
 
+struct SparseVictimReservation {
+  std::uint64_t id;
+  int device_id;
+  std::int64_t target_bytes;
+  std::int64_t resident_bytes;
+  bool ready;
+  std::string reason;
+  std::vector<NodePtr> victims;
+};
+
+struct SparseCacheResizeResult {
+  ResizeOutcome outcome;
+  int device_id;
+  std::int64_t target_bytes;
+  std::int64_t resident_bytes;
+  std::string reason;
+};
+
 class ArcherTaskPool : public base::noncopyable {
  public:
   void StartExec(const std::uint64_t& request_id, const NodePtr& node);
@@ -301,6 +320,16 @@ class ArcherTaskPool : public base::noncopyable {
     }
   }
 
+  SparseVictimReservation ReserveSparseCacheVictims(int device_id,
+                                                    std::int64_t target_bytes);
+  void CancelSparseCacheReservation(std::uint64_t id);
+  SparseCacheResizeResult CommitSparseCacheReservation(std::uint64_t id);
+
+#ifdef MOE_BUILD_TESTS
+  void SetAfterExecSnapshotHookForTest(std::function<void()> hook);
+  std::vector<NodePtr> SnapshotResizeExclusionsForTest(int device_id);
+#endif
+
   DELETE_COPY_AND_ASSIGN(ArcherTaskPool);
   STATIC_GET_INSTANCE(ArcherTaskPool);
 
@@ -321,13 +350,28 @@ class ArcherTaskPool : public base::noncopyable {
 
   std::string DebugString(const std::vector<std::deque<TaskPtr>>& queue);
 
+  // Snapshots the exec-queue membership and protected candidates for a device
+  // WITHOUT ever holding exec_mutex_ and candidates_mutex_ at the same time.
+  // Returns nodes that must be excluded from resize victim selection.
+  std::vector<NodePtr> SnapshotResizeExclusions(int device_id);
+
  private:
   std::vector<std::deque<TaskPtr>> unified_queue_;  // For ordered prefetch
   std::vector<std::vector<std::uint32_t>> gpu_min_priority_;
   std::unordered_map<std::uint64_t, TaskPtr> exec_queue_;
+  // Source lock rule: unified_mutex_ may precede candidates_mutex_ (see
+  // ReplaceCacheCandidates). exec_mutex_ and candidates_mutex_ are snapshot
+  // locks and are NEVER nested in either order.
   std::mutex exec_mutex_;
   std::mutex unified_mutex_;
   std::mutex candidates_mutex_;
+
+  std::mutex reservation_mutex_;
+  std::uint64_t next_reservation_id_ = 1;
+  std::unordered_map<std::uint64_t, SparseVictimReservation> reservations_;
+#ifdef MOE_BUILD_TESTS
+  std::function<void()> after_exec_snapshot_hook_for_test_;
+#endif
 
   std::vector<std::list<std::thread>> exec_threads_;
 

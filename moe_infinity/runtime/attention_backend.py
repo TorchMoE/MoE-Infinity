@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -22,6 +23,14 @@ from moe_infinity.runtime import flashinfer_utils
 from moe_infinity.runtime.attention_types import (
     AttentionMetadata as RuntimeAttentionMetadata,
 )
+
+
+def _allocate_resize_tensor(
+    *shape: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    return torch.empty(*shape, dtype=dtype, device=device)
+
+
 from moe_infinity.runtime.attention_types import (
     FlashInferPlanMetadata,
     KVCacheSpec,
@@ -49,6 +58,13 @@ if TYPE_CHECKING:
     pass
 if TYPE_CHECKING:
     from moe_infinity.runtime.paged_kv_storage import PagedKVStorage
+
+
+def _flashinfer_usable_on(module: object, device: torch.device | None) -> bool:
+    if device is not None and device.type == "cuda":
+        return True
+    module_name = getattr(module, "__name__", "")
+    return not module_name.startswith("flashinfer")
 
 
 @dataclass
@@ -370,6 +386,7 @@ class PagedAttentionBackend:
         self.spec = spec
         self.num_gpu_blocks = int(num_gpu_blocks)
         self.device = device
+        self._resize_lock = threading.Lock()
         self._block_store = None
         self._layer_registry = {}
         self.last_flashinfer_plan = None
@@ -432,7 +449,9 @@ class PagedAttentionBackend:
                 Any,
                 flashinfer_utils.get_flashinfer_module(),
             )
-            if flashinfer_module is not None:
+            if flashinfer_module is not None and _flashinfer_usable_on(
+                flashinfer_module, device
+            ):
                 try:
                     workspace = flashinfer_utils.get_workspace(device)
                     self._fi_workspace = workspace
@@ -1354,6 +1373,79 @@ class PagedAttentionBackend:
 
     def supports_dtype(self, dtype: torch.dtype) -> bool:
         return dtype in (torch.float16, torch.bfloat16, torch.float32)
+
+    def resize_num_blocks(
+        self, device_id: int, target_blocks: int, receipt: object
+    ) -> None:
+        if target_blocks <= 0:
+            raise ValueError("target_blocks must be positive")
+        if getattr(receipt, "device_id", None) != device_id:
+            raise ValueError("resize receipt device_id does not match backend")
+        if not getattr(receipt, "admissions_paused", False):
+            raise RuntimeError("resize requires paused admissions")
+        events = tuple(getattr(receipt, "cuda_events", ()))
+        if not events or not all(bool(event.query()) for event in events):
+            raise RuntimeError("resize requires synchronized CUDA events")
+
+        k_shape, v_shape = self.get_kv_cache_shape(self.spec, target_blocks)
+        new_k = _allocate_resize_tensor(
+            *k_shape, dtype=self.k_cache.dtype, device=self.k_cache.device
+        )
+        new_v = _allocate_resize_tensor(
+            *v_shape, dtype=self.v_cache.dtype, device=self.v_cache.device
+        )
+        new_fi_cache: Optional[torch.Tensor] = None
+        new_prefill: Optional[Any] = None
+        new_decode: Optional[Any] = None
+        if self._use_flashinfer:
+            module = cast(Any, flashinfer_utils.get_flashinfer_module())
+            if module is None or self._fi_workspace is None:
+                raise RuntimeError(
+                    "FlashInfer resize dependencies are unavailable"
+                )
+            new_fi_cache = _allocate_resize_tensor(
+                target_blocks,
+                2,
+                self.spec.block_size,
+                self.spec.num_kv_heads,
+                self.spec.head_dim,
+                dtype=self.spec.dtype,
+                device=self.device,
+            )
+            new_prefill = module.BatchPrefillWithPagedKVCacheWrapper(
+                self._fi_workspace, "NHD"
+            )
+            new_decode = module.BatchDecodeWithPagedKVCacheWrapper(
+                self._fi_workspace, "NHD"
+            )
+
+        old = (
+            self.k_cache,
+            self.v_cache,
+            self._fi_kv_cache,
+            self._fi_prefill,
+            self._fi_decode,
+        )
+        with self._resize_lock:
+            layer_count = (
+                self._block_store.num_layers
+                if self._block_store is not None
+                else None
+            )
+            self._block_store = None
+            self._k_cache = new_k
+            self._v_cache = new_v
+            self._fi_kv_cache = new_fi_cache
+            self._fi_prefill = new_prefill
+            self._fi_decode = new_decode
+            self.num_gpu_blocks = target_blocks
+            if layer_count is not None:
+                self.create_layered_store(layer_count=layer_count)
+        retain = getattr(receipt, "retain", None)
+        if callable(retain):
+            for item in old:
+                if item is not None:
+                    retain(item)
 
     def decode_graph_capability(self) -> "DecodeGraphCapability":
         from moe_infinity.runtime.attention_types import DecodeGraphCapability

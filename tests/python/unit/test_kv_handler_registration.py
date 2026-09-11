@@ -37,6 +37,7 @@ def _request(
         priority=TransferPriority.NORMAL,
         source_device="cuda:0",
         target_device=target_device,
+        device_id=0,
         tensor_id="kv",
         block_ids=block_ids,
     )

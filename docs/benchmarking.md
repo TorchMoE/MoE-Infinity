@@ -479,6 +479,24 @@ Fill this in for every benchmark run:
 | Baseline | `baseline_results.json` or `comparison_table.md` |
 | Metrics captured | `ttft_ms, itl_p50_ms, decode_toks_per_s, peak_gpu_memory_mb` |
 | Notes | `host-only, nsys, FlashInfer on, sampled off` |
+# Adaptive-memory evidence
+
+Adaptive memory is motivated by the competing expert/KV working sets discussed
+by [WiSP](https://arxiv.org/abs/2606.21868), but WiSP's reported numbers are not
+MoE-Infinity expectations. There is no assumed performance gain.
+
+Keep `adaptive_memory_enabled=false` for the fixed arm and true only for the
+adaptive arm. Both arms require separate model/runtime construction with the
+same requested ratios. Reports must retain `requested_config` and
+`effective_config` for each arm, plus hardware, model revision, seed, arm order,
+warmups, repetitions, and per-device initial/final targets.
+
+Safety and output parity are gates: no hard-budget, minimum-capacity, or
+free-memory reserve violation is acceptable. Report raw TTFT, decode throughput,
+latency distributions, expert miss/stall data, KV utilization/swap/preemption,
+peak allocation/reservation, decisions, fallback, and partial donor commits.
+Performance regressions or no measurable gain are valid outcomes; never infer a
+win from a single run.
 
 ## KV-cache quantization long-context matrix
 

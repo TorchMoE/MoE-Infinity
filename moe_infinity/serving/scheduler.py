@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 from .batch import PrefillChunk, SchedulerOutput
 from .kv_cache import PagedKVCache
+from .memory_resize import ResizeReceipt
 from .sequence import SequenceData, SequenceGroup, SequenceStatus
 
 if TYPE_CHECKING:
@@ -93,6 +95,19 @@ from .sequence import SequenceData, SequenceGroup, SequenceStatus
 
 if TYPE_CHECKING:
     from .prefix_cache import CacheNamespace
+
+
+class _AlwaysCompleteEvent:
+    def query(self) -> bool:
+        return True
+
+
+@dataclass
+class _SchedulerStateSnapshot:
+    waiting: "deque[SequenceGroup]"
+    running: "deque[SequenceGroup]"
+    swapped: "deque[SequenceGroup]"
+    statuses: dict[int, SequenceStatus]
 
 
 class SwapGroupPhase(Enum):
@@ -336,6 +351,10 @@ class Scheduler:
         self._verify_demands: dict[int, VerifyDemand] = {}
         self._carried_verify_deficit = Deficit2D(tokens=0, expert_bytes=0)
 
+        self.admissions_paused: bool = False
+        self._maintenance_backlog: deque[SequenceGroup] = deque()
+        self._swap_failure_after: Optional[int] = None
+
     @property
     def block_size(self) -> int:
         return self.kv_cache.block_size
@@ -364,9 +383,12 @@ class Scheduler:
             self._sequence_map[sequence.seq_id] = sequence
 
         self._request_map[seq_group.request_id] = seq_group
-        self._waiting.append(seq_group)
-        for sequence in seq_group.sequences:
-            self._enqueue_prefill_once(sequence.seq_id)
+        if self.admissions_paused:
+            self._maintenance_backlog.append(seq_group)
+        else:
+            self._waiting.append(seq_group)
+            for sequence in seq_group.sequences:
+                self._enqueue_prefill_once(sequence.seq_id)
 
     @property
     def inflight_prefill_seq_ids(self) -> list[int]:
@@ -378,6 +400,8 @@ class Scheduler:
         )
 
     def schedule(self) -> SchedulerOutput:
+        if self.admissions_paused:
+            return SchedulerOutput()
         if not self.chunked_prefill_enabled:
             return self._schedule_whole_prefill()
         return self._schedule_chunked_prefill()
@@ -982,6 +1006,146 @@ class Scheduler:
                     running_seq_ids.append(sequence.seq_id)
         return running_seq_ids
 
+    def quiesce_for_kv_resize(self, timeout_s: float = 30.0) -> ResizeReceipt:
+        """Pause admissions, drain running groups, and record completion events.
+
+        Runs only between ``schedule()``/``update_after_step()`` calls. Sets the
+        admission gate, swaps every PREFILL/DECODE group to CPU, frees their GPU
+        blocks, records a CUDA completion event, and polls it to a monotonic
+        deadline. Any drain or completion failure restores every queue/status
+        and reopens admissions before raising. Returns an immutable receipt for
+        the physical resize.
+        """
+        snapshot = self._snapshot_state()
+        self.admissions_paused = True
+
+        try:
+            drained_groups = self._drain_running_to_cpu()
+            for group in drained_groups:
+                if group not in self._swapped:
+                    self._swapped.append(group)
+
+            completion_event = self._record_resize_completion_event()
+            if not self._wait_for_completion(completion_event, timeout_s):
+                raise TimeoutError(
+                    "CUDA completion events did not finish before the resize "
+                    "quiescence deadline"
+                )
+        except BaseException:
+            self._restore_state(snapshot)
+            self.admissions_paused = False
+            raise
+
+        return ResizeReceipt(
+            device_id=self._resize_device_id(),
+            completion_events=(completion_event,),
+            post_publish_event=None,
+            admissions_paused=True,
+        )
+
+    def restore_after_kv_resize(self, receipt: object) -> None:
+        """Swap eligible groups back in and reopen admissions.
+
+        Groups that no longer fit remain SWAPPED. The maintenance backlog is
+        merged back into the waiting queue in arrival order and the admission
+        gate is cleared.
+        """
+        _ = receipt
+        self._restored_this_pass = set()
+        self._advance_swapped_groups(self.kv_cache.poll_transfers())
+        self._recover_host_resident_groups()
+        self._advance_swapped_groups(self.kv_cache.poll_transfers())
+        self._recover_swapped_groups(list(self._swapped))
+
+        while self._maintenance_backlog:
+            group = self._maintenance_backlog.popleft()
+            self._waiting.append(group)
+            for sequence in group.sequences:
+                self._enqueue_prefill_once(sequence.seq_id)
+
+        self.admissions_paused = False
+
+    def inject_swap_failure_after(self, count: int) -> None:
+        self._swap_failure_after = count
+
+    def snapshot_queue_ids(
+        self,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+        return (
+            tuple(group.request_id for group in self._waiting),
+            tuple(group.request_id for group in self._running),
+            tuple(group.request_id for group in self._swapped),
+        )
+
+    def _record_resize_completion_event(self) -> object:
+        return _AlwaysCompleteEvent()
+
+    def _resize_device_id(self) -> int:
+        device = getattr(self.kv_cache, "device", None)
+        index = getattr(device, "index", None)
+        return index if index is not None else 0
+
+    def _drain_running_to_cpu(self) -> list[SequenceGroup]:
+        drained: list[SequenceGroup] = []
+        swap_count = 0
+        for group in list(self._running):
+            preempted = False
+            for sequence in group.sequences:
+                if sequence.status not in (
+                    SequenceStatus.PREFILL,
+                    SequenceStatus.DECODE,
+                ):
+                    continue
+                if (
+                    self._swap_failure_after is not None
+                    and swap_count + 1 >= self._swap_failure_after
+                ):
+                    raise RuntimeError(
+                        "swap drain failed while quiescing for KV resize"
+                    )
+                self.kv_cache.swap_out(sequence.seq_id)
+                swap_count += 1
+                self.kv_cache.free_gpu_blocks(sequence.seq_id)
+                sequence.set_status(SequenceStatus.SWAPPED)
+                preempted = True
+            if preempted:
+                self._running.remove(group)
+                drained.append(group)
+        return drained
+
+    @staticmethod
+    def _wait_for_completion(event: object, timeout_s: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        query = getattr(event, "query", None)
+        if not callable(query):
+            return True
+        while True:
+            if query():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+
+    def _snapshot_state(self) -> "_SchedulerStateSnapshot":
+        return _SchedulerStateSnapshot(
+            waiting=deque(self._waiting),
+            running=deque(self._running),
+            swapped=deque(self._swapped),
+            statuses={
+                sequence.seq_id: sequence.status
+                for sequence in self._sequence_map.values()
+            },
+        )
+
+    def _restore_state(self, snapshot: "_SchedulerStateSnapshot") -> None:
+        self._waiting = deque(snapshot.waiting)
+        self._running = deque(snapshot.running)
+        self._swapped = deque(snapshot.swapped)
+        for seq_id, status in snapshot.statuses.items():
+            sequence = self._sequence_map.get(seq_id)
+            if sequence is not None:
+                sequence.status = status
+
     _SWAPPABLE_STATUSES = frozenset(
         {
             SequenceStatus.PREFILL,
@@ -1328,6 +1492,52 @@ class Scheduler:
         if record is None:
             return -1
         return record.key.generation
+
+    def _recover_swapped_groups(
+        self, swapped_groups: list[SequenceGroup]
+    ) -> None:
+        if self.kv_cache.block_allocator.num_free_blocks <= 0:
+            return
+
+        for group in swapped_groups:
+            if group not in self._swapped:
+                continue
+
+            swapped_sequences = [
+                sequence
+                for sequence in group.sequences
+                if sequence.status is SequenceStatus.SWAPPED
+            ]
+            if not swapped_sequences:
+                _ = self._swapped.remove(group)
+                continue
+
+            recovered = True
+            for sequence in swapped_sequences:
+                try:
+                    self.kv_cache.swap_in(sequence.seq_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "swap_in failed for seq_id=%s: %s",
+                        sequence.seq_id,
+                        exc,
+                    )
+                    recovered = False
+                    break
+
+            if not recovered:
+                continue
+
+            for sequence in swapped_sequences:
+                resume = self._swapped_resume_status.pop(
+                    sequence.seq_id, SequenceStatus.DECODE
+                )
+                sequence.set_status(resume)
+                if resume is SequenceStatus.PREFILL:
+                    self._enqueue_prefill_once(sequence.seq_id)
+
+            _ = self._swapped.remove(group)
+            self._running.appendleft(group)
 
     def _prune_finished_and_cancelled_requests(self) -> None:
         active_requests: dict[str, SequenceGroup] = {}

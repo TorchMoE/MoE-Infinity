@@ -25,6 +25,7 @@ class TransferRequest:
     priority: TransferPriority
     source_device: str
     target_device: str
+    device_id: int = 0
     tensor_id: Optional[str] = None
     block_ids: list[int] = field(default_factory=list)
 

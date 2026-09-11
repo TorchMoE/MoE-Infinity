@@ -69,6 +69,8 @@ def test_transfer_request_creation():
         priority=TransferPriority.HIGH,
         source_device="cpu",
         target_device="cuda:0",
+        device_id=0,
     )
     assert transfer.transfer_id == "t1"
     assert transfer.priority == TransferPriority.HIGH
+    assert transfer.device_id == 0

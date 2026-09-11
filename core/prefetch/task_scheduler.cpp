@@ -755,3 +755,148 @@ std::string ArcherTaskPool::DebugString(
   }
   return ss.str();
 }
+
+std::vector<NodePtr> ArcherTaskPool::SnapshotResizeExclusions(int device_id) {
+  std::unordered_set<NodePtr> nodes_exec;
+  {
+    std::lock_guard<std::mutex> lock(exec_mutex_);
+    for (auto& [id, task] : exec_queue_) {
+      if (task && task->node) {
+        nodes_exec.insert(task->node);
+      }
+    }
+  }
+
+#ifdef MOE_BUILD_TESTS
+  if (after_exec_snapshot_hook_for_test_) {
+    after_exec_snapshot_hook_for_test_();
+  }
+#endif
+
+  {
+    std::lock_guard<std::mutex> lock(candidates_mutex_);
+    for (auto& node : candidates_) {
+      nodes_exec.insert(node);
+    }
+  }
+
+  (void)device_id;
+  return std::vector<NodePtr>(nodes_exec.begin(), nodes_exec.end());
+}
+
+SparseVictimReservation ArcherTaskPool::ReserveSparseCacheVictims(
+    int device_id, std::int64_t target_bytes) {
+  auto exclusions = SnapshotResizeExclusions(device_id);
+  std::unordered_set<Node*> excluded;
+  for (auto& node : exclusions) {
+    excluded.insert(node.get());
+  }
+
+  auto nodes = kTopologyHandle->GetSparseNodes();
+
+  std::int64_t resident_bytes = 0;
+  NodePtrList device_nodes;
+  for (auto& n : nodes) {
+    if (n->device.is_cuda() && n->device.index() == device_id) {
+      resident_bytes += n->byte_size;
+      device_nodes.push_back(n);
+    }
+  }
+
+  std::vector<NodePtr> reserved;
+  std::int64_t remaining = resident_bytes;
+  for (auto& n : device_nodes) {
+    if (remaining <= target_bytes) break;
+    if (excluded.count(n.get()) != 0) continue;
+    if (n->pending_dispatches.load(std::memory_order_acquire) != 0) continue;
+    auto expected = NodeExecState::IDLE;
+    if (!n->exec_state.compare_exchange_strong(expected,
+                                               NodeExecState::RESIZE_RESERVED,
+                                               std::memory_order_acq_rel)) {
+      continue;
+    }
+    reserved.push_back(n);
+    remaining -= n->byte_size;
+  }
+
+  if (remaining > target_bytes) {
+    for (auto& n : reserved) {
+      n->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
+    }
+    return {0,
+            device_id,
+            target_bytes,
+            resident_bytes,
+            false,
+            "pinned_or_in_flight",
+            {}};
+  }
+
+  std::lock_guard<std::mutex> lock(reservation_mutex_);
+  std::uint64_t id = next_reservation_id_++;
+  SparseVictimReservation reservation{
+      id, device_id, target_bytes, resident_bytes, true, "reserved", reserved};
+  reservations_[id] = reservation;
+  return reservation;
+}
+
+void ArcherTaskPool::CancelSparseCacheReservation(std::uint64_t id) {
+  SparseVictimReservation reservation;
+  {
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    auto it = reservations_.find(id);
+    if (it == reservations_.end()) return;
+    reservation = it->second;
+    reservations_.erase(it);
+  }
+  for (auto& n : reservation.victims) {
+    auto expected = NodeExecState::RESIZE_RESERVED;
+    n->exec_state.compare_exchange_strong(expected, NodeExecState::IDLE,
+                                          std::memory_order_acq_rel);
+  }
+}
+
+SparseCacheResizeResult ArcherTaskPool::CommitSparseCacheReservation(
+    std::uint64_t id) {
+  SparseVictimReservation reservation;
+  {
+    std::lock_guard<std::mutex> lock(reservation_mutex_);
+    auto it = reservations_.find(id);
+    if (it == reservations_.end()) {
+      return {ResizeOutcome::REJECTED, -1, 0, 0, "unknown_reservation"};
+    }
+    reservation = it->second;
+    reservations_.erase(it);
+  }
+
+  for (auto& n : reservation.victims) {
+    n->SetDevice(n->default_host);
+    n->exec_state.store(NodeExecState::IDLE, std::memory_order_release);
+  }
+
+  auto nodes = kTopologyHandle->GetSparseNodes();
+  std::int64_t resident_bytes = 0;
+  for (auto& n : nodes) {
+    if (n->device.is_cuda() && n->device.index() == reservation.device_id) {
+      resident_bytes += n->byte_size;
+    }
+  }
+
+  kTopologyHandle->SetSparseCacheLimitOverride(reservation.device_id,
+                                               reservation.target_bytes);
+
+  return {ResizeOutcome::COMMITTED, reservation.device_id,
+          reservation.target_bytes, resident_bytes, "committed"};
+}
+
+#ifdef MOE_BUILD_TESTS
+void ArcherTaskPool::SetAfterExecSnapshotHookForTest(
+    std::function<void()> hook) {
+  after_exec_snapshot_hook_for_test_ = std::move(hook);
+}
+
+std::vector<NodePtr> ArcherTaskPool::SnapshotResizeExclusionsForTest(
+    int device_id) {
+  return SnapshotResizeExclusions(device_id);
+}
+#endif

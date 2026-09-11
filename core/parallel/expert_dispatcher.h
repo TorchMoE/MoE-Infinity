@@ -84,10 +84,18 @@ class ExpertDispatcher : public base::noncopyable {
     std::uint64_t generation = 0;
     bool cache_slot_reserved = false;
     bool cache_key_inserted = false;
+    bool pending_counted_down = false;
     std::uint64_t execution_lease_id = 0;
     ResidencyVariantKey execution_key;
   } ExecArgs;
   typedef std::tuple<torch::Tensor, int, int, int> CallResult;
+
+  struct ResizeToken {
+    std::uint64_t id = 0;
+    int device_id = -1;
+    bool ready = false;
+    std::string reason;
+  };
 
   typedef struct {
     int layer_idx = -1;
@@ -272,7 +280,13 @@ class ExpertDispatcher : public base::noncopyable {
   void ClearExpertCacheCounts();
   // Read-only observability accessors; neither alters routing/dispatch.
   std::int64_t GetCacheOccupancyBytes();
+  std::int64_t GetCacheOccupancyBytes(int device_id);
   double GetCacheHitRate() const;
+
+  ResizeToken BeginMemoryResize(int device_id, int timeout_ms);
+  void EndMemoryResize(const ResizeToken& token);
+  void SetCacheLimit(int device_id, std::int64_t target_bytes,
+                     const ResizeToken& token);
   void SetExpectedQueue(int expected_pending = 0) {
     pending_.store(expected_pending);
   }
@@ -314,6 +328,9 @@ class ExpertDispatcher : public base::noncopyable {
 
  private:
   void Enqueue(CallArgs& args);
+  // Blocks while the target device's resize gate is closed, then counts one
+  // in-flight item for that device. Pairs 1:1 with the exec-worker decrement.
+  void AdmitAndCount(int device_id);
   std::vector<CallResult> Wait();
   void Start() { start_ = true; }
 
@@ -385,6 +402,18 @@ class ExpertDispatcher : public base::noncopyable {
   std::atomic<bool> main_thread_stop_flag_;
 
   std::atomic<size_t> pending_;
+
+  // Per-device admission gate and drain counters for memory resize. Enqueue()
+  // blocks on resize_cv_ while a device's gate is closed so no new fetch/exec
+  // work is dropped during a maintenance window.
+  std::vector<std::uint8_t> admissions_paused_;
+  std::vector<std::int64_t> pending_by_device_;
+  std::vector<std::int64_t> active_fetch_workers_;
+  std::vector<std::int64_t> active_exec_workers_;
+  std::vector<std::int64_t> cache_limit_bytes_;
+  std::mutex resize_mutex_;
+  std::condition_variable resize_cv_;
+  std::uint64_t next_resize_token_id_ = 1;
 
   // Passive counters for GetCacheHitRate(); reset by ClearExpertCacheCounts().
   std::atomic<std::uint64_t> cache_hit_count_{0};

@@ -10,8 +10,6 @@ import torch
 ROOT = str(Path(__file__).resolve().parents[3])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
-_ = sys.modules.pop("moe_infinity", None)
-_ = sys.modules.pop("moe_infinity.serving", None)
 KV_CACHE_PATH = Path(ROOT) / "moe_infinity" / "serving" / "kv_cache.py"
 
 

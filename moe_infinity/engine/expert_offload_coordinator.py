@@ -138,6 +138,7 @@ class ExpertOffloadCoordinator:
                     if expert_ids
                     else "cuda:0"
                 )
+                device_id = int(target_device.removeprefix("cuda:"))
 
         request = TransferRequest(
             transfer_id="",
@@ -145,6 +146,7 @@ class ExpertOffloadCoordinator:
             priority=priority,
             source_device="cpu",
             target_device=target_device,
+            device_id=device_id,
             tensor_id=str(layer_id),
             block_ids=list(expert_ids),
         )

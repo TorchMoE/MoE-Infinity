@@ -279,6 +279,31 @@ Repo evidence:
 - `moe_infinity/distributed/expert_executor.py`
 - `moe_infinity/memory/expert_prefetcher.py`
 - `moe_infinity/runtime/attention_backend.py`
+# Adaptive expert/KV memory
+
+`adaptive_memory_enabled` is an opt-in controller and defaults to `false`.
+The static `device_memory_ratio` and `kv_cache_memory_ratio` remain the fallback
+contract. The bounded startup-only knobs are
+`adaptive_memory_interval_steps`, `adaptive_memory_cooldown_steps`,
+`adaptive_memory_ewma_alpha`, `adaptive_memory_hysteresis_ratio`,
+`adaptive_memory_max_resize_step_bytes`,
+`adaptive_memory_min_expert_cache_bytes`,
+`adaptive_memory_min_kv_cache_blocks`,
+`adaptive_memory_free_reserve_bytes`, and `adaptive_memory_failure_limit`.
+Only the enable flag is hot reloadable; changing another policy knob requires a
+restart.
+
+Every target leaves the configured free-memory reserve untouched and obeys the
+per-device expert/KV minima and maximum resize step. A device without a KV
+backend reports a hold rather than borrowing another GPU's capacity.
+
+Serving KV resize treats `_kv_cache`, `_fi_prefill`, and `_fi_decode` as one
+transactional bundle. The independent prefill and decode wrappers are rebuilt
+and freshly planned for the new page count. Old storage and wrappers remain
+strongly referenced until a post-publication CUDA event completes; a failed
+constructor or first plan restores the complete old bundle. The native path
+likewise recreates both built-in KV stores, the FlashInfer store, and both
+wrappers without changing dtype or layout.
 
 ## Asynchronous hierarchical KV swap
 

@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -116,3 +117,49 @@ def test_attention_backend_is_runtime_checkable():
 
     backend = PlaceholderAttentionBackend()
     assert isinstance(backend, AttentionBackend)
+
+
+class _FakeEvent:
+    def __init__(self, complete: bool) -> None:
+        self.complete = complete
+
+    def query(self) -> bool:
+        return self.complete
+
+
+def test_paged_backend_resize_requires_synchronized_receipt_and_recreates_stores():
+    from moe_infinity.engine.memory_resize import ResizeReceipt
+    from moe_infinity.runtime.attention_backend import PagedAttentionBackend
+    from moe_infinity.runtime.attention_types import KVCacheSpec
+
+    backend = PagedAttentionBackend(
+        KVCacheSpec(2, 8, torch.float32, 4), 8, torch.device("cpu")
+    )
+    old_k, old_v = backend.k_cache, backend.v_cache
+    pending = ResizeReceipt(
+        device_id=0,
+        request_queues_drained=True,
+        dispatch_queues_drained=True,
+        cuda_events=(_FakeEvent(False),),
+        admissions_paused=True,
+    )
+    with pytest.raises(RuntimeError, match="synchronized"):
+        backend.resize_num_blocks(0, 4, pending)
+    assert backend.k_cache is old_k and backend.v_cache is old_v
+
+    receipt = ResizeReceipt(
+        device_id=0,
+        request_queues_drained=True,
+        dispatch_queues_drained=True,
+        cuda_events=(_FakeEvent(True),),
+        admissions_paused=True,
+    )
+    backend.resize_num_blocks(0, 4, receipt)
+    assert backend.k_cache is not old_k and backend.v_cache is not old_v
+    assert backend.k_cache.shape[0] == backend.v_cache.shape[0] == 4
+    assert backend.k_cache.dtype == old_k.dtype
+    assert backend.v_cache.dtype == old_v.dtype
+    assert backend.k_cache.device == old_k.device
+    assert backend.v_cache.device == old_v.device
+    assert backend.k_cache.stride() == old_k.stride()
+    assert backend.v_cache.stride() == old_v.stride()

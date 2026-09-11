@@ -794,6 +794,38 @@ def _format_prometheus_metrics(stats: dict[str, object]) -> str:
     lines.append("# HELP moe_engine_steps_total Total engine steps")
     lines.append("# TYPE moe_engine_steps_total counter")
     lines.append(f"moe_engine_steps_total {stats.get('num_steps', 0)}")
+    memory = stats.get("memory", {})
+    adaptive = memory.get("adaptive", {}) if isinstance(memory, dict) else {}
+    devices = adaptive.get("devices", {}) if isinstance(adaptive, dict) else {}
+    metric_fields = (
+        ("moe_adaptive_memory_enabled", "enabled", True),
+        ("moe_adaptive_memory_fallback_static", "fallback_static", True),
+        (
+            "moe_adaptive_memory_expert_target_bytes",
+            "expert_target_bytes",
+            False,
+        ),
+        ("moe_adaptive_memory_kv_target_blocks", "kv_target_blocks", False),
+        ("moe_adaptive_memory_resize_attempts_total", "resize_attempts", False),
+        ("moe_adaptive_memory_resize_failures_total", "resize_failures", False),
+        (
+            "moe_adaptive_memory_reserve_rejections_total",
+            "reserve_rejections",
+            False,
+        ),
+        ("moe_adaptive_memory_expert_miss_cost", "expert_miss_cost", False),
+        ("moe_adaptive_memory_kv_pressure_cost", "kv_pressure_cost", False),
+    )
+    if isinstance(devices, dict):
+        for device_id in sorted(devices, key=lambda value: int(value)):
+            state = devices[device_id]
+            if not isinstance(state, dict):
+                continue
+            for metric, field, boolean in metric_fields:
+                value = state.get(field, 0)
+                if boolean:
+                    value = int(bool(value))
+                lines.append(f'{metric}{{device="{device_id}"}} {value}')
 
     policy = stats.get("expert_policy")
     if isinstance(policy, dict):

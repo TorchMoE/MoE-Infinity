@@ -150,6 +150,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("abort_derivative_overlay",
            &ArcherPrefetchHandle::AbortDerivativeOverlay)
       .def("clean_up_resources", &ArcherPrefetchHandle::CleanUpResources)
+      .def("resize_expert_cache", &ArcherPrefetchHandle::ResizeExpertCache,
+           py::arg("device_id"), py::arg("target_bytes"))
+      .def("get_expert_cache_limit", &ArcherPrefetchHandle::GetExpertCacheLimit,
+           py::arg("device_id"))
+      .def("begin_memory_resize", &ArcherPrefetchHandle::BeginMemoryResize,
+           py::arg("device_id"), py::arg("timeout_ms"))
+      .def("end_memory_resize", &ArcherPrefetchHandle::EndMemoryResize,
+           py::arg("token"))
       .def("configure_phase_policy",
            &ArcherPrefetchHandle::ConfigureExpertPolicy, py::arg("enabled"),
            py::arg("prefill_admission"), py::arg("decode_admission"),
@@ -166,6 +174,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Fused GeLU-tanh(gate) * up");
   m.def("fatrelu_and_mul", &fatrelu_and_mul, "Fused FatReLU(gate) * up");
 
+  py::class_<ExpertDispatcher::ResizeToken>(m, "expert_resize_token")
+      .def_readonly("id", &ExpertDispatcher::ResizeToken::id)
+      .def_readonly("device_id", &ExpertDispatcher::ResizeToken::device_id)
+      .def_readonly("ready", &ExpertDispatcher::ResizeToken::ready)
+      .def_readonly("reason", &ExpertDispatcher::ResizeToken::reason);
   py::class_<ExpertComputeSample>(m, "expert_compute_sample")
       .def_readonly("invocation_id", &ExpertComputeSample::invocation_id)
       .def_readonly("layer_id", &ExpertComputeSample::layer_id)
@@ -208,8 +221,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("clear_expert_cache_counts",
            &ExpertDispatcher::ClearExpertCacheCounts)
       .def("get_cache_occupancy_bytes",
-           &ExpertDispatcher::GetCacheOccupancyBytes)
+           (std::int64_t(ExpertDispatcher::*)()) &
+               ExpertDispatcher::GetCacheOccupancyBytes)
+      .def("get_cache_occupancy_bytes",
+           (std::int64_t(ExpertDispatcher::*)(int)) &
+               ExpertDispatcher::GetCacheOccupancyBytes,
+           py::arg("device_id"))
       .def("get_cache_hit_rate", &ExpertDispatcher::GetCacheHitRate)
+      .def("begin_memory_resize", &ExpertDispatcher::BeginMemoryResize,
+           py::arg("device_id"), py::arg("timeout_ms"))
+      .def("end_memory_resize", &ExpertDispatcher::EndMemoryResize,
+           py::arg("token"))
+      .def("set_cache_limit", &ExpertDispatcher::SetCacheLimit,
+           py::arg("device_id"), py::arg("target_bytes"), py::arg("token"))
       .def("register_expert_variant", &ExpertDispatcher::RegisterExpertVariant)
       .def("set_precision_targets", &ExpertDispatcher::SetPrecisionTargets,
            py::arg("targets"), py::arg("epoch"))

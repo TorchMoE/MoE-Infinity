@@ -4,6 +4,9 @@
 // EfficientMoE Team
 
 #include "expert_dispatcher.h"
+#include <algorithm>
+#include <chrono>
+#include <thread>
 #include <optional>
 #include "aio/archer_tensor_index.h"
 #include "common/pytorch.h"
@@ -321,6 +324,12 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
       modules_(kNumDevices() * num_threads, nullptr) {
   main_thread_stop_flag_.store(false);
 
+  admissions_paused_.assign(kNumDevices(), 0);
+  pending_by_device_.assign(kNumDevices(), 0);
+  active_fetch_workers_.assign(kNumDevices(), 0);
+  active_exec_workers_.assign(kNumDevices(), 0);
+  cache_limit_bytes_.assign(kNumDevices(), -1);
+
   gpu_overload_ = std::make_unique<std::atomic<bool>[]>(kNumDevices());
   for (int i = 0; i < kNumDevices(); ++i) {
     gpu_overload_[i].store(false);
@@ -337,8 +346,9 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
     threads_.emplace_back(new base::Thread(thread_func, thread_name));
     threads_.back()->start();
 
-    auto cache_limit =
-        kTopologyHandle->GetSparseCacheLimit(torch::Device(torch::kCUDA, i));
+    auto cache_limit = kTopologyHandle ? kTopologyHandle->GetSparseCacheLimit(
+                                             torch::Device(torch::kCUDA, i))
+                                       : static_cast<std::int64_t>(-1);
     cache_sizes_.push_back(cache_limit);
   }
 
@@ -588,6 +598,21 @@ void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id,
   Enqueue(args);
 }
 
+void ExpertDispatcher::AdmitAndCount(int device_id) {
+  if (device_id < 0 ||
+      device_id >= static_cast<int>(admissions_paused_.size())) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(resize_mutex_);
+  resize_cv_.wait(lock, [&] {
+    return main_thread_stop_flag_.load(std::memory_order_acquire) ||
+           admissions_paused_[device_id] == 0;
+  });
+  if (!main_thread_stop_flag_.load(std::memory_order_acquire)) {
+    pending_by_device_[device_id] += 1;
+  }
+}
+
 void ExpertDispatcher::Enqueue(CallArgs& args) {
 #ifndef NVTX_DISABLE
   nvtx3::scoped_range r("expert_enqueue");
@@ -609,6 +634,7 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
             1, std::memory_order_acq_rel);
         args.wait_for_prefetch = true;
         args.gpu_id = expert_node->node->default_device.index();
+        AdmitAndCount(args.gpu_id);
         input_queue_[args.gpu_id].Push(args);
         return;
       }
@@ -662,10 +688,12 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
 
     // std::unique_lock<std::mutex> lock(exec_mutex_[args.gpu_id]);
     // exec_queue_[args.gpu_id].push_back(std::move(exec_args));
+    AdmitAndCount(args.gpu_id);
     exec_queue_[args.gpu_id].Push(exec_args);
   } else {
     // std::unique_lock<std::mutex> lock(input_mutex_[args.gpu_id]);
     // input_queue_[args.gpu_id].push_back(std::move(args));
+    AdmitAndCount(args.gpu_id);
     input_queue_[args.gpu_id].Push(args);
   }
   // input_cv_[args.gpu_id].notify_all();
@@ -743,6 +771,147 @@ std::int64_t ExpertDispatcher::GetCacheOccupancyBytes() {
     }
   }
   return total;
+}
+
+std::int64_t ExpertDispatcher::GetCacheOccupancyBytes(int device_id) {
+  std::int64_t total = 0;
+  if (device_id < 0 || device_id >= static_cast<int>(cached_experts_.size())) {
+    return total;
+  }
+  for (auto key : cached_experts_[device_id]) {
+    int layer_idx = static_cast<int>(key >> 32);
+    int expert_idx = static_cast<int>(key & 0xFFFFFFFF);
+    if (expert_idx < 0 || expert_idx >= static_cast<int>(experts_.size())) {
+      continue;
+    }
+    if (layer_idx < 0 ||
+        layer_idx >= static_cast<int>(experts_[expert_idx].size())) {
+      continue;
+    }
+    auto& expert_node = experts_[expert_idx][layer_idx];
+    if (expert_node && expert_node->node) {
+      total += expert_node->node->byte_size;
+    }
+  }
+  return total;
+}
+
+ExpertDispatcher::ResizeToken ExpertDispatcher::BeginMemoryResize(
+    int device_id, int timeout_ms) {
+  ResizeToken token;
+  token.device_id = device_id;
+  if (device_id < 0 ||
+      device_id >= static_cast<int>(admissions_paused_.size())) {
+    token.ready = false;
+    token.reason = "invalid_device";
+    return token;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(resize_mutex_);
+    admissions_paused_[device_id] = 1;
+  }
+
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  {
+    std::unique_lock<std::mutex> lock(resize_mutex_);
+    bool drained = resize_cv_.wait_until(lock, deadline, [&] {
+      return input_queue_[device_id].Empty() &&
+             exec_queue_[device_id].Empty() &&
+             pending_by_device_[device_id] == 0 &&
+             active_fetch_workers_[device_id] == 0 &&
+             active_exec_workers_[device_id] == 0;
+    });
+    if (!drained) {
+      admissions_paused_[device_id] = 0;
+      lock.unlock();
+      resize_cv_.notify_all();
+      token.ready = false;
+      token.reason = "dispatcher_drain_timeout";
+      return token;
+    }
+  }
+
+  cudaEvent_t fetch_event = nullptr;
+  cudaEventCreateWithFlags(&fetch_event, cudaEventDefault);
+  cudaEventRecord(fetch_event, fetch_streams_[device_id]);
+
+  std::vector<cudaEvent_t> exec_events;
+  for (int thread_idx = 0; thread_idx < static_cast<int>(exec_streams_.size());
+       ++thread_idx) {
+    if (thread_idx % kNumDevices() != device_id) continue;
+    cudaEvent_t exec_event = nullptr;
+    cudaEventCreateWithFlags(&exec_event, cudaEventDefault);
+    cudaEventRecord(exec_event, exec_streams_[thread_idx]);
+    exec_events.push_back(exec_event);
+  }
+
+  bool events_complete = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    bool all_done = (cudaEventQuery(fetch_event) == cudaSuccess);
+    for (auto ev : exec_events) {
+      all_done = all_done && (cudaEventQuery(ev) == cudaSuccess);
+    }
+    if (all_done) {
+      events_complete = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+
+  cudaEventDestroy(fetch_event);
+  for (auto ev : exec_events) {
+    cudaEventDestroy(ev);
+  }
+
+  if (!events_complete) {
+    std::lock_guard<std::mutex> lock(resize_mutex_);
+    admissions_paused_[device_id] = 0;
+    resize_cv_.notify_all();
+    token.ready = false;
+    token.reason = "cuda_stream_barrier_timeout";
+    return token;
+  }
+
+  std::lock_guard<std::mutex> lock(resize_mutex_);
+  token.id = next_resize_token_id_++;
+  token.ready = true;
+  token.reason = "ready";
+  return token;
+}
+
+void ExpertDispatcher::EndMemoryResize(const ResizeToken& token) {
+  if (token.device_id < 0 ||
+      token.device_id >= static_cast<int>(admissions_paused_.size())) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(resize_mutex_);
+    admissions_paused_[token.device_id] = 0;
+  }
+  resize_cv_.notify_all();
+}
+
+void ExpertDispatcher::SetCacheLimit(int device_id, std::int64_t target_bytes,
+                                     const ResizeToken& token) {
+  if (device_id < 0 ||
+      device_id >= static_cast<int>(cache_limit_bytes_.size())) {
+    return;
+  }
+  if (!token.ready || token.device_id != device_id) {
+    DLOG_FATAL(
+        "ExpertDispatcher::SetCacheLimit: requires a live same-device resize "
+        "token (device ",
+        device_id, ")");
+  }
+
+  std::lock_guard<std::mutex> lock(cache_mutex_[device_id]);
+  cache_limit_bytes_[device_id] = target_bytes;
+  std::int64_t occupancy = GetCacheOccupancyBytes(device_id);
+  std::int64_t free_bytes = std::max<std::int64_t>(0, target_bytes - occupancy);
+  (void)free_bytes;
+  cache_cv_[device_id].notify_all();
 }
 
 double ExpertDispatcher::GetCacheHitRate() const {
@@ -892,6 +1061,26 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
       break;
     }
 
+    {
+      std::lock_guard<std::mutex> lock(resize_mutex_);
+      active_fetch_workers_[gpu_id] += 1;
+      // Fetch is the first worker to handle an input-queue item, so it owns
+      // the pending decrement. Items it forwards to exec are flagged so the
+      // exec worker does not decrement a second time.
+      if (pending_by_device_[gpu_id] > 0) {
+        pending_by_device_[gpu_id] -= 1;
+      }
+    }
+    struct FetchWorkerGuard {
+      ExpertDispatcher* self;
+      int gpu_id;
+      ~FetchWorkerGuard() {
+        std::lock_guard<std::mutex> lock(self->resize_mutex_);
+        self->active_fetch_workers_[gpu_id] -= 1;
+        self->resize_cv_.notify_all();
+      }
+    } fetch_guard{this, gpu_id};
+
     FailureContext failure;
     failure.gpu_id = gpu_id;
     try {
@@ -947,6 +1136,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
           cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
           cache_access_count_.fetch_add(1, std::memory_order_relaxed);
           exec_args.transfer_event = nullptr;
+          exec_args.pending_counted_down = true;
           if (manager_enabled_ && kExpertResidencyManager != nullptr) {
             auto active = kExpertResidencyManager->ActiveGeneration(
                 gpu_id, LogicalExpertKey(layer_idx, expert_idx));
@@ -1155,6 +1345,7 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
         cache_access_count_.fetch_add(1, std::memory_order_relaxed);
         if (cache_hit) cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
         exec_args.transfer_event = transfer_done;
+        exec_args.pending_counted_down = true;
         if (manager_enabled_ && kExpertResidencyManager != nullptr) {
           auto active = kExpertResidencyManager->ActiveGeneration(
               gpu_id, LogicalExpertKey(layer_idx, expert_idx));
@@ -1187,6 +1378,26 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
     if (!exec_queue_[gpu_id].Pop(args)) {
       break;
     }
+
+    {
+      std::lock_guard<std::mutex> lock(resize_mutex_);
+      active_exec_workers_[gpu_id] += 1;
+      // Direct cache-hit items reach exec without passing through the fetch
+      // worker, so exec owns their pending decrement. Fetch-forwarded items
+      // were already decremented by the fetch worker.
+      if (!args.pending_counted_down && pending_by_device_[gpu_id] > 0) {
+        pending_by_device_[gpu_id] -= 1;
+      }
+    }
+    struct ExecWorkerGuard {
+      ExpertDispatcher* self;
+      int gpu_id;
+      ~ExecWorkerGuard() {
+        std::lock_guard<std::mutex> lock(self->resize_mutex_);
+        self->active_exec_workers_[gpu_id] -= 1;
+        self->resize_cv_.notify_all();
+      }
+    } exec_guard{this, gpu_id};
 
     if (args.expert_node == nullptr) {
       continue;

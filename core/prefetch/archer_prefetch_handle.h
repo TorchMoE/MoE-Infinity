@@ -101,6 +101,11 @@ class ArcherPrefetchHandle {
   void CleanUpResources();
   void ResetCache();
 
+  std::unordered_map<std::string, std::int64_t> ResizeExpertCache(
+      int device_id, std::int64_t target_bytes);
+  std::int64_t GetExpertCacheLimit(int device_id);
+  std::uint64_t BeginMemoryResize(int device_id, int timeout_ms);
+  void EndMemoryResize(std::uint64_t token);
   void ConfigureExpertPolicy(bool enabled, int prefill_admission,
                              int decode_admission, double prefill_weight,
                              double decode_weight, int starvation_limit);

@@ -35,6 +35,14 @@ enum class NodeExecState : uint8_t {
   IDLE = 0,
   FETCHING = 1,
   EXECUTING = 2,
+  RESIZE_RESERVED = 3,
+};
+
+enum class ResizeOutcome {
+  COMMITTED,
+  REJECTED,
+  ROLLED_BACK,
+  PARTIAL_DONOR_COMMITTED,
 };
 
 // extern cudaStream_t kCudaStreamH2D;
@@ -203,6 +211,10 @@ class ArcherTopologyHandle : public base::noncopyable {
 
   std::int64_t GetSparseCacheLimit(const torch::Device& device);
 
+  void SetSparseCacheLimitOverride(int device_id, std::int64_t limit_bytes);
+  void ClearSparseCacheLimitOverride(int device_id);
+  std::int64_t GetSparseCacheLimitOverride(int device_id) const;
+
   std::size_t GetNumberOfStages() const noexcept {
     return pipeline_.stages.size();
   }
@@ -222,8 +234,10 @@ class ArcherTopologyHandle : public base::noncopyable {
   std::unordered_map<std::size_t, std::size_t> request_time_;
   std::unordered_map<std::size_t, StagePtr> request_trace_;
   std::int64_t visit_count_ = 0;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   bool trace_enabled_ = true;
+
+  std::unordered_map<int, std::int64_t> sparse_cache_limit_override_;
 
   std::unordered_map<TensorID, NodePtr> tensor_id_to_node_;
   std::size_t next_detached_node_id_ =

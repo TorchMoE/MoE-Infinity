@@ -86,3 +86,15 @@ target_link_libraries(archer_core PUBLIC
 
 target_link_directories(archer_core PUBLIC /usr/local/cuda/lib64)
 set_target_properties(archer_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(MOE_BUILD_TESTS)
+  # MOE_BUILD_TESTS must be a public compile definition so that the
+  # test-only declarations (SetAfterExecSnapshotHookForTest,
+  # SnapshotResizeExclusionsForTest) compiled into archer_core agree with the
+  # declarations seen by the focused test target.
+  target_compile_definitions(archer_core PUBLIC MOE_BUILD_TESTS)
+  add_subdirectory(
+    ${CMAKE_SOURCE_DIR}/tests/cpp/unit/prefetch
+    ${CMAKE_BINARY_DIR}/tests/cpp/unit/prefetch
+  )
+endif()

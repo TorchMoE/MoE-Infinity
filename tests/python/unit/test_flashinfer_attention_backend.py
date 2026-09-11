@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from moe_infinity.engine.memory_resize import ResizeReceipt
 from moe_infinity.runtime import attention_backend as attention_backend_module
 from moe_infinity.runtime import flashinfer_utils
 from moe_infinity.runtime.attention_types import AttentionMetadata, KVCacheSpec
@@ -121,9 +122,7 @@ def _enable_fake_flashinfer(monkeypatch: pytest.MonkeyPatch) -> None:
         BatchDecodeWithPagedKVCacheWrapper=_FakeDecodeWrapper,
     )
     monkeypatch.setattr(
-        attention_backend_module.flashinfer_utils,
-        "HAS_FLASHINFER",
-        True,
+        attention_backend_module.flashinfer_utils, "HAS_FLASHINFER", True
     )
     monkeypatch.setattr(
         attention_backend_module.flashinfer_utils,
@@ -133,12 +132,59 @@ def _enable_fake_flashinfer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         attention_backend_module.flashinfer_utils,
         "get_workspace",
-        lambda device: torch.empty(
-            1024,
-            dtype=torch.uint8,
-            device=device,
-        ),
+        lambda device: torch.empty(1024, dtype=torch.uint8, device=device),
     )
+
+
+class _CompleteEvent:
+    def query(self) -> bool:
+        return True
+
+
+def _resize_receipt() -> ResizeReceipt:
+    return ResizeReceipt(
+        device_id=0,
+        request_queues_drained=True,
+        dispatch_queues_drained=True,
+        cuda_events=(_CompleteEvent(),),
+        admissions_paused=True,
+    )
+
+
+def test_flashinfer_resize_recreates_store_and_both_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_fake_flashinfer(monkeypatch)
+    backend = attention_backend_module.PagedAttentionBackend(
+        spec=_spec(), num_gpu_blocks=8, device=torch.device("cpu")
+    )
+    old_store = backend._fi_kv_cache
+    old_prefill = backend._fi_prefill
+    old_decode = backend._fi_decode
+    backend.resize_num_blocks(0, 4, _resize_receipt())
+    assert backend._fi_kv_cache is not old_store
+    assert backend._fi_kv_cache is not None
+    assert backend._fi_kv_cache.shape[0] == 4
+    assert backend._fi_prefill is not old_prefill
+    assert backend._fi_decode is not old_decode
+    assert backend._fi_prefill is not backend._fi_decode
+
+    backend.forward(
+        query=torch.randn(4, 4, 8),
+        key=torch.randn(4, 2, 8),
+        value=torch.randn(4, 2, 8),
+        attention_metadata=_prefill_metadata(4),
+    )
+    backend.forward(
+        query=torch.randn(1, 4, 8),
+        key=torch.randn(1, 2, 8),
+        value=torch.randn(1, 2, 8),
+        attention_metadata=_decode_metadata(4),
+    )
+    assert backend._fi_prefill.plan_args is not None
+    assert max(backend._fi_prefill.plan_args[0][2].tolist()) < 4
+    assert backend._fi_decode.plan_args is not None
+    assert max(backend._fi_decode.plan_args[0][1].tolist()) < 4
 
 
 def test_flashinfer_kv_cache_layout_nhd_with_mocked_module(

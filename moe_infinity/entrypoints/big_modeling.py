@@ -430,6 +430,8 @@ class MoE:
         )
         num_cpu_blocks = max(32, num_gpu_blocks * 2)
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device_id = int(device.index or 0)
         from moe_infinity.models.deepseek_mla_attention import (
             is_deepseek_mla_eligible,
         )
@@ -445,6 +447,7 @@ class MoE:
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=kv_spec.block_size,
+            device_id=device_id,
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mla_cache = None
@@ -527,6 +530,7 @@ class MoE:
         scheduler = Scheduler(
             kv_cache_manager=kv_cache_manager,
             transfer_scheduler=transfer_scheduler,
+            device_id=device_id,
         )
 
         generation_engine = GenerationEngine(

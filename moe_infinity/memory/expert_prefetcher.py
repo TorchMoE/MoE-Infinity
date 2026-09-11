@@ -253,6 +253,22 @@ class ExpertPrefetcher(object):
                 return 0.0
         return 0.0
 
+    def resize_cache(
+        self, device_id: int, target_bytes: int
+    ) -> Dict[str, object]:
+        engine = self.archer_engine
+        if engine is None:
+            raise RuntimeError(
+                "resize_cache requires an initialized archer engine"
+            )
+        resize = getattr(engine, "resize_expert_cache", None)
+        if not callable(resize):
+            raise RuntimeError(
+                "archer engine does not expose resize_expert_cache"
+            )
+        result = resize(int(device_id), int(target_bytes))
+        return dict(result)
+
     def get_policy_stats(self) -> Dict[str, int]:
         # Reads exactly one ExpertResidencyManager::Snapshot() via the handle.
         # Must NOT merge dispatcher and scheduler totals: both are clients of

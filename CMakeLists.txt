@@ -40,6 +40,12 @@ endif()
 
 find_package(OpenMP REQUIRED)
 
+option(MOE_BUILD_TESTS "Build MoE-Infinity native unit tests" OFF)
+if(MOE_BUILD_TESTS)
+  include(CTest)
+  enable_testing()
+  find_package(GTest REQUIRED)
+endif()
 option(MOE_BUILD_TESTS "Build native unit tests" OFF)
 
 add_subdirectory(core)

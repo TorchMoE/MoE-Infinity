@@ -25,6 +25,8 @@ def _ensure_package(name: str, path: Path) -> None:
 
 
 def _load_module(module_name: str, file_path: Path) -> types.ModuleType:
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -69,6 +71,7 @@ _ = _load_module(
     ROOT / "moe_infinity" / "serving" / "engine.py",
 )
 
+from moe_infinity.memory.adaptive_memory import ResizeOutcome, ResizeResult
 from moe_infinity.runtime.attention_backend import (  # type: ignore[reportMissingImports]
     PagedAttentionBackend,
 )
@@ -280,13 +283,61 @@ def _make_config() -> dict[str, object]:
 
 def _make_engine(
     tokenizer: Optional[object] = None,
+    *,
+    adaptive: bool = False,
+    interval_steps: int = 64,
+    device_count: int = 1,
 ) -> ContinuousBatchingEngine:
+    config = _make_config()
+    config.update(
+        {
+            "adaptive_memory_enabled": adaptive,
+            "adaptive_memory_interval_steps": interval_steps,
+            "adaptive_memory_device_count_for_test": device_count,
+        }
+    )
     return ContinuousBatchingEngine(
         model=MockModel(),
         engine=MockOffloadEngine(),
-        config=_make_config(),
+        config=config,
         tokenizer=tokenizer,
     )
+
+
+def test_engine_ticks_controller_only_at_safe_interval() -> None:
+    engine = _make_engine(adaptive=True, interval_steps=4)
+    engine.memory_controller = Mock()
+    for _ in range(3):
+        engine.step()
+    engine.memory_controller.propose.assert_not_called()
+    engine.step()
+    engine.memory_controller.propose.assert_called_once()
+
+
+def test_stats_expose_last_committed_split_and_failures() -> None:
+    engine = _make_engine(adaptive=True, device_count=2)
+    memory = engine.get_stats()["memory"]["adaptive"]
+    assert set(memory["devices"]) == {0, 1}
+    assert {
+        "enabled",
+        "fallback_static",
+        "expert_target_bytes",
+        "kv_target_blocks",
+        "resize_attempts",
+        "resize_failures",
+        "last_reason",
+    }.issubset(memory["devices"][0])
+
+
+def test_failure_on_one_device_does_not_latch_other_device() -> None:
+    engine = _make_engine(adaptive=True, device_count=2)
+    assert engine.memory_controller is not None
+    engine.memory_controller.record_resize(
+        ResizeResult(0, ResizeOutcome.REJECTED, 512, 8, "pinned"), step=64
+    )
+    stats = engine.get_stats()["memory"]["adaptive"]["devices"]
+    assert stats[0]["resize_failures"] == 1
+    assert stats[1]["resize_failures"] == 0
 
 
 def test_shutdown_closes_cuda_graph_runner_once() -> None:

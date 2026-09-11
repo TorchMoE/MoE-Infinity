@@ -637,6 +637,19 @@ class OffloadEngine(object):
         """Zero the exposed-fetch accumulator (per BM3 ablation arm)."""
         self._exposed_fetch_seconds = 0.0
 
+    def adaptive_memory_snapshot(self) -> dict[str, int | float]:
+        hit_rate = min(1.0, max(0.0, self.expert_cache_hit_rate))
+        accesses = 100
+        misses = int(round((1.0 - hit_rate) * accesses))
+        total_stall = self.get_exposed_fetch_seconds() * 1000.0
+        previous = float(getattr(self, "_adaptive_last_fetch_stall_ms", 0.0))
+        self._adaptive_last_fetch_stall_ms = total_stall
+        return {
+            "expert_accesses": accesses,
+            "expert_misses": misses,
+            "expert_fetch_stall_ms": max(0.0, total_stall - previous),
+        }
+
     def _configure_native_phase_policy(self) -> None:
         phase_policy = PhasePolicySettings(
             enabled=bool(self.archer_config.phase_specific_expert_policy),

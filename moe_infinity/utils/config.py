@@ -114,6 +114,16 @@ class ArcherConfig:
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
         },
     )
+    adaptive_memory_enabled: bool = False
+    adaptive_memory_interval_steps: int = 64
+    adaptive_memory_cooldown_steps: int = 256
+    adaptive_memory_ewma_alpha: float = 0.20
+    adaptive_memory_hysteresis_ratio: float = 0.15
+    adaptive_memory_max_resize_step_bytes: int = 256 * 1024**2
+    adaptive_memory_min_expert_cache_bytes: int = 512 * 1024**2
+    adaptive_memory_min_kv_cache_blocks: int = 128
+    adaptive_memory_free_reserve_bytes: int = 1024 * 1024**2
+    adaptive_memory_failure_limit: int = 3
     phase_specific_expert_policy: bool = field(
         default=False,
         metadata={
@@ -403,6 +413,25 @@ class ArcherConfig:
         if self.device_memory_ratio + self.kv_cache_memory_ratio > 1.0:
             raise ValueError(
                 f"device_memory_ratio ({self.device_memory_ratio}) + kv_cache_memory_ratio ({self.kv_cache_memory_ratio}) > 1.0"
+            )
+        positive_adaptive = (
+            "adaptive_memory_interval_steps",
+            "adaptive_memory_cooldown_steps",
+            "adaptive_memory_max_resize_step_bytes",
+            "adaptive_memory_min_expert_cache_bytes",
+            "adaptive_memory_min_kv_cache_blocks",
+            "adaptive_memory_free_reserve_bytes",
+            "adaptive_memory_failure_limit",
+        )
+        for name in positive_adaptive:
+            value = getattr(self, name)
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if not 0.0 < self.adaptive_memory_ewma_alpha <= 1.0:
+            raise ValueError("adaptive_memory_ewma_alpha must be in (0, 1]")
+        if not 0.0 <= self.adaptive_memory_hysteresis_ratio <= 1.0:
+            raise ValueError(
+                "adaptive_memory_hysteresis_ratio must be in [0, 1]"
             )
 
         if self.adaptive_expert_precision:

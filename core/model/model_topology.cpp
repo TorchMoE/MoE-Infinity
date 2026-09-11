@@ -887,6 +887,14 @@ NodeBodyPtr ArcherTopologyHandle::GetNodeBodyFromCorrID(
 
 std::int64_t ArcherTopologyHandle::GetSparseCacheLimit(
     const torch::Device& device) {
+  if (device.is_cuda()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = sparse_cache_limit_override_.find(device.index());
+    if (it != sparse_cache_limit_override_.end()) {
+      return it->second;
+    }
+  }
+
   std::int64_t dense_cache_size = 0;
   for (auto& stage : pipeline_.stages) {
     for (auto& node_body : stage->nodes) {
@@ -904,6 +912,24 @@ std::int64_t ArcherTopologyHandle::GetSparseCacheLimit(
   std::int64_t sparse_cache_size = device_size_limit - dense_cache_size;
 
   return sparse_cache_size;
+}
+
+void ArcherTopologyHandle::SetSparseCacheLimitOverride(
+    int device_id, std::int64_t limit_bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  sparse_cache_limit_override_[device_id] = limit_bytes;
+}
+
+void ArcherTopologyHandle::ClearSparseCacheLimitOverride(int device_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  sparse_cache_limit_override_.erase(device_id);
+}
+
+std::int64_t ArcherTopologyHandle::GetSparseCacheLimitOverride(
+    int device_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = sparse_cache_limit_override_.find(device_id);
+  return (it == sparse_cache_limit_override_.end()) ? -1 : it->second;
 }
 
 std::tuple<std::size_t, std::size_t>
