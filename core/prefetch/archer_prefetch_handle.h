@@ -32,6 +32,16 @@ class ArcherPrefetchHandle {
   void EnqueuePrefetchTensors(const std::vector<std::uint32_t>& tensor_ids,
                               std::uint32_t priority = kRouteAheadPriority);
 
+  PrefetchAdmission SchedulePrefetchTensors(
+      const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
+      std::uint64_t generation, std::int64_t layer_id,
+      std::int64_t max_inflight_bytes);
+  std::int64_t CancelPrefetchGeneration(
+      std::uint64_t generation, std::int64_t layer_id,
+      const std::vector<std::uint32_t>& keep_tensor_ids);
+  std::vector<PrefetchSample> DrainPrefetchSamples();
+  std::int64_t GetInflightPrefetchBytes();
+
   void OffloadTensor(torch::Tensor& tensor, const std::uint32_t tensor_id);
   void RegisterTensor(torch::Tensor& tensor, const std::uint32_t tensor_id);
   void RegisterModule(torch::nn::Module& module);

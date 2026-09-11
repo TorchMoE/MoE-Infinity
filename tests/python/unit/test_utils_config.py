@@ -111,6 +111,52 @@ def test_native_engine_autocorrects_kv_cache_ratio(monkeypatch):
     assert config.kv_cache_memory_ratio == pytest.approx(0.15)
 
 
+def test_overlap_prefetch_defaults_are_safe(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    c = ArcherConfig(offload_path="/tmp", use_native_engine=False)
+    assert c.overlap_prefetch_policy == "off"
+    assert c.overlap_prefetch_ewma_alpha == pytest.approx(0.2)
+    assert c.overlap_prefetch_safety_factor == pytest.approx(0.8)
+    assert c.overlap_prefetch_cold_start_experts == 1
+    assert c.overlap_prefetch_max_window_bytes == 256 * 1024 * 1024
+    assert c.overlap_prefetch_max_inflight_bytes == 512 * 1024 * 1024
+    assert c.gpu_only_expert_routing is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("overlap_prefetch_policy", "fast"),
+        ("overlap_prefetch_ewma_alpha", 0.0),
+        ("overlap_prefetch_safety_factor", 1.1),
+        ("overlap_prefetch_cold_start_experts", -1),
+        ("overlap_prefetch_max_window_bytes", -1),
+    ],
+)
+def test_overlap_prefetch_rejects_invalid_values(monkeypatch, field, value):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(ValueError, match=field):
+        ArcherConfig(
+            offload_path="/tmp",
+            use_native_engine=False,
+            **{field: value},
+        )
+
+
+@pytest.mark.parametrize("policy", ["observe", "enforce"])
+def test_overlap_prefetch_rejects_gpu_only_routing(monkeypatch, policy):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(ValueError, match="gpu_only_expert_routing"):
+        ArcherConfig.load_from_json(
+            {
+                "offload_path": "/tmp",
+                "use_native_engine": False,
+                "gpu_only_expert_routing": True,
+                "overlap_prefetch_policy": policy,
+            }
+        )
+
+
 def test_gpu_only_expert_routing_defaults_off(monkeypatch):
     monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     config = ArcherConfig(offload_path="/tmp", use_native_engine=False)
@@ -129,7 +175,8 @@ def test_gpu_only_expert_routing_loads_from_json(monkeypatch):
     assert config.gpu_only_expert_routing is True
 
 
-def test_gpu_routing_rejects_current_overlap_boolean(monkeypatch):
+@pytest.mark.parametrize("policy", ["observe", "enforce"])
+def test_gpu_routing_rejects_current_overlap_boolean(monkeypatch, policy):
     monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     with pytest.raises(
         ValueError,
@@ -139,8 +186,19 @@ def test_gpu_routing_rejects_current_overlap_boolean(monkeypatch):
             offload_path="/tmp",
             use_native_engine=False,
             gpu_only_expert_routing=True,
-            speculative_prefetch_overlap=True,
+            overlap_prefetch_policy=policy,
         )
+
+
+def test_gpu_only_routing_is_independent_when_overlap_is_off(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    c = ArcherConfig(
+        offload_path="/tmp",
+        use_native_engine=False,
+        gpu_only_expert_routing=True,
+        overlap_prefetch_policy="off",
+    )
+    assert c.gpu_only_expert_routing is True
 
 
 @pytest.mark.parametrize("mode", ["observe", "enforce"])

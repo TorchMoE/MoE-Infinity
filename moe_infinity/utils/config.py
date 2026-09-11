@@ -113,6 +113,42 @@ class ArcherConfig:
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
         },
     )
+    overlap_prefetch_policy: str = field(
+        default="off",
+        metadata={
+            "help": "off, observe, or enforce overlap-window byte admission for speculative expert prefetch."
+        },
+    )
+    overlap_prefetch_ewma_alpha: float = field(
+        default=0.2,
+        metadata={
+            "help": "EWMA smoothing factor in (0, 1] for compute/bandwidth/queue/issue calibration."
+        },
+    )
+    overlap_prefetch_safety_factor: float = field(
+        default=0.8,
+        metadata={
+            "help": "Fraction in (0, 1] of measured compute time usable as the transfer overlap window."
+        },
+    )
+    overlap_prefetch_cold_start_experts: int = field(
+        default=1,
+        metadata={
+            "help": "Max experts admitted before both a compute and a transfer sample exist."
+        },
+    )
+    overlap_prefetch_max_window_bytes: int = field(
+        default=256 * 1024 * 1024,
+        metadata={
+            "help": "Upper bound on the per-layer admitted prefetch window in bytes."
+        },
+    )
+    overlap_prefetch_max_inflight_bytes: int = field(
+        default=512 * 1024 * 1024,
+        metadata={
+            "help": "Upper bound on outstanding speculative prefetch bytes."
+        },
+    )
     kv_cache_format: str = field(
         default="native",
         metadata={
@@ -258,6 +294,49 @@ class ArcherConfig:
                 f"device_memory_ratio ({self.device_memory_ratio}) + kv_cache_memory_ratio ({self.kv_cache_memory_ratio}) > 1.0"
             )
 
+        valid_policies = ("off", "observe", "enforce")
+        if self.overlap_prefetch_policy not in valid_policies:
+            raise ValueError(
+                f"overlap_prefetch_policy must be one of {valid_policies}, got {self.overlap_prefetch_policy!r}"
+            )
+        if not 0.0 < self.overlap_prefetch_ewma_alpha <= 1.0:
+            raise ValueError(
+                f"overlap_prefetch_ewma_alpha must be in (0, 1], got {self.overlap_prefetch_ewma_alpha}"
+            )
+        if not 0.0 < self.overlap_prefetch_safety_factor <= 1.0:
+            raise ValueError(
+                f"overlap_prefetch_safety_factor must be in (0, 1], got {self.overlap_prefetch_safety_factor}"
+            )
+        if self.overlap_prefetch_cold_start_experts < 0:
+            raise ValueError(
+                f"overlap_prefetch_cold_start_experts must be >= 0, got {self.overlap_prefetch_cold_start_experts}"
+            )
+        if self.overlap_prefetch_max_window_bytes < 0:
+            raise ValueError(
+                f"overlap_prefetch_max_window_bytes must be >= 0, got {self.overlap_prefetch_max_window_bytes}"
+            )
+        if self.overlap_prefetch_max_inflight_bytes < 0:
+            raise ValueError(
+                f"overlap_prefetch_max_inflight_bytes must be >= 0, got {self.overlap_prefetch_max_inflight_bytes}"
+            )
+        if (
+            self.overlap_prefetch_policy == "enforce"
+            and self.overlap_prefetch_max_window_bytes
+            > self.overlap_prefetch_max_inflight_bytes
+        ):
+            raise ValueError(
+                f"overlap_prefetch_max_window_bytes ({self.overlap_prefetch_max_window_bytes}) must be <= "
+                f"overlap_prefetch_max_inflight_bytes ({self.overlap_prefetch_max_inflight_bytes}) when policy is enforce"
+            )
+        if (
+            self.gpu_only_expert_routing
+            and self.overlap_prefetch_policy != "off"
+        ):
+            raise ValueError(
+                "gpu_only_expert_routing cannot be combined with overlap "
+                "prefetch (overlap_prefetch_policy=observe|enforce) in the "
+                "first release"
+            )
         from moe_infinity.runtime.kv_cache_format import KVCacheFormat
 
         KVCacheFormat.parse(self.kv_cache_format)

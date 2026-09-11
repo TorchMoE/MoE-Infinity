@@ -277,6 +277,46 @@ void ArcherPrefetchHandle::EnqueuePrefetchTensors(
   }
 }
 
+PrefetchAdmission ArcherPrefetchHandle::SchedulePrefetchTensors(
+    const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
+    std::uint64_t generation, std::int64_t layer_id,
+    std::int64_t max_inflight_bytes) {
+  if (priority == kOnDemandPriority) {
+    return PrefetchAdmission{};
+  }
+  std::vector<std::pair<NodePtr, std::int64_t>> costed_nodes;
+  std::unordered_set<std::size_t> seen_node_ids;
+  for (std::uint32_t tensor_id : tensor_ids) {
+    auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
+    if (node == nullptr) continue;
+    if (!seen_node_ids.insert(node->id).second) continue;
+    costed_nodes.emplace_back(node, node->byte_size);
+  }
+  return kTaskPool->AdmitPrefetchTasks(costed_nodes, priority, generation,
+                                       layer_id, max_inflight_bytes);
+}
+
+std::int64_t ArcherPrefetchHandle::CancelPrefetchGeneration(
+    std::uint64_t generation, std::int64_t layer_id,
+    const std::vector<std::uint32_t>& keep_tensor_ids) {
+  std::unordered_set<std::uint32_t> keep_node_ids;
+  for (std::uint32_t tensor_id : keep_tensor_ids) {
+    auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
+    if (node != nullptr) {
+      keep_node_ids.insert(static_cast<std::uint32_t>(node->id));
+    }
+  }
+  return kTaskPool->CancelQueuedPrefetch(generation, layer_id, keep_node_ids);
+}
+
+std::vector<PrefetchSample> ArcherPrefetchHandle::DrainPrefetchSamples() {
+  return kTaskPool->DrainPrefetchSamples();
+}
+
+std::int64_t ArcherPrefetchHandle::GetInflightPrefetchBytes() {
+  return kTaskPool->GetInflightPrefetchBytes();
+}
+
 void ArcherPrefetchHandle::FetchTensors(
     std::uint64_t& request_id, const std::vector<std::uint32_t>& buffer) {
   // std::vector<NodePtr> candidates;

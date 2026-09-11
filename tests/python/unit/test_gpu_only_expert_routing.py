@@ -111,7 +111,7 @@ def test_native_active_list_drives_existing_prefetch_correction():
     executor, dispatcher = make_executor(enabled=True)
     prefetcher = FakePrefetcher()
     executor._last_dispatch_used_native_routing = True
-    executor._pending_prefetch = (prefetcher, 7, None, None)
+    executor._pending_prefetch = (prefetcher, 7, None, None, [], None)
 
     result = executor.wait_dispatch_local()
 

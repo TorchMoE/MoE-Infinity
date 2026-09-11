@@ -596,6 +596,104 @@ void ArcherTaskPool::SetNodeDevice(const TaskPtr& task) {
   }
 }
 
+PrefetchAdmission ArcherTaskPool::AdmitPrefetchTasks(
+    const std::vector<std::pair<NodePtr, std::int64_t>>& costed_nodes,
+    std::uint32_t priority, std::uint64_t generation, std::int64_t layer_id,
+    std::int64_t max_inflight_bytes) {
+  PrefetchAdmission admission;
+  std::vector<TaskPtr> to_enqueue;
+
+  {
+    std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
+    for (const auto& entry : costed_nodes) {
+      const NodePtr& node = entry.first;
+      std::int64_t bytes = entry.second;
+      if (node == nullptr || bytes <= 0) continue;
+      auto tensor_id = static_cast<std::uint32_t>(node->id);
+      if (!prefetch_accounting_.TryAdmit(tensor_id, bytes,
+                                         max_inflight_bytes)) {
+        continue;
+      }
+      tensor_generation_[tensor_id] = generation;
+      tensor_layer_[tensor_id] = layer_id;
+
+      auto task = std::make_shared<Task>();
+      task->on_demand = false;
+      task->node = node;
+      task->priority = priority;
+      task->src_device = node->device;
+      task->dst_device = node->default_device;
+      task->request_id = 0;
+      task->generation = generation;
+      task->layer_id = layer_id;
+      task->scheduled_bytes = bytes;
+      task->enqueue_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+
+      admission.accepted_tensor_ids.push_back(tensor_id);
+      admission.accepted_bytes += bytes;
+      to_enqueue.push_back(task);
+    }
+    admission.inflight_bytes = prefetch_accounting_.inflight_bytes();
+  }
+
+  for (auto& task : to_enqueue) {
+    if (task->src_device == task->dst_device) {
+      task->node->state = 0;
+      task->node->cv.notify_all();
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(unified_mutex_);
+    unified_queue_[task->priority].push_back(task);
+  }
+
+  return admission;
+}
+
+std::int64_t ArcherTaskPool::CancelQueuedPrefetch(
+    std::uint64_t generation, std::int64_t layer_id,
+    const std::unordered_set<std::uint32_t>& keep_tensor_ids) {
+  std::int64_t canceled = 0;
+  std::lock_guard<std::mutex> account_lock(prefetch_accounting_mutex_);
+  std::lock_guard<std::mutex> queue_lock(unified_mutex_);
+  for (std::uint32_t i = 1; i < NUM_PRIORITY; ++i) {
+    auto& queue = unified_queue_[i];
+    queue.erase(
+        std::remove_if(
+            queue.begin(), queue.end(),
+            [&](const TaskPtr& t) {
+              if (t == nullptr || t->node == nullptr) return false;
+              if (t->generation != generation || t->layer_id != layer_id)
+                return false;
+              auto tensor_id = static_cast<std::uint32_t>(t->node->id);
+              if (keep_tensor_ids.count(tensor_id) > 0) return false;
+              std::int64_t bytes = prefetch_accounting_.CancelQueued(tensor_id);
+              if (bytes > 0) {
+                canceled += bytes;
+                t->node->exec_state.store(NodeExecState::IDLE,
+                                          std::memory_order_release);
+              }
+              return true;
+            }),
+        queue.end());
+  }
+  return canceled;
+}
+
+std::vector<PrefetchSample> ArcherTaskPool::DrainPrefetchSamples() {
+  std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
+  std::vector<PrefetchSample> drained;
+  drained.swap(prefetch_samples_);
+  return drained;
+}
+
+std::int64_t ArcherTaskPool::GetInflightPrefetchBytes() {
+  std::lock_guard<std::mutex> lock(prefetch_accounting_mutex_);
+  return prefetch_accounting_.inflight_bytes();
+}
+
 std::string ArcherTaskPool::DebugString(
     const std::vector<std::deque<TaskPtr>>& queue) {
   std::stringstream ss;

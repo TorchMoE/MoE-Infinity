@@ -10,7 +10,40 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 from transformers import PretrainedConfig
 
+from moe_infinity.memory.overlap_budget import (
+    Candidate,
+    OverlapBudgetController,
+)
 from moe_infinity.utils import parse_moe_param
+
+_SCHEDULER_CAPABILITY_METHODS = (
+    "schedule_prefetch_tensors",
+    "cancel_prefetch_generation",
+    "drain_prefetch_samples",
+    "get_inflight_prefetch_bytes",
+)
+_DISPATCHER_TIMING_METHODS = (
+    "set_inputs_with_invocation",
+    "set_overlap_compute_timing_enabled",
+    "drain_compute_samples",
+)
+
+
+class NativeOverlapCapabilities:
+    def __init__(self, engine: Any, dispatcher: Any):
+        self.scheduler_ready = engine is not None and all(
+            callable(getattr(engine, name, None))
+            for name in _SCHEDULER_CAPABILITY_METHODS
+        )
+        self.dispatcher_timing_ready = dispatcher is not None and all(
+            callable(getattr(dispatcher, name, None))
+            for name in _DISPATCHER_TIMING_METHODS
+        )
+
+    @property
+    def enforce_ready(self) -> bool:
+        return self.scheduler_ready and self.dispatcher_timing_ready
+
 
 # Native prefetch priority bands; must mirror core/prefetch/task_scheduler.h.
 ON_DEMAND_PRIORITY = 0
@@ -66,6 +99,11 @@ class ExpertPrefetcher(object):
         self.expert_tensor_map: Dict[Tuple[int, int], int] = {}
         self.expert_nbytes_map: Dict[Tuple[int, int], int] = {}
         self._last_speculative_prediction: Set[int] = set()
+        self.overlap_controller: Optional[OverlapBudgetController] = None
+        self._overlap_policy: str = "off"
+        self._overlap_caps: Optional[NativeOverlapCapabilities] = None
+        self._overlap_generation: int = 0
+        self._overlap_stats: Dict[str, int] = {}
 
     def set_archer_engine(self, archer_engine: Any):
         global _expert_prefetcher
@@ -286,10 +324,17 @@ class ExpertPrefetcher(object):
                 ::-1
             ].tolist()
 
+        self._last_speculative_prediction = set(topk_indices)
+        if self._overlap_active():
+            generation, _accepted = self.plan_candidates(
+                next_layer, topk_indices
+            )
+            return generation
+
         self.prefetch_experts_list(
             next_layer, topk_indices, priority=BACKGROUND_PREFETCH_PRIORITY
         )
-        self._last_speculative_prediction = set(topk_indices)
+        return None
 
     def correct_prefetch(
         self,
@@ -310,3 +355,165 @@ class ExpertPrefetcher(object):
             self.prefetch_experts_list(layer_idx, missed)
 
         self._last_speculative_prediction = set()
+
+    def configure_overlap_policy(self, config: Any) -> None:
+        policy = getattr(config, "overlap_prefetch_policy", "off")
+        self._overlap_policy = policy
+        if policy == "off":
+            self.overlap_controller = None
+            self._overlap_caps = None
+            return
+
+        self.overlap_controller = OverlapBudgetController(
+            policy=policy,
+            alpha=config.overlap_prefetch_ewma_alpha,
+            safety_factor=config.overlap_prefetch_safety_factor,
+            max_window_bytes=config.overlap_prefetch_max_window_bytes,
+            max_inflight_bytes=config.overlap_prefetch_max_inflight_bytes,
+            cold_start_experts=config.overlap_prefetch_cold_start_experts,
+        )
+        self._overlap_generation = 0
+        self._overlap_stats = {
+            "decisions": 0,
+            "native_capability_misses": 0,
+            "stale_compute_samples": 0,
+        }
+        caps = NativeOverlapCapabilities(
+            self.archer_engine, self.expert_dispatcher
+        )
+        self._overlap_caps = caps
+        if caps.dispatcher_timing_ready:
+            self.expert_dispatcher.set_overlap_compute_timing_enabled(True)
+
+    def _overlap_active(self) -> bool:
+        return (
+            getattr(self, "_overlap_policy", "off") in ("observe", "enforce")
+            and getattr(self, "overlap_controller", None) is not None
+        )
+
+    def _next_generation(self) -> int:
+        self._overlap_generation += 1
+        return self._overlap_generation
+
+    def plan_candidates(
+        self,
+        layer_id: int,
+        ranked_expert_ids: List[int],
+        scores: Optional[List[float]] = None,
+    ) -> Tuple[Optional[int], List[int]]:
+        if not self._overlap_active():
+            return None, list(ranked_expert_ids)
+
+        caps = self._overlap_caps
+        if self._overlap_policy == "observe":
+            if caps is None or not caps.scheduler_ready:
+                self._overlap_stats["native_capability_misses"] += 1
+            self._overlap_stats["decisions"] += 1
+            self.prefetch_experts_list(
+                layer_id,
+                list(ranked_expert_ids),
+                priority=BACKGROUND_PREFETCH_PRIORITY,
+            )
+            return None, list(ranked_expert_ids)
+
+        if caps is None or not caps.enforce_ready:
+            self._overlap_stats["native_capability_misses"] += 1
+            self._overlap_stats["decisions"] += 1
+            return None, []
+
+        candidates = []
+        for position, expert_id in enumerate(ranked_expert_ids):
+            score = (
+                scores[position]
+                if scores is not None and position < len(scores)
+                else float(len(ranked_expert_ids) - position)
+            )
+            nbytes = self.expert_nbytes_map.get((layer_id, expert_id))
+            candidates.append(Candidate(expert_id, score, nbytes))
+
+        inflight = int(self.archer_engine.get_inflight_prefetch_bytes())
+        decision = self.overlap_controller.admit(
+            layer_id, candidates, inflight_bytes=inflight
+        )
+        self._overlap_stats["decisions"] += 1
+        if not decision.expert_ids:
+            return None, []
+
+        generation = self._next_generation()
+        issued_nbytes = {
+            expert_id: int(self.expert_nbytes_map[(layer_id, expert_id)])
+            for expert_id in decision.expert_ids
+        }
+        self.overlap_controller.record_issue(
+            layer_id, generation, issued_nbytes
+        )
+        tensor_ids = [
+            self.expert_tensor_map[(layer_id, expert_id)]
+            for expert_id in decision.expert_ids
+        ]
+        admission = self.archer_engine.schedule_prefetch_tensors(
+            tensor_ids,
+            priority=self.route_ahead_priority,
+            generation=generation,
+            layer_id=layer_id,
+            max_inflight_bytes=self.overlap_controller.max_inflight_bytes,
+        )
+        accepted = list(getattr(admission, "accepted_tensor_ids", []) or [])
+        return generation, accepted
+
+    def correct_to_native_route(
+        self, layer_id: int, actual_expert_ids: List[int]
+    ) -> None:
+        if not self._overlap_active():
+            return
+        caps = self._overlap_caps
+        if caps is None or not caps.scheduler_ready:
+            return
+        self.drain_native_prefetch_samples()
+
+    def abort_prefetch_generations(
+        self, generations: List[int], reason: str
+    ) -> None:
+        if not self._overlap_active():
+            return
+        caps = self._overlap_caps
+        if caps is None or not caps.scheduler_ready:
+            return
+        try:
+            for generation in generations:
+                self.archer_engine.cancel_prefetch_generation(
+                    generation, -1, []
+                )
+        finally:
+            self.drain_native_prefetch_samples()
+
+    def drain_native_prefetch_samples(self) -> None:
+        if not self._overlap_active():
+            return
+        caps = self._overlap_caps
+        if caps is None or not caps.scheduler_ready:
+            return
+        self.archer_engine.drain_prefetch_samples()
+
+    def observe_compute_samples(self, samples: List[Any]) -> None:
+        if not self._overlap_active():
+            return
+        for sample in samples:
+            self.overlap_controller.observe_compute(
+                sample.layer_id,
+                sample.kernel_start_offset_ns,
+                sample.kernel_end_offset_ns,
+            )
+
+    def record_stale_compute_samples(self, count: int) -> None:
+        if not self._overlap_active():
+            return
+        self._overlap_stats["stale_compute_samples"] = self._overlap_stats.get(
+            "stale_compute_samples", 0
+        ) + int(count)
+
+    def overlap_prefetch_stats(self) -> Dict[str, Any]:
+        stats: Dict[str, Any] = dict(self._overlap_stats)
+        if self.overlap_controller is not None:
+            stats.update(self.overlap_controller.snapshot())
+        return stats
