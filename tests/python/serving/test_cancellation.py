@@ -70,7 +70,13 @@ _ = _load_module(
     ROOT / "moe_infinity" / "serving" / "engine.py",
 )
 
+from moe_infinity.engine.kv_transfer import (
+    CopyTicket,
+    KVTransferState,
+    PinnedBufferPool,
+)
 from moe_infinity.serving.engine import ContinuousBatchingEngine
+from moe_infinity.serving.kv_cache import PagedKVCache
 from moe_infinity.serving.sequence import SamplingParams
 
 
@@ -272,6 +278,150 @@ def test_no_block_leak_after_cancel() -> None:
     assert (
         engine.kv_cache.block_allocator.num_free_blocks < original_free_blocks
     )
+
+
+class _FakeEvent:
+    def __init__(self) -> None:
+        self.done = False
+
+    def query(self) -> bool:
+        return self.done
+
+    def synchronize(self) -> None:
+        self.done = True
+
+
+class _FakeAsyncBackend:
+    asynchronous = True
+
+    def __init__(self) -> None:
+        self.events: list[_FakeEvent] = []
+
+    def submit_d2h(
+        self,
+        source_cache: torch.Tensor,
+        destination: torch.Tensor,
+        *,
+        block_ids: list[int],
+        block_dim: int,
+    ) -> CopyTicket:
+        source = source_cache.index_select(
+            block_dim, torch.tensor(block_ids, dtype=torch.long)
+        )
+        destination.copy_(source)
+        event = _FakeEvent()
+        self.events.append(event)
+        return CopyTicket(
+            device=source.device,
+            stream=None,
+            event=event,
+            owned_staging_tensors=(),
+            submitted_ns=1,
+            nbytes=source.numel() * source.element_size(),
+        )
+
+    def submit_h2d(
+        self,
+        source: torch.Tensor,
+        destination_cache: torch.Tensor,
+        *,
+        block_ids: list[int],
+        block_dim: int,
+    ) -> CopyTicket:
+        destination_cache.index_copy_(
+            block_dim,
+            torch.tensor(block_ids, dtype=torch.long),
+            source,
+        )
+        event = _FakeEvent()
+        self.events.append(event)
+        return CopyTicket(
+            device=destination_cache.device,
+            stream=None,
+            event=event,
+            owned_staging_tensors=(),
+            submitted_ns=1,
+            nbytes=source.numel() * source.element_size(),
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _make_async_cache(backend: _FakeAsyncBackend) -> PagedKVCache:
+    pool = PinnedBufferPool(
+        capacity_bytes=1 << 20,
+        allocator=lambda shape, dtype: torch.empty(shape, dtype=dtype),
+    )
+    return PagedKVCache(
+        num_blocks=2,
+        block_size=4,
+        num_layers=1,
+        num_heads=1,
+        head_dim=8,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        transfer_backend=backend,
+        pinned_pool=pool,
+    )
+
+
+def test_cancel_during_d2h_holds_resources_until_event_completion() -> None:
+    backend = _FakeAsyncBackend()
+    cache = _make_async_cache(backend)
+    cache.allocate_sequence(5, num_tokens=8)
+    assert cache.request_swap_out(5)
+    assert cache.transfer_state(5) is KVTransferState.SWAP_OUT_IN_FLIGHT
+    held_lease_bytes = cache.get_swap_stats()["host_in_use_bytes"]
+
+    cache.cancel_sequence(5)
+
+    assert cache.block_allocator.num_free_blocks == 0
+    assert cache.get_swap_stats()["host_in_use_bytes"] == held_lease_bytes
+
+    assert backend.events[-1].done is False
+    assert cache.poll_transfers() == []
+    assert cache.block_allocator.num_free_blocks == 0
+    assert cache.get_swap_stats()["host_in_use_bytes"] == held_lease_bytes
+
+    backend.events[-1].done = True
+    cache.poll_transfers()
+
+    assert cache.block_allocator.num_free_blocks == 2
+    assert cache.get_swap_stats()["host_in_use_bytes"] == 0
+
+
+def test_cancel_during_h2d_holds_resources_until_event_completion() -> None:
+    backend = _FakeAsyncBackend()
+    cache = _make_async_cache(backend)
+    cache.allocate_sequence(6, num_tokens=8)
+    assert cache.request_swap_out(6)
+    backend.events[-1].done = True
+    cache.poll_transfers()
+    assert cache.request_swap_in(6)
+    assert cache.transfer_state(6) is KVTransferState.SWAP_IN_IN_FLIGHT
+
+    cache.cancel_sequence(6)
+
+    assert cache.block_allocator.num_free_blocks == 0
+
+    backend.events[-1].done = True
+    cache.poll_transfers()
+
+    assert cache.block_allocator.num_free_blocks == 2
+    assert cache.get_swap_stats()["host_in_use_bytes"] == 0
+
+
+def test_async_cache_shutdown_twice_is_safe() -> None:
+    backend = _FakeAsyncBackend()
+    cache = _make_async_cache(backend)
+    cache.allocate_sequence(8, num_tokens=8)
+    assert cache.request_swap_out(8)
+
+    cache.shutdown()
+    cache.shutdown()
+
+    assert cache.get_swap_stats()["host_in_use_bytes"] == 0
 
 
 def _make_paged_backend(

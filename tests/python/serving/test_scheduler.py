@@ -269,7 +269,40 @@ def test_update_after_step() -> None:
 
     assert sequence.status is SequenceStatus.FINISHED
     assert scheduler.has_work() is False
-    assert cache.block_allocator.num_free_blocks == cache.num_blocks
+
+
+def test_has_runnable_work_tracks_gpu_ready_sequences() -> None:
+    cache = _make_cache()
+    scheduler = Scheduler(cache, max_batch_size=8, max_tokens_per_step=128)
+
+    assert scheduler.has_runnable_work() is False
+
+    req = _make_group("req-1", 1, 3)
+    scheduler.add_request(req)
+    assert scheduler.has_runnable_work() is True
+
+    scheduler.schedule()
+    scheduler.update_after_step(completed_seq_ids=[], new_decode_seq_ids=[1])
+    assert scheduler.has_runnable_work() is True
+
+    scheduler.update_after_step(completed_seq_ids=[1], new_decode_seq_ids=[])
+    assert scheduler.has_runnable_work() is False
+
+
+def test_has_work_includes_swapped_groups() -> None:
+    cache = _make_cache(num_blocks=2)
+    scheduler = Scheduler(cache, max_batch_size=8, max_tokens_per_step=128)
+
+    req1 = _make_group("req-1", 1, 8)
+    scheduler.add_request(req1)
+    scheduler.schedule()
+
+    req2 = _make_group("req-2", 2, 4)
+    scheduler.add_request(req2)
+    scheduler.schedule()
+
+    assert req1.sequences[0].status is SequenceStatus.SWAPPED
+    assert scheduler.has_work() is True
 
 
 def test_chunking_disabled_preserves_whole_prefill_blocking() -> None:

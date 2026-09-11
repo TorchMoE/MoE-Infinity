@@ -7,7 +7,10 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
+#include <stdexcept>
 #include <torch/script.h>
+#include <utility>
 #include "common/pytorch.h"
 #include "prefetch/task_scheduler.h"
 #include "utils/logger.h"
@@ -218,4 +221,147 @@ void ArcherTensorHandle::ReadBulk(const std::string& filename, void* memory_ptr,
                                   bool on_demand, std::int64_t num_bytes,
                                   std::int64_t offset) {
   prio_aio_handle_.Read(filename, memory_ptr, on_demand, num_bytes, offset);
+}
+
+static const char* ScalarTypeToDerivativeDtype(torch::ScalarType type) {
+  switch (type) {
+    case torch::kFloat8_e4m3fn:
+      return "float8_e4m3fn";
+    case torch::kFloat:
+      return "float32";
+    case torch::kBFloat16:
+      return "bfloat16";
+    case torch::kHalf:
+      return "float16";
+    case torch::kInt:
+      return "int32";
+    case torch::kByte:
+      return "uint8";
+    default:
+      throw std::invalid_argument(
+          "unsupported canonical dtype for derivative snapshot");
+  }
+}
+
+torch::ScalarType ArcherTensorHandle::DerivativeDtypeToScalarType(
+    const std::string& dtype) const {
+  if (dtype == "float8_e4m3fn") return torch::kFloat8_e4m3fn;
+  if (dtype == "float32") return torch::kFloat;
+  if (dtype == "bfloat16") return torch::kBFloat16;
+  if (dtype == "float16") return torch::kHalf;
+  if (dtype == "int32") return torch::kInt;
+  if (dtype == "uint8") return torch::kByte;
+  throw std::invalid_argument("unknown derivative dtype: " + dtype);
+}
+
+std::vector<std::unordered_map<std::string, py::object>>
+ArcherTensorHandle::GetCanonicalTensorIndexSnapshot() const {
+  std::unique_lock<std::mutex> lock(mutex_);
+  std::vector<std::pair<std::uint32_t, const TensorStorageMeta*>> rows;
+  for (const auto& entry : *kTensorIndex) {
+    if (derivative_owned_ids_.count(entry.first) > 0) {
+      continue;
+    }
+    rows.emplace_back(entry.first, &entry.second);
+  }
+  std::sort(rows.begin(), rows.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.first < rhs.first;
+  });
+
+  std::vector<std::unordered_map<std::string, py::object>> snapshot;
+  snapshot.reserve(rows.size());
+  for (const auto& row : rows) {
+    const TensorStorageMeta& meta = *row.second;
+    std::unordered_map<std::string, py::object> py_row;
+    py_row["tensor_id"] = py::cast(static_cast<std::int64_t>(row.first));
+    py_row["dtype"] = py::cast(std::string(ScalarTypeToDerivativeDtype(
+        c10::typeMetaToScalarType(meta.options.dtype()))));
+    py_row["shape"] = py::cast(meta.shape);
+    py_row["size"] = py::cast(static_cast<std::int64_t>(meta.size));
+    py_row["file_id"] = py::cast(static_cast<std::int64_t>(meta.file_id));
+    py_row["offset"] = py::cast(static_cast<std::int64_t>(meta.offset));
+    snapshot.push_back(std::move(py_row));
+  }
+  return snapshot;
+}
+
+void ArcherTensorHandle::BeginDerivativeOverlay(
+    const std::string& generation, std::int64_t canonical_max_tensor_id,
+    std::int64_t canonical_max_file_id) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (overlay_active_) {
+    throw std::runtime_error("derivative overlay already active");
+  }
+  overlay_active_ = true;
+  overlay_generation_ = generation;
+  overlay_canonical_max_tensor_id_ = canonical_max_tensor_id;
+  overlay_canonical_max_file_id_ = canonical_max_file_id;
+  overlay_staged_.clear();
+}
+
+void ArcherTensorHandle::RegisterDerivativeTensor(
+    const std::string& generation, std::int64_t tensor_id, std::int64_t file_id,
+    std::int64_t offset, std::int64_t size,
+    const std::vector<std::int64_t>& shape, const std::string& dtype) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!overlay_active_ || overlay_generation_ != generation) {
+    throw std::runtime_error("derivative overlay is not active");
+  }
+  if (tensor_id <= overlay_canonical_max_tensor_id_) {
+    throw std::invalid_argument("derivative tensor_id not above canonical max");
+  }
+  if (file_id <= overlay_canonical_max_file_id_) {
+    throw std::invalid_argument("derivative file_id not above canonical max");
+  }
+  if (tensor_id > UINT32_MAX || file_id > UINT32_MAX) {
+    throw std::invalid_argument("derivative id exceeds uint32 range");
+  }
+  auto scalar_type = DerivativeDtypeToScalarType(dtype);
+  auto id = static_cast<std::uint32_t>(tensor_id);
+  if (kTensorIndex->find(id) != kTensorIndex->end() ||
+      overlay_staged_.find(id) != overlay_staged_.end()) {
+    throw std::invalid_argument("duplicate derivative tensor_id");
+  }
+  if (offset < 0 || (offset % kAioAlignment) != 0) {
+    throw std::invalid_argument("derivative offset is not aligned");
+  }
+  for (const auto& staged : overlay_staged_) {
+    const TensorStorageMeta& other = staged.second;
+    if (other.file_id != static_cast<std::uint32_t>(file_id)) {
+      continue;
+    }
+    std::int64_t other_begin = other.offset;
+    std::int64_t other_end =
+        other.offset + static_cast<std::int64_t>(other.size);
+    if (offset < other_end && other_begin < offset + size) {
+      throw std::invalid_argument("derivative file intervals overlap");
+    }
+  }
+  TensorStorageMeta meta{static_cast<std::uint32_t>(file_id), offset,
+                         static_cast<std::size_t>(size), shape};
+  meta.options = torch::TensorOptions().dtype(scalar_type);
+  meta.id = id;
+  overlay_staged_.emplace(id, std::move(meta));
+}
+
+void ArcherTensorHandle::CommitDerivativeOverlay(
+    const std::string& generation) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!overlay_active_ || overlay_generation_ != generation) {
+    throw std::runtime_error("derivative overlay is not active");
+  }
+  for (auto& staged : overlay_staged_) {
+    kTensorIndex->emplace(staged.first, staged.second);
+    derivative_owned_ids_.insert(staged.first);
+  }
+  overlay_staged_.clear();
+  overlay_active_ = false;
+  overlay_generation_.clear();
+}
+
+void ArcherTensorHandle::AbortDerivativeOverlay(const std::string& generation) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  overlay_staged_.clear();
+  overlay_active_ = false;
+  overlay_generation_.clear();
 }

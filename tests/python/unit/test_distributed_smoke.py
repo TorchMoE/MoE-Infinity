@@ -21,6 +21,7 @@ from moe_infinity.distributed import (
     DistributedExpertPrefetcher,
 )
 from moe_infinity.distributed.expert_executor import ExpertExecutor
+from moe_infinity.memory.expert_policy import ExpertPhase
 from moe_infinity.utils import ArcherConfig
 
 
@@ -87,7 +88,7 @@ class TestDistributedExpertExecutor:
         )
 
         prefetcher.speculative_prefetch.assert_called_once_with(
-            3, router_logits
+            3, router_logits, phase=ExpertPhase.MIXED
         )
 
     def test_trigger_speculative_prefetch_without_prefetcher_is_noop(self):

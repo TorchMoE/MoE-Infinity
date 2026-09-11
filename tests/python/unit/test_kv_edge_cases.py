@@ -55,34 +55,30 @@ def _make_scheduler(num_blocks: int = 4) -> Scheduler:
 
 
 def test_partial_swap_failure_rollback() -> None:
+    from moe_infinity.engine.kv_transfer import (
+        KVTransferState,
+        PageableCPUBufferRecord,
+    )
+
     kv_cache = _make_kv_cache()
     seq_id = 7
     kv_cache.allocate_sequence(seq_id=seq_id, num_tokens=4)
     kv_cache.swap_out(seq_id)
+    kv_cache.free_gpu_blocks(seq_id)
 
-    swapped_cpu_buffers = cast(
-        dict[int, object],
-        getattr(kv_cache, "_swapped_cpu_buffers"),
-    )
-    swapped_out_sequences = cast(
-        set[int],
-        getattr(kv_cache, "_swapped_out_sequences"),
-    )
+    record = kv_cache._kv_records[seq_id]
+    assert record.state is KVTransferState.HOST_RESIDENT
 
-    class _FaultyCpuBuffer:
-        def to(self, *args: object, **kwargs: object) -> torch.Tensor:
-            _ = (args, kwargs)
+    class _FaultyCpuBuffer(PageableCPUBufferRecord):
+        def require_tensor(self) -> torch.Tensor:
             raise RuntimeError("simulated swap_in failure")
 
-    swapped_cpu_buffers[seq_id] = _FaultyCpuBuffer()
-    before_entries = dict(swapped_cpu_buffers)
+    record.pageable_buffer = _FaultyCpuBuffer(tensor=torch.zeros(1), nbytes=0)
 
     with pytest.raises(RuntimeError, match="simulated swap_in failure"):
         kv_cache.swap_in(seq_id)
 
-    assert seq_id in before_entries
-    assert seq_id not in swapped_cpu_buffers
-    assert seq_id in swapped_out_sequences
+    assert kv_cache._kv_records[seq_id].state is KVTransferState.HOST_RESIDENT
 
 
 def test_gpu_oom_on_swap_in_handled_gracefully(monkeypatch) -> None:
@@ -108,12 +104,23 @@ def test_gpu_oom_on_swap_in_handled_gracefully(monkeypatch) -> None:
     request_map[group.request_id] = group
     sequence_map[sequence.seq_id] = sequence
 
-    def _raise_oom(_seq_id: int) -> None:
-        raise RuntimeError("CUDA out of memory")
+    from moe_infinity.serving.scheduler import (
+        SwapGroupPhase,
+        _SwappedGroupRecord,
+    )
 
-    monkeypatch.setattr(scheduler.kv_cache, "swap_in", _raise_oom)
+    scheduler._swapped_groups[group.request_id] = _SwappedGroupRecord(
+        group=group,
+        prior_status_by_seq={sequence.seq_id: SequenceStatus.DECODE},
+        phase=SwapGroupPhase.HOST_RESIDENT,
+    )
 
-    scheduler._recover_swapped_groups([group])
+    def _oom(_seq_ids: list[int]) -> None:
+        return None
+
+    monkeypatch.setattr(scheduler.kv_cache, "reserve_swap_in_group", _oom)
+
+    scheduler._recover_host_resident_groups()
 
     assert sequence.status is SequenceStatus.SWAPPED
     assert group in swapped_queue
@@ -151,30 +158,20 @@ def test_dtype_preserved_through_swap_cycle() -> None:
 
 
 def test_swap_in_with_empty_cpu_cache_noop() -> None:
+    from moe_infinity.engine.kv_transfer import KVTransferState
+
     kv_cache = _make_kv_cache()
     seq_id = 99
     kv_cache.allocate_sequence(seq_id=seq_id, num_tokens=4)
 
-    swapped_cpu_buffers_before = dict(
-        cast(dict[int, torch.Tensor], getattr(kv_cache, "_swapped_cpu_buffers"))
-    )
-    swapped_out_before = set(
-        cast(set[int], getattr(kv_cache, "_swapped_out_sequences"))
-    )
+    state_before = kv_cache.transfer_state(seq_id)
+    blocks_before = kv_cache.get_block_table(seq_id)
 
     kv_cache.swap_in(seq_id)
 
-    swapped_cpu_buffers_after = cast(
-        dict[int, torch.Tensor],
-        getattr(kv_cache, "_swapped_cpu_buffers"),
-    )
-    swapped_out_after = cast(
-        set[int],
-        getattr(kv_cache, "_swapped_out_sequences"),
-    )
-
-    assert swapped_cpu_buffers_after == swapped_cpu_buffers_before
-    assert swapped_out_after == swapped_out_before
+    assert kv_cache.transfer_state(seq_id) is state_before
+    assert kv_cache.transfer_state(seq_id) is KVTransferState.GPU_RESIDENT
+    assert kv_cache.get_block_table(seq_id) == blocks_before
 
 
 def test_capture_kv_with_none_past_kv_values_noop() -> None:

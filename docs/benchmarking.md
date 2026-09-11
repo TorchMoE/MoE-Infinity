@@ -1,5 +1,7 @@
 # Benchmarking MoE-Infinity
 
+Adaptive benchmarks use `deterministic-v1`, canonical/static-low/adaptive arms, H2D and `peak_accounted_bytes`, TTFT, TPOT p50/p90/p99, throughput, quality-attestation, five measured repetitions, and a `release_gate`; no speedup is guaranteed.
+
 This guide covers the benchmark entry points under `benchmarks/`, labels each one as a stable user workflow, contributor-only spike, helper or report tool, or excluded helper module, and keeps the TTFT vs decode guidance in one place.
 
 If you want the cross-framework comparison table, start with [Benchmark reproduction](benchmark_reproduction.md). For the expert I/O profiler flow, see [benchmarks/expert_io_microbench/README.md](../benchmarks/expert_io_microbench/README.md). For ContextPilot and DeepSeek-V4-Flash background, see [ContextPilot](contextpilot/README.md) and [DeepSeek-V4-Flash](../moe_infinity/models/deepseek_v4/README.md).
@@ -26,6 +28,39 @@ If you want the cross-framework comparison table, start with [Benchmark reproduc
 - Compare like with like: p50-to-p50 or average-to-average. Do not compare a percentile on one side with an average on the other.
 - Record the exact commit, command line, and output file path with every result.
 - For cross-framework comparisons, use the same metric on both sides. For example, compare MoE-Infinity decode throughput with llama.cpp `eval time`, not `prompt eval time`.
+
+## Async KV swap A/B benchmark
+
+`benchmarks/serving/kv_offload_benchmark.py` runs warmup outside measurement and
+records raw trial samples, request latency, generated tokens, backpressure,
+D2H/H2D bytes, pinned/GPU peaks, failures, and observed swap p50/p95/p99. Here
+p99 means per-swap observed completion latency; it includes polling delay and is
+not pure PCIe time. Each result also records all six resolved `kv_swap`
+configuration values.
+
+```bash
+python benchmarks/serving/kv_offload_benchmark.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /path/to/offload/dir \
+  --num-requests 64 --prompt-length 2048 --max-new-tokens 128 \
+  --warmup-requests 8 --trials 5 \
+  --host-memory-mib 2048 --max-inflight-mib 1024 \
+  --kv-swap-mode async --output-json /tmp/kv-swap-async.json
+
+python benchmarks/serving/kv_offload_benchmark.py \
+  --model deepseek-ai/DeepSeek-V2-Lite-Chat \
+  --offload-dir /path/to/offload/dir \
+  --num-requests 64 --prompt-length 2048 --max-new-tokens 128 \
+  --warmup-requests 8 --trials 5 \
+  --host-memory-mib 2048 --max-inflight-mib 1024 \
+  --kv-swap-mode sync --output-json /tmp/kv-swap-sync.json
+```
+
+Compare the two self-contained JSON files offline and describe any difference
+as observed overlap. Results are hardware- and workload-specific; they are not
+an SLA or performance promise. The benchmark exits nonzero for transfer or
+checksum failures and leaked accounting. Unit tests validate parser,
+conversion, percentile, and schema behavior.
 
 ## Using the StopWatch utility
 
@@ -140,6 +175,7 @@ print(f"Decode throughput:           {streamer.decoding_iterations / streamer.de
 | Workflow | Entry points | Purpose | Prerequisites | Metrics / output | Guide / status |
 | --- | --- | --- | --- | --- | --- |
 | Serving benchmarks | `benchmarks/serving/baseline_performance.py`<br>`benchmarks/serving/throughput.py`<br>`benchmarks/serving/latency.py`<br>`benchmarks/serving/memory.py`<br>`benchmarks/serving/kv_offload_benchmark.py` | Single request TTFT, throughput sweeps, concurrency latency, memory, and KV offload checks. | CUDA GPU, `transformers`, `moe_infinity`, model checkpoint, offload dir. | `ttft_ms`, `per_token_latency_ms`, `total_time_s`, `peak_gpu_memory_mb`, throughput per batch size, TTFT and ITL percentiles, expert hit rate, KV utilization, swap count. | Stable user workflow. Command examples are below. |
+| Phase-specific expert policy A/B | `benchmarks/serving/phase_specific_expert_policy.py` | Compare the opt-in policy off and on through the same continuous-batching server path. | CUDA GPU, one OpenAI server at a time, identical model/offload/environment for both runs. | Per-request TTFT, TPOT, E2E, token IDs, p50/p90/p99, policy telemetry, and signed deltas. | Contributor validation workflow. Follow the parity gates below. |
 | DeepSeek-V4-Flash ContextPilot A/B | `benchmarks/contextpilot/v4flash_ab.py`<br>`benchmarks/contextpilot/v4flash_ab_report.py` | A/B compare ContextPilot on DeepSeek-V4-Flash and emit a markdown GO/NO-GO report. | 4 GPUs in mp4 setup, official DeepSeek-V4 checkpoint, `torchrun`, pinned host RAM, `v4flash` image. | `ttft_p50`, `e2e_p50`, prompt token savings, decode tok/s, GO/NO-GO report. | Stable user workflow. See the DeepSeek-V4 guide and the ContextPilot guide. |
 | Serving validation and FlashInfer checks | `benchmarks/serving/ab_kernel_bench.py`<br>`benchmarks/serving/validate_flashinfer.py`<br>`benchmarks/serving/validate_batched_dispatch.py` | FlashInfer vs naive SDPA, FlashInfer import and correctness checks, batched dispatch feasibility. | CUDA GPU, FlashInfer for `validate_flashinfer.py`, source tree for dispatch analysis. | Speedup, GO/NO-GO summary, correctness checks, static interface analysis. | Contributor-only, experimental. Use before changing serving kernels or dispatch wiring. |
 | ContextPilot phase benchmarks | `benchmarks/contextpilot/baseline.py`<br>`benchmarks/contextpilot/phase_a_benchmark.py`<br>`benchmarks/contextpilot/phase_b_benchmark.py`<br>`benchmarks/contextpilot/phase_c_benchmark.py`<br>`benchmarks/contextpilot/compare_phases.py`<br>`benchmarks/contextpilot/memory_profile.py`<br>`benchmarks/contextpilot/reorder_overhead.py`<br>`benchmarks/contextpilot/gen_longctx_workload.py` | Baseline generation, sidecar and middleware comparisons, scheduler phase comparisons, RSS profiling, reorder overhead, and workload generation. | Local or mocked ContextPilot, optional GPU or HTTP server for real phase runs, `psutil` for `memory_profile.py`. | TTFT p50/p90/p99, E2E p50/p90/p99, token savings, KV and expert hit rates, RSS over checkpoints, reorder p50/p90/p99, generated workload JSON. | Contributor-only, experimental. Use the ContextPilot integration guide. |
@@ -296,6 +332,64 @@ python benchmarks/serving/kv_offload_benchmark.py \
     --output-json kv_offload_results.json
 ```
 
+### Phase-specific expert policy matrix
+
+Run the client once against a server started with
+`--no-phase-specific-expert-policy`, restart the same server with only that
+flag changed to `--phase-specific-expert-policy`, and run it again. The client
+never launches separate prefill and decode workers and its `--policy` argument
+only labels and validates the state reported by `/admin/stats`; it does not
+change server configuration.
+
+The default matrix is:
+
+| Prompt tokens | Output tokens | Concurrency | Regime |
+| ---: | ---: | ---: | --- |
+| 128 | 16 | 1 | Short prefill and decode |
+| 2048 | 16 | 1 | Prefill-heavy |
+| 128 | 256 | 1 | Decode-heavy |
+| 2048 | 256 | 1 | Balanced long request |
+| 128 | 256 | 8 | Decode-heavy continuous-batching pressure |
+| 2048 | 256 | 8 | Mixed prefill/decode continuous-batching pressure |
+
+Each cell uses one warmup followed by five measured repeats. Concurrency-eight
+requests wait on one barrier before submission, and every streamed token is
+timestamped. TTFT is the interval from submission to the first streamed token;
+TPOT is the mean gap between tokens after the first; E2E is the interval from
+submission to the final streamed token. Reports contain per-request raw rows
+and p50/p90/p99 summaries.
+
+```bash
+python benchmarks/serving/phase_specific_expert_policy.py \
+  --server-url http://127.0.0.1:8000 \
+  --model "$MODEL" --policy off \
+  --prompt-lengths 128 2048 --output-lengths 16 256 \
+  --concurrency 1 8 --warmup 1 --repeats 5 --seed 0 \
+  --output-json "$RESULT_DIR/policy-off.json"
+
+python benchmarks/serving/phase_specific_expert_policy.py \
+  --server-url http://127.0.0.1:8000 \
+  --model "$MODEL" --policy on \
+  --prompt-lengths 128 2048 --output-lengths 16 256 \
+  --concurrency 1 8 --warmup 1 --repeats 5 --seed 0 \
+  --compare-json "$RESULT_DIR/policy-off.json" \
+  --output-json "$RESULT_DIR/policy-on.json"
+```
+
+The report records the commit and command, model and tokenizer, CUDA, PyTorch,
+Transformers, GPU/CPU, visible devices, offload path/medium, raw rows, summary,
+and the `/admin/stats` expert-policy snapshot after every cell. That snapshot
+contains prefill/decode/mixed accesses, hits, misses, admissions, transient
+uses, evictions, prefetch outcomes, transition hits, starvation promotions,
+and aggregate shared resident bytes.
+
+The comparison is rejected when the environment fingerprint, matrix cells,
+request counts, prompt/output lengths, or generated token IDs differ. Only
+signed `on - off` TTFT and TPOT deltas are printed; do not describe them as
+speedups or wins. Keep `device_memory_ratio` fixed. DuoServe-MoE motivates
+treating prefill and decode as different regimes, but it is not performance
+evidence for this implementation: measurements from this repository must stand
+on their own.
 ### Prefix KV reuse (disabled / cold / warm)
 
 `benchmarks/serving/prefix_cache_benchmark.py` measures the three prefix-reuse
@@ -404,6 +498,28 @@ peak allocation/reservation, decisions, fallback, and partial donor commits.
 Performance regressions or no measurable gain are valid outcomes; never infer a
 win from a single run.
 
+## KV-cache quantization long-context matrix
+
+`benchmarks/serving/kv_cache_quantization.py` runs a `native` vs `int8_sym`
+A/B matrix over context lengths and batch sizes, writing a JSON array with
+separate storage/transfer/execution precision fields plus TTFT, decode
+tokens/s, ITL p50/p99, peak allocated/reserved bytes, descriptor and measured
+cache bytes, D2H/H2D swap bytes, and scratch peak bytes.
+
+```bash
+python benchmarks/serving/kv_cache_quantization.py \
+  --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+  --context-lengths 128 2048 8192 32768 --batch-sizes 1 4 16 \
+  --decode-tokens 128 --warmups 2 --repeats 5 --strict-fallback \
+  --output-json artifacts/kv-cache-quantization/qwen3.json
+```
+
+`--strict-fallback` fails the run if the requested and effective formats
+differ, so a silent fallback cannot be reported as a quantized result. The
+writer creates the artifact's parent directory automatically. Rollout gates:
+INT8 measured storage ratio `<= 0.52`, lower peak memory at 8K/32K, and 2K
+decode throughput at least 90% of native. Performance misses block rollout but
+never relax the correctness/quality tolerances.
 ### Chunked-prefill TTFT/TPOT tails
 
 Start two identical paged-attention servers: baseline without the feature and

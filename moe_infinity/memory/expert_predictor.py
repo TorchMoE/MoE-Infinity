@@ -31,6 +31,16 @@ class ExpertPredictor:
     def add_tracer(self, tracer: ExpertTracer):
         self.tracer = tracer
 
+    def ranked_candidates(self, expert_matrix, layer_idx):
+        row = expert_matrix[layer_idx]
+        scored = [
+            (int(expert_id), float(row[expert_id]))
+            for expert_id in range(self.num_experts)
+            if row[expert_id] > 0
+        ]
+        scored.sort(key=lambda item: (-item[1], item[0]))
+        return scored
+
     def predict(self, seq_id, expert_list, layer_idx):
         if self.tracer is None:
             raise RuntimeError("tracer must be added before predict")

@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import statistics
+import subprocess
 import sys
 import time
 import warnings
@@ -27,7 +30,75 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-kv-offload", action="store_true")
     parser.add_argument("--kv-cache-ratio", type=float, default=0.05)
     parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument(
+        "--kv-swap-mode", choices=("sync", "async"), default="sync"
+    )
+    parser.add_argument("--warmup-requests", type=int, default=8)
+    parser.add_argument("--trials", type=int, default=5)
+    parser.add_argument("--host-memory-mib", type=int, default=2048)
+    parser.add_argument("--max-inflight-mib", type=int, default=1024)
+    parser.add_argument("--checksum", action="store_true")
+    parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument(
+        "--no-sync-fallback",
+        action="store_false",
+        dest="kv_swap_allow_sync_fallback",
+    )
+    parser.set_defaults(kv_swap_allow_sync_fallback=True)
+    parser.add_argument("--max-batch-size", type=int, default=64)
+    parser.add_argument("--max-tokens-per-step", type=int, default=4096)
     return parser.parse_args()
+
+
+def percentiles(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
+    ordered = sorted(float(value) for value in values)
+
+    def nearest_rank(percentile: float) -> float:
+        rank = max(1, math.ceil(percentile * len(ordered)))
+        return ordered[rank - 1]
+
+    return {
+        "p50": float(statistics.median(ordered)),
+        "p95": nearest_rank(0.95),
+        "p99": nearest_rank(0.99),
+    }
+
+
+def swap_config_from_args(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "kv_swap_mode": args.kv_swap_mode,
+        "kv_swap_host_memory_bytes": args.host_memory_mib * MEGABYTE,
+        "kv_swap_max_inflight_bytes": args.max_inflight_mib * MEGABYTE,
+        "kv_swap_checksum": bool(args.checksum),
+        "kv_swap_max_retries": args.max_retries,
+        "kv_swap_allow_sync_fallback": args.kv_swap_allow_sync_fallback,
+    }
+
+
+def summarize_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {"raw_samples": trials}
+    for key in (
+        "latency_ms",
+        "swap_out_observed_ms",
+        "swap_in_observed_ms",
+    ):
+        summary[key] = percentiles(
+            [float(trial.get(key, 0.0)) for trial in trials]
+        )
+    return summary
+
+
+def git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def environment_info() -> dict[str, Any]:
@@ -106,6 +177,9 @@ def _resolve_dtype(model: object) -> torch.dtype:
 def _build_engine_config(
     model: object,
     kv_cache_ratio: float,
+    swap_config: dict[str, object] | None = None,
+    max_batch_size: int = 64,
+    max_tokens_per_step: int = 4096,
 ) -> dict[str, object]:
     model_config = getattr(model, "config", None)
     if model_config is None:
@@ -144,8 +218,8 @@ def _build_engine_config(
     config: dict[str, object] = {
         "device_memory_ratio": 0.75,
         "kv_cache_ratio": kv_cache_ratio,
-        "max_batch_size": 64,
-        "max_tokens_per_step": 4096,
+        "max_batch_size": max_batch_size,
+        "max_tokens_per_step": max_tokens_per_step,
         "block_size": 16,
         "num_layers": num_layers,
         "num_kv_heads": num_kv_heads,
@@ -154,6 +228,8 @@ def _build_engine_config(
     }
     if isinstance(eos_token_id, int):
         config["eos_token_id"] = eos_token_id
+    if swap_config is not None:
+        config.update(swap_config)
     return config
 
 
@@ -217,6 +293,8 @@ def run_benchmark(
     engine: Any,
     prompt_batches: list[list[int]],
     max_new_tokens: int,
+    *,
+    request_prefix: str = "bench",
 ) -> dict[str, float | int | None]:
     from moe_infinity.serving.sequence import SamplingParams
 
@@ -235,25 +313,40 @@ def run_benchmark(
 
     swap_count = [0]
     original_swap_out = engine.kv_cache.swap_out
+    original_reserve_swap_out_group = engine.kv_cache.reserve_swap_out_group
 
     def counting_swap_out(seq_id: int) -> None:
         swap_count[0] += 1
         original_swap_out(seq_id)
+
+    def counting_reserve_swap_out_group(seq_ids: list[int]) -> object:
+        reservation = original_reserve_swap_out_group(seq_ids)
+        if reservation is not None:
+            swap_count[0] += len(seq_ids)
+        return reservation
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
     engine.eos_token_id = None
+    before_swap = engine.kv_cache.get_swap_stats()
     start = time.perf_counter()
-    with patch.object(
-        engine.kv_cache,
-        "swap_out",
-        side_effect=counting_swap_out,
+    with (
+        patch.object(
+            engine.kv_cache,
+            "swap_out",
+            side_effect=counting_swap_out,
+        ),
+        patch.object(
+            engine.kv_cache,
+            "reserve_swap_out_group",
+            side_effect=counting_reserve_swap_out_group,
+        ),
     ):
         for req_idx, prompt_ids in enumerate(prompt_batches):
             engine.add_request(
-                request_id=f"bench-{req_idx}",
+                request_id=f"{request_prefix}-{req_idx}",
                 prompt_token_ids=list(prompt_ids),
                 sampling_params=SamplingParams(
                     temperature=0.0,
@@ -288,6 +381,15 @@ def run_benchmark(
     latency_ms = (
         0.0 if num_requests <= 0 else (elapsed_s * 1000.0) / num_requests
     )
+    after_swap = engine.kv_cache.get_swap_stats()
+
+    def delta(name: str) -> float:
+        return float(after_swap.get(name, 0.0)) - float(
+            before_swap.get(name, 0.0)
+        )
+
+    swap_out_count = max(1.0, delta("swap_out_completed_total"))
+    swap_in_count = max(1.0, delta("swap_in_completed_total"))
 
     return {
         "latency_ms": latency_ms,
@@ -297,6 +399,16 @@ def run_benchmark(
         "swap_count": int(swap_count[0]),
         "generated_tokens": int(generated_tokens),
         "elapsed_s": elapsed_s,
+        "swap_out_observed_ms": delta("d2h_duration_ms_sum") / swap_out_count,
+        "swap_in_observed_ms": delta("h2d_duration_ms_sum") / swap_in_count,
+        "backpressure_count": int(delta("backpressure_total")),
+        "d2h_bytes": int(delta("d2h_bytes_total")),
+        "h2d_bytes": int(delta("h2d_bytes_total")),
+        "pinned_peak_bytes": int(after_swap.get("host_peak_in_use_bytes", 0)),
+        "transfer_failures": int(
+            delta("swap_out_failed_total") + delta("swap_in_failed_total")
+        ),
+        "checksum_failures": int(delta("checksum_failures_total")),
     }
 
 
@@ -328,10 +440,21 @@ def main() -> int:
         raise ValueError("--max-new-tokens must be > 0")
     if args.kv_cache_ratio <= 0:
         raise ValueError("--kv-cache-ratio must be > 0")
+    if args.warmup_requests < 0:
+        raise ValueError("--warmup-requests must be >= 0")
+    if args.trials <= 0:
+        raise ValueError("--trials must be > 0")
+    if args.host_memory_mib <= 0 or args.max_inflight_mib <= 0:
+        raise ValueError("swap memory limits must be > 0")
+    if args.max_inflight_mib > args.host_memory_mib:
+        raise ValueError("--max-inflight-mib must not exceed --host-memory-mib")
+    if args.max_retries < 0:
+        raise ValueError("--max-retries must be >= 0")
 
     env = environment_info()
 
     kv_cache_ratio = args.kv_cache_ratio if args.enable_kv_offload else 0.35
+    swap_config = swap_config_from_args(args)
     payload: dict[str, Any] = {
         "status": "BLOCKED",
         "reason": None,
@@ -343,6 +466,12 @@ def main() -> int:
         "max_new_tokens": args.max_new_tokens,
         "enable_kv_offload": bool(args.enable_kv_offload),
         "kv_cache_ratio": kv_cache_ratio,
+        "git_commit": git_commit(),
+        "swap_config": swap_config,
+        "warmup_requests": args.warmup_requests,
+        "trials": args.trials,
+        "raw_samples": [],
+        "percentiles": {},
         "measurement": None,
     }
 
@@ -376,7 +505,13 @@ def main() -> int:
     engine = ContinuousBatchingEngine(
         model=model.model,
         engine=model.engine,
-        config=_build_engine_config(model.model, kv_cache_ratio=kv_cache_ratio),
+        config=_build_engine_config(
+            model.model,
+            kv_cache_ratio=kv_cache_ratio,
+            swap_config=swap_config,
+            max_batch_size=args.max_batch_size,
+            max_tokens_per_step=args.max_tokens_per_step,
+        ),
         tokenizer=tokenizer,
     )
     prompt_batches = _build_prompt_batches(
@@ -385,12 +520,55 @@ def main() -> int:
         prompt_length=args.prompt_length,
     )
 
-    measurement = run_benchmark(
-        engine,
-        prompt_batches,
-        max_new_tokens=args.max_new_tokens,
+    if args.warmup_requests:
+        warmup_batches = _build_prompt_batches(
+            tokenizer,
+            num_requests=args.warmup_requests,
+            prompt_length=args.prompt_length,
+        )
+        _ = run_benchmark(
+            engine,
+            warmup_batches,
+            max_new_tokens=args.max_new_tokens,
+            request_prefix="warmup",
+        )
+
+    samples = [
+        run_benchmark(
+            engine,
+            prompt_batches,
+            max_new_tokens=args.max_new_tokens,
+            request_prefix=f"trial-{trial}",
+        )
+        for trial in range(args.trials)
+    ]
+    measurement = samples[-1]
+    summary = summarize_trials(samples)
+    payload["raw_samples"] = samples
+    payload["percentiles"] = {
+        key: value for key, value in summary.items() if key != "raw_samples"
+    }
+    final_swap_stats = engine.kv_cache.get_swap_stats()
+    transfer_failures = sum(
+        int(sample.get("transfer_failures", 0) or 0) for sample in samples
     )
-    payload["status"] = "PASS"
+    checksum_failures = sum(
+        int(sample.get("checksum_failures", 0) or 0) for sample in samples
+    )
+    leaked = any(
+        int(final_swap_stats.get(key, 0)) != 0
+        for key in (
+            "host_in_use_bytes",
+            "inflight",
+            "host_resident",
+            "retiring_records",
+        )
+    )
+    payload["status"] = (
+        "PASS"
+        if transfer_failures == 0 and checksum_failures == 0 and not leaked
+        else "FAIL"
+    )
     payload["reason"] = None
     payload["measurement"] = measurement
 
@@ -403,7 +581,8 @@ def main() -> int:
 
     if args.output_json:
         write_json(Path(args.output_json), payload)
-    return 0
+    engine.shutdown()
+    return 0 if payload["status"] == "PASS" else 1
 
 
 if __name__ == "__main__":

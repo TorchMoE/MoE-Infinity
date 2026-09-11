@@ -7,6 +7,7 @@ set(ARCHER_CORE_CXX_SOURCES
   ${CMAKE_SOURCE_DIR}/core/model/moe.cpp
   # prefetch
   ${CMAKE_SOURCE_DIR}/core/prefetch/archer_prefetch_handle.cpp
+  ${CMAKE_SOURCE_DIR}/core/prefetch/expert_residency.cpp
   ${CMAKE_SOURCE_DIR}/core/prefetch/task_scheduler.cpp
   ${CMAKE_SOURCE_DIR}/core/prefetch/task_thread.cpp
   # memory
@@ -54,6 +55,10 @@ add_library(archer_core STATIC
   ${ARCHER_CORE_CXX_SOURCES}
   ${ARCHER_CORE_CUDA_SOURCES}
 )
+
+if(MOE_INFINITY_TESTING)
+  target_compile_definitions(archer_core PUBLIC MOE_INFINITY_TESTING=1)
+endif()
 
 target_include_directories(archer_core PUBLIC
   ${CMAKE_SOURCE_DIR}/core

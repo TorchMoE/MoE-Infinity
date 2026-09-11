@@ -66,13 +66,15 @@ class UnifiedTransferScheduler(TransferScheduler):
         self._condition: threading.Condition = threading.Condition(self._lock)
 
         self._pending: dict[str, threading.Event] = {}
+        self._requests: dict[str, TransferRequest] = {}
         self._results: dict[str, TransferResult] = {}
         self._transfer_devices: dict[str, set[int]] = {}
 
         self._cancelled: set[str] = set()
 
         self._metrics: dict[TransferType, dict[str, int]] = {
-            t: {"count": 0, "bytes": 0} for t in TransferType
+            t: {"count": 0, "bytes": 0, "failures": 0, "cancelled": 0}
+            for t in TransferType
         }
 
         self._bandwidth_budgets: dict[str, float] = {
@@ -81,7 +83,7 @@ class UnifiedTransferScheduler(TransferScheduler):
         }
 
         self._handlers: dict[
-            TransferType, Callable[[TransferRequest], None]
+            TransferType, Callable[[TransferRequest], Optional[int]]
         ] = {}
 
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
@@ -96,7 +98,7 @@ class UnifiedTransferScheduler(TransferScheduler):
     def register_handler(
         self,
         transfer_type: TransferType,
-        handler: Callable[[TransferRequest], None],
+        handler: Callable[[TransferRequest], Optional[int]],
     ) -> None:
         with self._lock:
             self._handlers[transfer_type] = handler
@@ -131,6 +133,7 @@ class UnifiedTransferScheduler(TransferScheduler):
                 with self._condition:
                     self._pending[transfer_id] = event
                     self._transfer_devices[transfer_id] = devices
+                    self._requests[transfer_id] = normalized_request
                     self._seq_counter += 1
                     heapq.heappush(
                         self._queue,
@@ -148,6 +151,12 @@ class UnifiedTransferScheduler(TransferScheduler):
         with self._condition:
             if transfer_id not in self._pending:
                 return False
+            request = self._requests[transfer_id]
+            if not any(
+                queued.transfer_id == transfer_id
+                for _, _, queued in self._queue
+            ):
+                return False
             self._cancelled.add(transfer_id)
             self._transfer_devices.pop(transfer_id, None)
             event = self._pending.pop(transfer_id, None)
@@ -157,6 +166,7 @@ class UnifiedTransferScheduler(TransferScheduler):
                     status="CANCELLED",
                     duration_ms=0.0,
                 )
+                self._metrics[request.transfer_type]["cancelled"] += 1
                 event.set()
         return True
 
@@ -265,13 +275,19 @@ class UnifiedTransferScheduler(TransferScheduler):
         with profiler_cm:
             with nvtx_cm:
                 transfer_id = request.transfer_id
+                bytes_transferred = 0
+                error: Optional[str] = None
                 try:
                     handler = self._handlers.get(request.transfer_type)
                     if handler is not None:
-                        handler(request)
+                        handler_bytes = handler(request)
+                        if handler_bytes is not None:
+                            bytes_transferred = int(handler_bytes)
                     status = "COMPLETED"
-                except Exception:
+                except Exception as exc:
                     status = "FAILED"
+                    bytes_transferred = 0
+                    error = f"{type(exc).__name__}: {exc}"
 
                 duration_ms = (time.monotonic() - start_time) * 1000.0
                 with self._lock:
@@ -279,13 +295,18 @@ class UnifiedTransferScheduler(TransferScheduler):
                         transfer_id=transfer_id,
                         status=status,
                         duration_ms=duration_ms,
+                        bytes_transferred=bytes_transferred,
+                        error=error,
                     )
-                    self._metrics[request.transfer_type]["count"] += 1
-                    self._metrics[request.transfer_type]["bytes"] += len(
-                        request.block_ids
-                    )
+                    metrics = self._metrics[request.transfer_type]
+                    metrics["count"] += 1
+                    if status == "FAILED":
+                        metrics["failures"] += 1
+                    else:
+                        metrics["bytes"] += bytes_transferred
                     event = self._pending.pop(transfer_id, None)
                     self._transfer_devices.pop(transfer_id, None)
+                    self._requests.pop(transfer_id, None)
                     if event:
                         event.set()
 
@@ -304,6 +325,7 @@ class UnifiedTransferScheduler(TransferScheduler):
             with self._lock:
                 if transfer_id in self._cancelled:
                     self._cancelled.discard(transfer_id)
+                    self._requests.pop(transfer_id, None)
                     continue
 
             start_time = time.monotonic()

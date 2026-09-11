@@ -10,6 +10,7 @@
 #include <cuda_runtime_api.h>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include "aio/archer_prio_aio_handle.h"
 #include "aio/archer_tensor_handle.h"
@@ -739,6 +740,44 @@ void ArcherTopologyHandle::BuildTopologyFromSpecs(
   }
 
   EnableTrace();
+}
+
+NodePtr ArcherTopologyHandle::CreateDetachedNode(
+    const std::vector<TensorID>& tensor_ids, int gpu_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tensor_ids.empty() || gpu_id < 0 || kTensorIndex == nullptr) {
+    throw std::invalid_argument("invalid detached expert node request");
+  }
+
+  std::int64_t aligned_bytes = 0;
+  for (const TensorID tensor_id : tensor_ids) {
+    const auto meta = kTensorIndex->find(tensor_id);
+    if (meta == kTensorIndex->end() || meta->second.size == 0 ||
+        meta->second.size > static_cast<std::uint64_t>(
+                                std::numeric_limits<std::int64_t>::max())) {
+      throw std::invalid_argument("invalid detached expert tensor metadata");
+    }
+    const auto size = static_cast<std::int64_t>(meta->second.size);
+    const auto alignment = static_cast<std::int64_t>(kAioAlignment);
+    if (size > std::numeric_limits<std::int64_t>::max() - alignment + 1) {
+      throw std::overflow_error("detached expert tensor size overflow");
+    }
+    const auto aligned = (size + alignment - 1) & ~(alignment - 1);
+    if (aligned_bytes > std::numeric_limits<std::int64_t>::max() - aligned) {
+      throw std::overflow_error("detached expert node size overflow");
+    }
+    aligned_bytes += aligned;
+  }
+
+  auto node = std::make_shared<Node>();
+  node->tensor_ids = tensor_ids;
+  node->byte_size = aligned_bytes;
+  node->id = next_detached_node_id_++;
+  node->corr_id = node->id;
+  node->is_sparse = true;
+  node->default_device = torch::Device(torch::kCUDA, gpu_id);
+  node->default_host = CPU_DEVICE;
+  return node;
 }
 
 void ArcherTopologyHandle::InitializeTopology(

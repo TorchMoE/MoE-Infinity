@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -21,6 +22,7 @@
 #include "common/types.h"
 #include "memory/event_pool.h"
 #include "memory/memory_pool.h"
+#include "prefetch/expert_policy.h"
 
 enum NodeState {
   NODE_STATE_NONE = 0x0,
@@ -77,6 +79,8 @@ struct Node {
   NodeState io_state = NODE_STATE_NONE;
 
   bool is_overflow = false;
+
+  ExpertPolicyMetadata policy_metadata;
 
   void* host_memory_ptr = nullptr;
   void* device_memory_ptr = nullptr;
@@ -199,6 +203,8 @@ class ArcherTopologyHandle : public base::noncopyable {
   void SetChildVisitCounts(const std::vector<std::size_t>& visit_counts);
 
   NodePtr GetNodeFromTensorID(const TensorID& tensor_id);
+  NodePtr CreateDetachedNode(const std::vector<TensorID>& tensor_ids,
+                             int gpu_id);
   NodeBodyPtr GetNodeBodyFromCorrID(const std::uint64_t& correlation_id);
 
   std::tuple<std::size_t, std::size_t> GetNumLayersAndExperts();
@@ -234,6 +240,8 @@ class ArcherTopologyHandle : public base::noncopyable {
   std::unordered_map<int, std::int64_t> sparse_cache_limit_override_;
 
   std::unordered_map<TensorID, NodePtr> tensor_id_to_node_;
+  std::size_t next_detached_node_id_ =
+      std::numeric_limits<std::size_t>::max() / 2;
 };
 
 extern std::unique_ptr<ArcherTopologyHandle> kTopologyHandle;

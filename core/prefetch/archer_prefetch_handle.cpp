@@ -5,6 +5,7 @@
 
 #include "archer_prefetch_handle.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <cuda_runtime_api.h>
@@ -14,9 +15,22 @@
 #include "common/pytorch.h"
 #include "common/time.h"
 #include "memory/memory_pool.h"
+#include "prefetch/expert_residency.h"
 #include "task_scheduler.h"
 #include "utils/cuda_utils.h"
 #include "utils/logger.h"
+
+namespace {
+
+std::optional<ExpertFormat> ParsePrefetchFormat(const std::string& value) {
+  if (value == "bf16") return ExpertFormat::BF16;
+  if (value == "fp8_e4m3_block128") return ExpertFormat::FP8_E4M3_BLOCK128;
+  if (value == "marlin_int4_group128")
+    return ExpertFormat::MARLIN_INT4_GROUP128;
+  return std::nullopt;
+}
+
+}  // namespace
 
 ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
                                            const double device_memory_ratio)
@@ -37,6 +51,7 @@ ArcherPrefetchHandle::ArcherPrefetchHandle(const std::string& prefix,
       std::make_unique<ArcherTensorHandle>(prefix, num_io_threads);
   kTopologyHandle = std::make_unique<ArcherTopologyHandle>();
   kTaskPool = std::make_unique<ArcherTaskPool>();
+  InitExpertResidency();
   kDeviceMemoryPool = std::make_unique<DeviceMemoryPool>();
   kHostMemoryPool = std::make_unique<HostMemoryPool>();
   kDeviceMemoryPool->SetMemoryRatio(device_memory_ratio);
@@ -91,7 +106,28 @@ void ArcherPrefetchHandle::CleanUpResources() {
   kTopologyHandle.reset();
   kDeviceMemoryPool.reset();
   kHostMemoryPool.reset();
+  ResetExpertResidency();
   has_cleaned_up_resources_ = true;
+}
+
+void ArcherPrefetchHandle::ConfigureExpertPolicy(
+    bool enabled, int prefill_admission, int decode_admission,
+    double prefill_weight, double decode_weight, int starvation_limit) {
+  PhasePolicyConfig config;
+  config.enabled = enabled;
+  config.prefill_admission = static_cast<AdmissionMode>(prefill_admission);
+  config.decode_admission = static_cast<AdmissionMode>(decode_admission);
+  config.prefill_eviction_weight = prefill_weight;
+  config.decode_eviction_weight = decode_weight;
+  config.starvation_limit = static_cast<std::uint32_t>(starvation_limit);
+  if (kExpertResidencyManager) {
+    kExpertResidencyManager->ConfigurePolicy(config);
+  }
+}
+
+ExpertPolicyStats ArcherPrefetchHandle::GetExpertPolicyStats() const {
+  if (!kExpertResidencyManager) return ExpertPolicyStats{};
+  return kExpertResidencyManager->Snapshot();
 }
 
 void ArcherPrefetchHandle::ResetCache() {
@@ -103,6 +139,36 @@ void ArcherPrefetchHandle::ResetCache() {
   if (kTaskPool) {
     kTaskPool->ClearQueue();
   }
+}
+
+std::vector<std::unordered_map<std::string, py::object>>
+ArcherPrefetchHandle::GetCanonicalTensorIndexSnapshot() const {
+  return kArcherTensorHandle->GetCanonicalTensorIndexSnapshot();
+}
+
+void ArcherPrefetchHandle::BeginDerivativeOverlay(
+    const std::string& generation, std::int64_t canonical_max_tensor_id,
+    std::int64_t canonical_max_file_id) {
+  kArcherTensorHandle->BeginDerivativeOverlay(
+      generation, canonical_max_tensor_id, canonical_max_file_id);
+}
+
+void ArcherPrefetchHandle::RegisterDerivativeTensor(
+    const std::string& generation, std::int64_t tensor_id, std::int64_t file_id,
+    std::int64_t offset, std::int64_t size,
+    const std::vector<std::int64_t>& shape, const std::string& dtype) {
+  kArcherTensorHandle->RegisterDerivativeTensor(generation, tensor_id, file_id,
+                                                offset, size, shape, dtype);
+}
+
+void ArcherPrefetchHandle::CommitDerivativeOverlay(
+    const std::string& generation) {
+  kArcherTensorHandle->CommitDerivativeOverlay(generation);
+}
+
+void ArcherPrefetchHandle::AbortDerivativeOverlay(
+    const std::string& generation) {
+  kArcherTensorHandle->AbortDerivativeOverlay(generation);
 }
 
 void ArcherPrefetchHandle::AcquireTensor(std::uint64_t& request_id,
@@ -249,7 +315,11 @@ void ArcherPrefetchHandle::ReplaceCacheCandidates(
     candidates.push_back(node);
   }
 
-  kTaskPool->ReplaceCacheCandidates(candidates);
+  if (kExpertResidencyManager && kExpertResidencyManager->PolicyEnabled()) {
+    kExpertResidencyManager->ReplaceProtectedCandidates(candidates);
+  } else {
+    kTaskPool->ReplaceCacheCandidates(candidates);
+  }
 }
 void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id,
                                            int gpu_id) {
@@ -270,17 +340,62 @@ void ArcherPrefetchHandle::EnqueuePrefetch(const uint32_t tensor_id,
 }
 
 void ArcherPrefetchHandle::EnqueuePrefetchTensors(
-    const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority) {
+    const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
+    int phase) {
+  TORCH_CHECK(phase >= static_cast<int>(ExpertPhase::PREFILL) &&
+                  phase <= static_cast<int>(ExpertPhase::MIXED),
+              "invalid expert phase: ", phase);
   for (std::uint32_t tensor_id : tensor_ids) {
     auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
     auto task = std::make_shared<Task>();
     task->priority = priority;
     task->node = node;
     task->on_demand = false;
+    task->phase = static_cast<ExpertPhase>(phase);
     task->src_device = node->device;
     task->dst_device = node->default_device;
     kTaskPool->EnqueueTask(task);
   }
+}
+
+PrefetchAdmission ArcherPrefetchHandle::SchedulePrefetchTensors(
+    const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
+    std::uint64_t generation, std::int64_t layer_id,
+    std::int64_t max_inflight_bytes) {
+  if (priority == kOnDemandPriority) {
+    return PrefetchAdmission{};
+  }
+  std::vector<std::pair<NodePtr, std::int64_t>> costed_nodes;
+  std::unordered_set<std::size_t> seen_node_ids;
+  for (std::uint32_t tensor_id : tensor_ids) {
+    auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
+    if (node == nullptr) continue;
+    if (!seen_node_ids.insert(node->id).second) continue;
+    costed_nodes.emplace_back(node, node->byte_size);
+  }
+  return kTaskPool->AdmitPrefetchTasks(costed_nodes, priority, generation,
+                                       layer_id, max_inflight_bytes);
+}
+
+std::int64_t ArcherPrefetchHandle::CancelPrefetchGeneration(
+    std::uint64_t generation, std::int64_t layer_id,
+    const std::vector<std::uint32_t>& keep_tensor_ids) {
+  std::unordered_set<std::uint32_t> keep_node_ids;
+  for (std::uint32_t tensor_id : keep_tensor_ids) {
+    auto node = kTopologyHandle->GetNodeFromTensorID(tensor_id);
+    if (node != nullptr) {
+      keep_node_ids.insert(static_cast<std::uint32_t>(node->id));
+    }
+  }
+  return kTaskPool->CancelQueuedPrefetch(generation, layer_id, keep_node_ids);
+}
+
+std::vector<PrefetchSample> ArcherPrefetchHandle::DrainPrefetchSamples() {
+  return kTaskPool->DrainPrefetchSamples();
+}
+
+std::int64_t ArcherPrefetchHandle::GetInflightPrefetchBytes() {
+  return kTaskPool->GetInflightPrefetchBytes();
 }
 
 void ArcherPrefetchHandle::FetchTensors(
@@ -399,11 +514,23 @@ void ArcherPrefetchHandle::TraceRequest(const std::uint64_t request_id,
   request_id_to_nodes_[request_id].insert(node);
 }
 
+void ArcherPrefetchHandle::ConfigureExpertCapacityAfterTopology() {
+  for (int gpu_id = 0; gpu_id < kNumDevices(); ++gpu_id) {
+    const auto device = torch::Device(torch::kCUDA, gpu_id);
+    const auto bytes = kTopologyHandle->GetSparseCacheLimit(device);
+    TORCH_CHECK(kExpertResidencyManager->ConfigureCapacity(gpu_id, bytes),
+                "failed to configure expert residency capacity for GPU ",
+                gpu_id, " with ", bytes, " bytes");
+  }
+}
+
 void ArcherPrefetchHandle::SetTopology(
     const std::vector<
         std::tuple<std::string, std::vector<std::vector<TensorID>>>>&
         topology) {
   kTopologyHandle->InitializeTopology(topology);
+  ConfigureExpertResidencyCapacityFromTopology();
+  ConfigureExpertCapacityAfterTopology();
 }
 
 void ArcherPrefetchHandle::SetTopologyV2(
@@ -411,11 +538,93 @@ void ArcherPrefetchHandle::SetTopologyV2(
         std::tuple<std::string, bool, std::vector<std::vector<TensorID>>,
                    std::vector<std::uint64_t>>>& topology) {
   kTopologyHandle->InitializeTopologyV2(topology);
+  ConfigureExpertResidencyCapacityFromTopology();
+  ConfigureExpertCapacityAfterTopology();
 }
 
 std::vector<std::tuple<std::uint64_t, bool, int>>
 ArcherPrefetchHandle::GetTopologySnapshot() {
   return kTopologyHandle->GetTopologySnapshot();
+}
+
+NodePtr ArcherPrefetchHandle::CreateDetachedNode(
+    const std::vector<TensorID>& tensor_ids, int gpu_id) {
+  return kTopologyHandle->CreateDetachedNode(tensor_ids, gpu_id);
+}
+
+std::uintptr_t ArcherPrefetchHandle::GetResidencyManagerId() const {
+  return reinterpret_cast<std::uintptr_t>(kExpertResidencyManager.get());
+}
+
+void ArcherPrefetchHandle::ConfigureResidencyManager(
+    bool manager_enabled, bool phase_policy_enabled) {
+  manager_enabled_ = manager_enabled;
+  phase_policy_enabled_ = phase_policy_enabled;
+}
+
+bool ArcherPrefetchHandle::SetAdaptiveHbmBudgetBytes(std::int64_t bytes) {
+  if (bytes <= 0 || kExpertResidencyManager == nullptr) return false;
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  for (int gpu_id = 0; gpu_id < std::max(device_count, 1); ++gpu_id) {
+    if (!kExpertResidencyManager->ConfigureCapacity(gpu_id, bytes))
+      return false;
+  }
+  return true;
+}
+
+std::size_t ArcherPrefetchHandle::PrefetchExpertVariants(
+    const std::vector<std::tuple<int, int, std::string, std::uint64_t>>& keys,
+    std::uint32_t priority, const std::string& phase) {
+  if (!manager_enabled_ || kExpertResidencyManager == nullptr ||
+      kPrefetchResidencyClient == nullptr) {
+    return 0;
+  }
+  const ExpertPhase expert_phase = phase == "prefill"  ? ExpertPhase::PREFILL
+                                   : phase == "decode" ? ExpertPhase::DECODE
+                                                       : ExpertPhase::MIXED;
+  std::size_t admitted = 0;
+  for (const auto& item : keys) {
+    const auto format = ParsePrefetchFormat(std::get<2>(item));
+    if (!format.has_value()) continue;
+    const auto logical_key = (static_cast<std::uint64_t>(
+                                  static_cast<std::uint32_t>(std::get<0>(item)))
+                              << 32) |
+                             static_cast<std::uint32_t>(std::get<1>(item));
+    ResidencyVariantKey key{logical_key, *format, std::get<3>(item)};
+    const auto variant = kExpertResidencyManager->RegisteredVariant(key);
+    if (!variant.has_value()) continue;
+    const int gpu_id = std::get<1>(item) % std::max(kNumDevices(), 1);
+    auto transaction = kPrefetchResidencyClient->BeginAdmission(
+        *variant, gpu_id, expert_phase, AdmissionMode::CACHE);
+    if (transaction.outcome == AdmissionOutcome::ALREADY_RESIDENT) {
+      ++admitted;
+      continue;
+    }
+    if (!transaction.valid) continue;
+    if (transaction.reserved_victim_key.has_value() &&
+        !kExpertResidencyManager->EvictReserved(transaction)) {
+      kExpertResidencyManager->AbortTransaction(transaction);
+      continue;
+    }
+    try {
+      cudaEvent_t event = nullptr;
+      variant->node->SetDevice(CUDA_DEVICE(gpu_id), false, nullptr, &event);
+      if (event != nullptr) {
+        cudaEventSynchronize(event);
+        kCudaEventPool->Release(event);
+      }
+      if (kExpertResidencyManager->CommitTransaction(transaction)) {
+        kExpertResidencyManager->RecordWorkspaceUse(transaction.id, nullptr);
+        kExpertResidencyManager->ReapWorkspace(gpu_id);
+        ++admitted;
+      }
+    } catch (const std::exception&) {
+      kExpertResidencyManager->AbortTransaction(transaction);
+    }
+  }
+  (void)priority;
+  return admitted;
 }
 
 bool ArcherPrefetchHandle::IsTensorOffloaded(const std::uint32_t tensor_id) {

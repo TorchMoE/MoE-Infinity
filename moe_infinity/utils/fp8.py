@@ -31,6 +31,37 @@ def dequant_fp8_blockwise(
     return (w * s_full).to(dtype)
 
 
+def quant_fp8_blockwise(
+    weight: torch.Tensor,
+    block_size: int = FP8_BLOCK,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if weight.dim() != 2:
+        raise ValueError("FP8 blockwise expert weights must be 2D")
+    rows, cols = weight.shape
+    padded_rows = ((rows + block_size - 1) // block_size) * block_size
+    padded_cols = ((cols + block_size - 1) // block_size) * block_size
+    padded = torch.zeros(
+        (padded_rows, padded_cols), dtype=torch.float32, device=weight.device
+    )
+    padded[:rows, :cols] = weight.float()
+    blocks = padded.view(
+        padded_rows // block_size,
+        block_size,
+        padded_cols // block_size,
+        block_size,
+    )
+    max_abs = blocks.abs().amax(dim=(1, 3))
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    scales = (max_abs / fp8_max).clamp_min(torch.finfo(torch.float32).tiny)
+    expanded = scales.repeat_interleave(block_size, 0).repeat_interleave(
+        block_size, 1
+    )
+    quantized = (
+        (padded / expanded).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    )
+    return quantized[:rows, :cols].contiguous(), scales.contiguous()
+
+
 def dequant_fp8_state_dict(
     state_dict: dict,
     dtype: torch.dtype = torch.bfloat16,

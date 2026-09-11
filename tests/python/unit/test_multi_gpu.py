@@ -288,7 +288,7 @@ class TestDispatchLocalMultiGPU:
         mock_dispatcher = MagicMock()
         enqueued = []
 
-        def capture_enqueue(layer_id, expert_id, gpu_id, remote):
+        def capture_enqueue(layer_id, expert_id, gpu_id, remote, phase):
             enqueued.append((layer_id, expert_id, gpu_id, remote))
 
         mock_dispatcher.enqueue_expert = capture_enqueue
@@ -338,7 +338,7 @@ class TestDispatchLocalMultiGPU:
         mock_dispatcher = MagicMock()
         enqueued = []
 
-        def capture_enqueue(layer_id, expert_id, gpu_id, remote):
+        def capture_enqueue(layer_id, expert_id, gpu_id, remote, phase):
             enqueued.append((layer_id, expert_id, gpu_id, remote))
 
         mock_dispatcher.enqueue_expert = capture_enqueue
