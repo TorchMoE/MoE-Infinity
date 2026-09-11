@@ -150,3 +150,13 @@ def test_native_wasted_prefetch_bytes_none_without_getter():
 def test_probe_h2d_gbps_returns_none_or_positive():
     result = _probe_h2d_gbps(nbytes=1 << 20, iters=2)
     assert result is None or (isinstance(result, float) and result > 0.0)
+
+
+def test_policy_stats_fallback_is_disabled_and_zero() -> None:
+    prefetcher = _bare_prefetcher(
+        archer_engine=object(), expert_dispatcher=object()
+    )
+    stats = prefetcher.get_policy_stats()
+    assert stats["enabled"] == 0
+    assert stats["resident_bytes"] == 0
+    assert stats["decode_hits"] == 0

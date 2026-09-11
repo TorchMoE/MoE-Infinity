@@ -111,6 +111,19 @@ Use the entries below as symptom-first checks. Each one lists the likely cause, 
 - **Resolution:** reorder `CUDA_VISIBLE_DEVICES` so the desired card is logical `cuda:0`, keep all devices on one host, and do not assume universal peer transfers.
 - **Related guide:** [Single-server multi-GPU](multi-gpu.md)
 
+## Phase-specific expert policy regression or rollback
+
+- **Symptom:** TTFT or TPOT regresses, `prefetch_rejected` rises, or `starvation_promotions` grows after enabling the phase policy.
+- **Likely cause:** the configured admission, top-k, priority, eviction weights, or starvation bound does not match the workload. The cache itself is still shared; there are no phase-specific pools.
+- **How to confirm:** capture the effective config, `/admin/stats`, `/metrics`, and both benchmark JSON files before changing settings. Keep the model, offload directory, GPU visibility, seed, greedy sampling, prompt/output lengths, concurrency, and `device_memory_ratio` identical.
+- **Resolution:** restart with `--no-phase-specific-expert-policy`, or set `"phase_specific_expert_policy": false` for in-process use. Leave subordinate keys in place if desired; they are inert while disabled. Reuse the existing offload directory without deleting or migrating it because phase is not persisted in tensor IDs, topology, or checkpoint metadata.
+- **Compatibility check:** disabled non-paged mixed batches use one combined forward; disabled paged mixed batches run prefill then decode. `moe_expert_phase_policy_enabled` reports `0`, phase-policy counters remain zero, and legacy cache occupancy/hit-rate telemetry remains available.
+- **Related guides:** [Serving](serving.md#phase-specific-expert-policy), [Configuration](configuration.md#phase-specific-expert-policy-fields), and [Benchmarking](benchmarking.md#phase-specific-expert-policy-matrix).
+
+Do not parallel-merge adaptive expert precision with the fixed-size phase-policy
+manager. Rebase it onto the shared residency lease/accounting transactions and
+add combined tests before enabling both features.
+
 ## Related guides
 
 - [Configuration](configuration.md)
@@ -118,3 +131,4 @@ Use the entries below as symptom-first checks. Each one lists the likely cause, 
 - [Serving](serving.md)
 - [Environment variables](environment-variables.md)
 - [DFlash](dflash.md)
+- [Phase-policy benchmarking](benchmarking.md#phase-specific-expert-policy-matrix)

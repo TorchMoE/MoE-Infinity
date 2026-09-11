@@ -488,6 +488,12 @@ def initialize_with_model(
     kv_cache_ratio: float = 0.25,
     max_batch_size: int = 32,
     enable_prefix_caching: bool = False,
+    kv_swap_mode: str = "sync",
+    kv_swap_host_memory_bytes: int = 512 * 1024 * 1024,
+    kv_swap_max_inflight_bytes: int = 256 * 1024 * 1024,
+    kv_swap_checksum: bool = False,
+    kv_swap_max_retries: int = 2,
+    kv_swap_allow_sync_fallback: bool = True,
     enable_chunked_prefill: bool = False,
     prefill_chunk_size: int = 512,
     prefill_starvation_threshold_steps: int = 8,
@@ -526,6 +532,12 @@ def initialize_with_model(
         kv_cache_ratio=kv_cache_ratio,
         max_batch_size=max_batch_size,
         enable_prefix_caching=enable_prefix_caching,
+        kv_swap_mode=kv_swap_mode,
+        kv_swap_host_memory_bytes=kv_swap_host_memory_bytes,
+        kv_swap_max_inflight_bytes=kv_swap_max_inflight_bytes,
+        kv_swap_checksum=kv_swap_checksum,
+        kv_swap_max_retries=kv_swap_max_retries,
+        kv_swap_allow_sync_fallback=kv_swap_allow_sync_fallback,
         enable_chunked_prefill=enable_chunked_prefill,
         prefill_chunk_size=prefill_chunk_size,
         prefill_starvation_threshold_steps=(prefill_starvation_threshold_steps),
@@ -782,6 +794,84 @@ def _format_prometheus_metrics(stats: dict[str, object]) -> str:
     lines.append("# HELP moe_engine_steps_total Total engine steps")
     lines.append("# TYPE moe_engine_steps_total counter")
     lines.append(f"moe_engine_steps_total {stats.get('num_steps', 0)}")
+    memory = stats.get("memory", {})
+    adaptive = memory.get("adaptive", {}) if isinstance(memory, dict) else {}
+    devices = adaptive.get("devices", {}) if isinstance(adaptive, dict) else {}
+    metric_fields = (
+        ("moe_adaptive_memory_enabled", "enabled", True),
+        ("moe_adaptive_memory_fallback_static", "fallback_static", True),
+        (
+            "moe_adaptive_memory_expert_target_bytes",
+            "expert_target_bytes",
+            False,
+        ),
+        ("moe_adaptive_memory_kv_target_blocks", "kv_target_blocks", False),
+        ("moe_adaptive_memory_resize_attempts_total", "resize_attempts", False),
+        ("moe_adaptive_memory_resize_failures_total", "resize_failures", False),
+        (
+            "moe_adaptive_memory_reserve_rejections_total",
+            "reserve_rejections",
+            False,
+        ),
+        ("moe_adaptive_memory_expert_miss_cost", "expert_miss_cost", False),
+        ("moe_adaptive_memory_kv_pressure_cost", "kv_pressure_cost", False),
+    )
+    if isinstance(devices, dict):
+        for device_id in sorted(devices, key=lambda value: int(value)):
+            state = devices[device_id]
+            if not isinstance(state, dict):
+                continue
+            for metric, field, boolean in metric_fields:
+                value = state.get(field, 0)
+                if boolean:
+                    value = int(bool(value))
+                lines.append(f'{metric}{{device="{device_id}"}} {value}')
+
+    policy = stats.get("expert_policy")
+    if isinstance(policy, dict):
+        lines.extend(_format_expert_policy_metrics(policy))
+
+    kv_swap_obj = stats.get("kv_swap", {})
+    kv_swap = kv_swap_obj if isinstance(kv_swap_obj, dict) else {}
+    gauges = {
+        "moe_kv_swap_inflight": "inflight",
+        "moe_kv_swap_inflight_bytes": "inflight_bytes",
+        "moe_kv_swap_retiring_records": "retiring_records",
+        "moe_kv_swap_host_resident": "host_resident",
+        "moe_kv_swap_host_bytes": "host_in_use_bytes",
+        "moe_kv_swap_host_capacity_bytes": "host_capacity_bytes",
+    }
+    for metric, key in gauges.items():
+        lines.append(f"# TYPE {metric} gauge")
+        lines.append(f"{metric} {kv_swap.get(key, 0)}")
+    counters = {
+        "moe_kv_swap_backpressure_total": "backpressure_total",
+        "moe_kv_swap_out_completed_total": "swap_out_completed_total",
+        "moe_kv_swap_in_completed_total": "swap_in_completed_total",
+    }
+    for metric, key in counters.items():
+        lines.append(f"# TYPE {metric} counter")
+        lines.append(f"{metric} {kv_swap.get(key, 0)}")
+    lines.append(
+        'moe_kv_swap_failures_total{direction="out"} '
+        f"{kv_swap.get('swap_out_failed_total', 0)}"
+    )
+    lines.append(
+        'moe_kv_swap_failures_total{direction="in"} '
+        f"{kv_swap.get('swap_in_failed_total', 0)}"
+    )
+    for direction in ("d2h", "h2d"):
+        lines.append(
+            f'moe_kv_swap_bytes_total{{direction="{direction}"}} '
+            f"{kv_swap.get(f'{direction}_bytes_total', 0)}"
+        )
+        duration_seconds = (
+            float(kv_swap.get(f"{direction}_duration_ms_sum", 0.0)) / 1000.0
+        )
+        lines.append(
+            f'moe_kv_swap_duration_seconds_sum{{direction="{direction}"}} '
+            f"{duration_seconds:g}"
+        )
     cuda_graph = stats.get("cuda_graph", {})
     graph_stats = (
         cast(dict[str, object], cuda_graph)
@@ -821,6 +911,82 @@ def _format_prometheus_metrics(stats: dict[str, object]) -> str:
             f'moe_cuda_graph_fallback_total{{reason="{reason}"}} {count}'
         )
     return "\n".join(lines) + "\n"
+
+
+_POLICY_PHASES = ("prefill", "decode")
+_POLICY_PREFETCH_RESULTS = ("issued", "completed", "rejected")
+
+
+def _format_expert_policy_metrics(policy: dict[str, object]) -> list[str]:
+    def value(key: str) -> int:
+        raw = policy.get(key, 0)
+        try:
+            return int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+
+    lines: list[str] = []
+    lines.append("# HELP moe_expert_phase_policy_enabled Phase policy enabled")
+    lines.append("# TYPE moe_expert_phase_policy_enabled gauge")
+    lines.append(f"moe_expert_phase_policy_enabled {value('enabled')}")
+    lines.append("# HELP moe_expert_cache_resident_bytes Shared resident bytes")
+    lines.append("# TYPE moe_expert_cache_resident_bytes gauge")
+    lines.append(f"moe_expert_cache_resident_bytes {value('resident_bytes')}")
+    lines.append(
+        "# HELP moe_expert_cache_resident_experts Shared resident experts"
+    )
+    lines.append("# TYPE moe_expert_cache_resident_experts gauge")
+    lines.append(
+        f"moe_expert_cache_resident_experts {value('resident_experts')}"
+    )
+
+    lines.append("# HELP moe_expert_cache_accesses_total Expert cache accesses")
+    lines.append("# TYPE moe_expert_cache_accesses_total counter")
+    for phase in (*_POLICY_PHASES, "mixed"):
+        lines.append(
+            f'moe_expert_cache_accesses_total{{phase="{phase}"}} '
+            f"{value(f'{phase}_accesses')}"
+        )
+
+    for name in ("hits", "misses", "admissions", "transient", "evictions"):
+        lines.append(
+            f"# HELP moe_expert_cache_{name}_total Expert cache {name}"
+        )
+        lines.append(f"# TYPE moe_expert_cache_{name}_total counter")
+        for phase in _POLICY_PHASES:
+            lines.append(
+                f'moe_expert_cache_{name}_total{{phase="{phase}"}} '
+                f"{value(f'{phase}_{name}')}"
+            )
+
+    lines.append("# HELP moe_expert_prefetch_total Expert prefetch operations")
+    lines.append("# TYPE moe_expert_prefetch_total counter")
+    for phase in _POLICY_PHASES:
+        for result in _POLICY_PREFETCH_RESULTS:
+            count = value(f"{phase}_prefetch_{result}")
+            labels = f'phase="{phase}",result="{result}"'
+            lines.append(f"moe_expert_prefetch_total{{{labels}}} {count}")
+
+    lines.append(
+        "# HELP moe_expert_cache_transition_hits_total Decode reuse of "
+        "prefill-admitted experts"
+    )
+    lines.append("# TYPE moe_expert_cache_transition_hits_total counter")
+    lines.append(
+        f"moe_expert_cache_transition_hits_total {value('transition_hits')}"
+    )
+    lines.append(
+        "# HELP moe_expert_prefetch_starvation_promotions_total Bounded "
+        "bypass promotions"
+    )
+    lines.append(
+        "# TYPE moe_expert_prefetch_starvation_promotions_total counter"
+    )
+    lines.append(
+        "moe_expert_prefetch_starvation_promotions_total "
+        f"{value('starvation_promotions')}"
+    )
+    return lines
 
 
 def _tokenize_text(prompt: str) -> list[int]:
@@ -1191,6 +1357,21 @@ async def _initialize_model() -> None:
         moe_config = {
             "offload_path": os.path.join(args.offload_dir, args.model),
             "device_memory_ratio": args.device_memory_ratio,
+            "phase_specific_expert_policy": bool(
+                getattr(args, "phase_specific_expert_policy", False)
+            ),
+            "kv_swap_mode": getattr(args, "kv_swap_mode", "sync"),
+            "kv_swap_host_memory_bytes": getattr(
+                args, "kv_swap_host_memory_bytes", 512 * 1024 * 1024
+            ),
+            "kv_swap_max_inflight_bytes": getattr(
+                args, "kv_swap_max_inflight_bytes", 256 * 1024 * 1024
+            ),
+            "kv_swap_checksum": getattr(args, "kv_swap_checksum", False),
+            "kv_swap_max_retries": getattr(args, "kv_swap_max_retries", 2),
+            "kv_swap_allow_sync_fallback": getattr(
+                args, "kv_swap_allow_sync_fallback", True
+            ),
             "enable_deepseek_mla_paging": enable_deepseek_mla_paging,
             "max_resident_paged_speculative_sessions": (
                 max_resident_paged_speculative_sessions
@@ -2062,6 +2243,22 @@ def _build_engine_config(
     validate_chunked_prefill_config(config)
     if args.enable_prefix_caching:
         config["enable_prefix_caching"] = True
+    config["kv_cache_format"] = getattr(args, "kv_cache_format", "native")
+    config["kv_cache_allow_fallback"] = getattr(
+        args, "kv_cache_allow_fallback", True
+    )
+    config["kv_swap_mode"] = getattr(args, "kv_swap_mode", "sync")
+    config["kv_swap_host_memory_bytes"] = getattr(
+        args, "kv_swap_host_memory_bytes", 512 * 1024 * 1024
+    )
+    config["kv_swap_max_inflight_bytes"] = getattr(
+        args, "kv_swap_max_inflight_bytes", 256 * 1024 * 1024
+    )
+    config["kv_swap_checksum"] = getattr(args, "kv_swap_checksum", False)
+    config["kv_swap_max_retries"] = getattr(args, "kv_swap_max_retries", 2)
+    config["kv_swap_allow_sync_fallback"] = getattr(
+        args, "kv_swap_allow_sync_fallback", True
+    )
     prefix_cache_max_entries = getattr(args, "prefix_cache_max_entries", None)
     if prefix_cache_max_entries is not None:
         if prefix_cache_max_entries < 1:
@@ -2126,6 +2323,56 @@ def parse_args() -> argparse.Namespace:
         help="maximum number of prefix cache entries (startup-only, >= 1)",
     )
     parser.add_argument(
+        "--kv-cache-format",
+        choices=("native", "int8_sym"),
+        default="native",
+        help="KV cache storage format (default: native).",
+    )
+    parser.add_argument(
+        "--no-kv-cache-format-fallback",
+        dest="kv_cache_allow_fallback",
+        action="store_false",
+        default=True,
+        help="Refuse a native fallback when the requested KV format is unsupported.",
+    )
+    parser.add_argument(
+        "--kv-swap-mode",
+        type=str,
+        default="sync",
+        choices=["sync", "async"],
+        help="Serving KV swap backend: 'sync' (default) or 'async'",
+    )
+    parser.add_argument(
+        "--kv-swap-host-memory-bytes",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="Hard cap on pinned host memory for async KV swap",
+    )
+    parser.add_argument(
+        "--kv-swap-max-inflight-bytes",
+        type=int,
+        default=256 * 1024 * 1024,
+        help="Hard cap on in-flight async KV transfer bytes",
+    )
+    parser.add_argument(
+        "--kv-swap-checksum",
+        action="store_true",
+        help="Enable opt-in CRC32 validation of swapped KV payloads",
+    )
+    parser.add_argument(
+        "--kv-swap-max-retries",
+        type=int,
+        default=2,
+        help="Maximum async swap-in retries before terminal reprefill",
+    )
+    parser.add_argument(
+        "--no-kv-swap-sync-fallback",
+        action="store_false",
+        dest="kv_swap_allow_sync_fallback",
+        default=True,
+        help="Disable async->sync fallback when pinned/CUDA is unavailable",
+    )
+    parser.add_argument(
         "--enable-decode-cuda-graphs",
         action="store_true",
         default=False,
@@ -2151,6 +2398,12 @@ def parse_args() -> argparse.Namespace:
         "--decode-cuda-graph-max-memory-bytes",
         type=int,
         default=0,
+    )
+    parser.add_argument(
+        "--phase-specific-expert-policy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable phase-specific expert admission, prefetch, and eviction policy.",
     )
     parser.add_argument(
         "--startup-timeout",

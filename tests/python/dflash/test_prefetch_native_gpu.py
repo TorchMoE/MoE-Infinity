@@ -65,8 +65,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+_LOADED_MODEL: Optional[object] = None
+
+
 @pytest.fixture(scope="module")
 def offloaded_prefetcher():
+    global _LOADED_MODEL
     from moe_infinity import MoE
 
     offload = os.environ.get(
@@ -78,9 +82,26 @@ def offloaded_prefetcher():
         TARGET_REPO,
         {"offload_path": offload, "device_memory_ratio": ratio},
     )
+    _LOADED_MODEL = model
     prefetcher = model.engine.expert_prefetcher
     assert prefetcher is not None and prefetcher.archer_engine is not None
     yield prefetcher
+
+
+def _run_one_token(prefetcher) -> None:
+    model = _LOADED_MODEL
+    assert model is not None
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(TARGET_REPO)
+    inputs = tokenizer("The capital of France is", return_tensors="pt")
+    model.generate(
+        inputs.input_ids,
+        max_new_tokens=1,
+        do_sample=False,
+    )
 
 
 def _saturated_ids(prefetcher) -> list[int]:
@@ -185,3 +206,26 @@ def test_native_route_ahead_priority_knob_issues_each_band(
             torch.cuda.synchronize()
     finally:
         offloaded_prefetcher.route_ahead_priority = original
+
+
+def test_native_compute_samples_are_drainable(offloaded_prefetcher) -> None:
+    dispatcher = offloaded_prefetcher.expert_dispatcher
+    dispatcher.set_overlap_compute_timing_enabled(True)
+    assert dispatcher.drain_compute_samples() == []
+    _run_one_token(offloaded_prefetcher)
+    samples = dispatcher.drain_compute_samples()
+    assert samples
+    assert all(
+        s.invocation_id > 0
+        and s.kernel_end_offset_ns > s.kernel_start_offset_ns
+        and s.kernel_duration_ns
+        == s.kernel_end_offset_ns - s.kernel_start_offset_ns
+        and s.forward_return_host_ns >= 0
+        and s.output_complete_host_ns >= s.forward_return_host_ns
+        and s.output_delay_ns
+        == s.output_complete_host_ns - s.forward_return_host_ns
+        and s.layer_id >= 0
+        for s in samples
+    )
+    assert len({s.invocation_id for s in samples}) == 1
+    assert dispatcher.drain_compute_samples() == []

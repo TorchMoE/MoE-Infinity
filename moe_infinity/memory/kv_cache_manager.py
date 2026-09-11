@@ -60,7 +60,11 @@ class KVCacheManager:
         num_gpu_blocks: int,
         num_cpu_blocks: int,
         block_size: int = 16,
+        device_id: int = 0,
     ):
+        if device_id < 0:
+            raise ValueError("device_id must be non-negative")
+        self.device_id = device_id
         self.block_size = block_size
         self._gpu_pool = BlockPool(num_blocks=num_gpu_blocks)
         self._cpu_pool = BlockPool(num_blocks=num_cpu_blocks)
@@ -141,7 +145,16 @@ class KVCacheManager:
     def get_block_table(self, seq_id: str) -> list[int]:
         return list(self._seq_to_gpu_blocks.get(seq_id, []))
 
-    def prepare_swap_out(self, seq_id: str) -> list[tuple[int, int]]:
+    def _validate_device(self, device_id: int) -> None:
+        if device_id != self.device_id:
+            raise ValueError(
+                f"device_id {device_id} does not match KV owner {self.device_id}"
+            )
+
+    def prepare_swap_out(
+        self, device_id: int, seq_id: str
+    ) -> list[tuple[int, int]]:
+        self._validate_device(device_id)
         gpu_block_ids = self._seq_to_gpu_blocks.get(seq_id, [])
         if not gpu_block_ids:
             return []
@@ -162,8 +175,9 @@ class KVCacheManager:
         return pairs
 
     def commit_swap_out(
-        self, seq_id: str, pairs: list[tuple[int, int]]
+        self, device_id: int, seq_id: str, pairs: list[tuple[int, int]]
     ) -> None:
+        self._validate_device(device_id)
         swapped_gpu_ids: list[int] = []
         for gpu_id, cpu_id in pairs:
             self._swap_map_gpu_to_cpu[gpu_id] = cpu_id
@@ -179,9 +193,11 @@ class KVCacheManager:
 
     def prepare_swap_in(
         self,
+        device_id: int,
         seq_id: str,
         swapped_gpu_block_ids: list[int],
     ) -> list[tuple[int, int]]:
+        self._validate_device(device_id)
         _ = seq_id
         pairs: list[tuple[int, int]] = []
         new_gpu_blocks: list[KVCacheBlock] = []
@@ -206,10 +222,12 @@ class KVCacheManager:
 
     def commit_swap_in(
         self,
+        device_id: int,
         seq_id: str,
         orig_gpu_block_ids: list[int],
         pairs: list[tuple[int, int]],
     ) -> None:
+        self._validate_device(device_id)
         new_gpu_ids: list[int] = []
         for orig_gpu_id, (cpu_id, new_gpu_id) in zip(orig_gpu_block_ids, pairs):
             cpu_block = self._cpu_allocated_blocks.pop(cpu_id, None)
@@ -241,6 +259,35 @@ class KVCacheManager:
     @property
     def num_cpu_blocks(self) -> int:
         return self._cpu_pool.total_blocks()
+
+    def resize_gpu_blocks(
+        self, device_id: int, target_blocks: int, receipt: object
+    ) -> None:
+        self._validate_device(device_id)
+        if target_blocks <= 0:
+            raise ValueError("target_blocks must be positive")
+        if getattr(receipt, "device_id", None) != device_id:
+            raise ValueError("resize receipt device_id does not match KV owner")
+        if not getattr(receipt, "admissions_paused", False):
+            raise RuntimeError("resize requires paused admissions")
+        events = tuple(getattr(receipt, "cuda_events", ()))
+        if not events or not all(bool(event.query()) for event in events):
+            raise RuntimeError("resize requires synchronized CUDA events")
+        if self._seq_to_gpu_blocks or self._gpu_pool.referenced_block_ids():
+            raise RuntimeError("cannot resize with referenced KV blocks")
+        if self._gpu_allocated_blocks:
+            raise RuntimeError("cannot resize with allocated KV blocks")
+        old_pool = self._gpu_pool
+        new_pool = BlockPool(target_blocks)
+        self._gpu_pool = new_pool
+        retain = getattr(receipt, "retain", None)
+        if callable(retain):
+            retain(old_pool)
+
+    def restore_gpu_pool(self, pool: BlockPool) -> None:
+        if self._seq_to_gpu_blocks or self._gpu_allocated_blocks:
+            raise RuntimeError("cannot restore KV pool with live blocks")
+        self._gpu_pool = pool
 
 
 __all__ = ["BlockPool", "KVCacheManager", "MemoryBudget"]

@@ -40,6 +40,10 @@ class TransferScheduler(ABC):
     @abstractmethod
     def wait(self, transfer_id: str, timeout_ms: float = 5000.0) -> bool: ...
 
+    def wait_for_device(self, device_id: int, timeout_ms: float) -> bool:
+        _ = (device_id, timeout_ms)
+        return True
+
     @abstractmethod
     def get_pending_count(self) -> dict[TransferType, int]: ...
 
@@ -62,12 +66,15 @@ class UnifiedTransferScheduler(TransferScheduler):
         self._condition: threading.Condition = threading.Condition(self._lock)
 
         self._pending: dict[str, threading.Event] = {}
+        self._requests: dict[str, TransferRequest] = {}
         self._results: dict[str, TransferResult] = {}
+        self._transfer_devices: dict[str, set[int]] = {}
 
         self._cancelled: set[str] = set()
 
         self._metrics: dict[TransferType, dict[str, int]] = {
-            t: {"count": 0, "bytes": 0} for t in TransferType
+            t: {"count": 0, "bytes": 0, "failures": 0, "cancelled": 0}
+            for t in TransferType
         }
 
         self._bandwidth_budgets: dict[str, float] = {
@@ -76,7 +83,7 @@ class UnifiedTransferScheduler(TransferScheduler):
         }
 
         self._handlers: dict[
-            TransferType, Callable[[TransferRequest], None]
+            TransferType, Callable[[TransferRequest], Optional[int]]
         ] = {}
 
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(
@@ -91,7 +98,7 @@ class UnifiedTransferScheduler(TransferScheduler):
     def register_handler(
         self,
         transfer_type: TransferType,
-        handler: Callable[[TransferRequest], None],
+        handler: Callable[[TransferRequest], Optional[int]],
     ) -> None:
         with self._lock:
             self._handlers[transfer_type] = handler
@@ -111,18 +118,22 @@ class UnifiedTransferScheduler(TransferScheduler):
         with profiler_cm:
             with nvtx_cm:
                 transfer_id = request.transfer_id or str(uuid.uuid4())
+                devices = self._validate_endpoints(request)
                 normalized_request = TransferRequest(
                     transfer_id=transfer_id,
                     transfer_type=request.transfer_type,
                     priority=request.priority,
                     source_device=request.source_device,
                     target_device=request.target_device,
+                    device_id=request.device_id,
                     tensor_id=request.tensor_id,
                     block_ids=list(request.block_ids),
                 )
                 event = threading.Event()
                 with self._condition:
                     self._pending[transfer_id] = event
+                    self._transfer_devices[transfer_id] = devices
+                    self._requests[transfer_id] = normalized_request
                     self._seq_counter += 1
                     heapq.heappush(
                         self._queue,
@@ -140,7 +151,14 @@ class UnifiedTransferScheduler(TransferScheduler):
         with self._condition:
             if transfer_id not in self._pending:
                 return False
+            request = self._requests[transfer_id]
+            if not any(
+                queued.transfer_id == transfer_id
+                for _, _, queued in self._queue
+            ):
+                return False
             self._cancelled.add(transfer_id)
+            self._transfer_devices.pop(transfer_id, None)
             event = self._pending.pop(transfer_id, None)
             if event:
                 self._results[transfer_id] = TransferResult(
@@ -148,6 +166,7 @@ class UnifiedTransferScheduler(TransferScheduler):
                     status="CANCELLED",
                     duration_ms=0.0,
                 )
+                self._metrics[request.transfer_type]["cancelled"] += 1
                 event.set()
         return True
 
@@ -158,6 +177,56 @@ class UnifiedTransferScheduler(TransferScheduler):
             if event is None:
                 return transfer_id in self._results
         return event.wait(timeout=timeout_ms / 1000.0)
+
+    @override
+    def wait_for_device(self, device_id: int, timeout_ms: float) -> bool:
+        if device_id < 0:
+            raise ValueError("device_id must be non-negative")
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            with self._lock:
+                events = [
+                    self._pending[transfer_id]
+                    for transfer_id, devices in self._transfer_devices.items()
+                    if device_id in devices and transfer_id in self._pending
+                ]
+            if not events:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if not events[0].wait(timeout=remaining):
+                return False
+
+    @staticmethod
+    def _cuda_endpoint_device(endpoint: str) -> Optional[int]:
+        if endpoint == "cpu":
+            return None
+        if not endpoint.startswith("cuda:"):
+            raise ValueError(f"malformed transfer endpoint: {endpoint}")
+        index = endpoint.removeprefix("cuda:")
+        if not index.isdigit():
+            raise ValueError(f"malformed CUDA device_id endpoint: {endpoint}")
+        device_id = int(index)
+        if device_id < 0:
+            raise ValueError("CUDA device_id must be non-negative")
+        return device_id
+
+    @classmethod
+    def _validate_endpoints(cls, request: TransferRequest) -> set[int]:
+        if request.device_id < 0:
+            raise ValueError("device_id must be non-negative")
+        devices = {
+            device
+            for device in (
+                cls._cuda_endpoint_device(request.source_device),
+                cls._cuda_endpoint_device(request.target_device),
+            )
+            if device is not None
+        }
+        if devices and devices != {request.device_id}:
+            raise ValueError("transfer endpoint does not match device_id")
+        return devices or {request.device_id}
 
     @override
     def get_pending_count(self) -> dict[TransferType, int]:
@@ -206,13 +275,19 @@ class UnifiedTransferScheduler(TransferScheduler):
         with profiler_cm:
             with nvtx_cm:
                 transfer_id = request.transfer_id
+                bytes_transferred = 0
+                error: Optional[str] = None
                 try:
                     handler = self._handlers.get(request.transfer_type)
                     if handler is not None:
-                        handler(request)
+                        handler_bytes = handler(request)
+                        if handler_bytes is not None:
+                            bytes_transferred = int(handler_bytes)
                     status = "COMPLETED"
-                except Exception:
+                except Exception as exc:
                     status = "FAILED"
+                    bytes_transferred = 0
+                    error = f"{type(exc).__name__}: {exc}"
 
                 duration_ms = (time.monotonic() - start_time) * 1000.0
                 with self._lock:
@@ -220,12 +295,18 @@ class UnifiedTransferScheduler(TransferScheduler):
                         transfer_id=transfer_id,
                         status=status,
                         duration_ms=duration_ms,
+                        bytes_transferred=bytes_transferred,
+                        error=error,
                     )
-                    self._metrics[request.transfer_type]["count"] += 1
-                    self._metrics[request.transfer_type]["bytes"] += len(
-                        request.block_ids
-                    )
+                    metrics = self._metrics[request.transfer_type]
+                    metrics["count"] += 1
+                    if status == "FAILED":
+                        metrics["failures"] += 1
+                    else:
+                        metrics["bytes"] += bytes_transferred
                     event = self._pending.pop(transfer_id, None)
+                    self._transfer_devices.pop(transfer_id, None)
+                    self._requests.pop(transfer_id, None)
                     if event:
                         event.set()
 
@@ -244,6 +325,7 @@ class UnifiedTransferScheduler(TransferScheduler):
             with self._lock:
                 if transfer_id in self._cancelled:
                     self._cancelled.discard(transfer_id)
+                    self._requests.pop(transfer_id, None)
                     continue
 
             start_time = time.monotonic()

@@ -10,6 +10,7 @@
 #include <cuda_runtime_api.h>
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include "aio/archer_prio_aio_handle.h"
 #include "aio/archer_tensor_handle.h"
@@ -741,6 +742,44 @@ void ArcherTopologyHandle::BuildTopologyFromSpecs(
   EnableTrace();
 }
 
+NodePtr ArcherTopologyHandle::CreateDetachedNode(
+    const std::vector<TensorID>& tensor_ids, int gpu_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (tensor_ids.empty() || gpu_id < 0 || kTensorIndex == nullptr) {
+    throw std::invalid_argument("invalid detached expert node request");
+  }
+
+  std::int64_t aligned_bytes = 0;
+  for (const TensorID tensor_id : tensor_ids) {
+    const auto meta = kTensorIndex->find(tensor_id);
+    if (meta == kTensorIndex->end() || meta->second.size == 0 ||
+        meta->second.size > static_cast<std::uint64_t>(
+                                std::numeric_limits<std::int64_t>::max())) {
+      throw std::invalid_argument("invalid detached expert tensor metadata");
+    }
+    const auto size = static_cast<std::int64_t>(meta->second.size);
+    const auto alignment = static_cast<std::int64_t>(kAioAlignment);
+    if (size > std::numeric_limits<std::int64_t>::max() - alignment + 1) {
+      throw std::overflow_error("detached expert tensor size overflow");
+    }
+    const auto aligned = (size + alignment - 1) & ~(alignment - 1);
+    if (aligned_bytes > std::numeric_limits<std::int64_t>::max() - aligned) {
+      throw std::overflow_error("detached expert node size overflow");
+    }
+    aligned_bytes += aligned;
+  }
+
+  auto node = std::make_shared<Node>();
+  node->tensor_ids = tensor_ids;
+  node->byte_size = aligned_bytes;
+  node->id = next_detached_node_id_++;
+  node->corr_id = node->id;
+  node->is_sparse = true;
+  node->default_device = torch::Device(torch::kCUDA, gpu_id);
+  node->default_host = CPU_DEVICE;
+  return node;
+}
+
 void ArcherTopologyHandle::InitializeTopology(
     const std::vector<
         std::tuple<std::string, std::vector<std::vector<TensorID>>>>&
@@ -848,6 +887,14 @@ NodeBodyPtr ArcherTopologyHandle::GetNodeBodyFromCorrID(
 
 std::int64_t ArcherTopologyHandle::GetSparseCacheLimit(
     const torch::Device& device) {
+  if (device.is_cuda()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = sparse_cache_limit_override_.find(device.index());
+    if (it != sparse_cache_limit_override_.end()) {
+      return it->second;
+    }
+  }
+
   std::int64_t dense_cache_size = 0;
   for (auto& stage : pipeline_.stages) {
     for (auto& node_body : stage->nodes) {
@@ -865,6 +912,24 @@ std::int64_t ArcherTopologyHandle::GetSparseCacheLimit(
   std::int64_t sparse_cache_size = device_size_limit - dense_cache_size;
 
   return sparse_cache_size;
+}
+
+void ArcherTopologyHandle::SetSparseCacheLimitOverride(
+    int device_id, std::int64_t limit_bytes) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  sparse_cache_limit_override_[device_id] = limit_bytes;
+}
+
+void ArcherTopologyHandle::ClearSparseCacheLimitOverride(int device_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  sparse_cache_limit_override_.erase(device_id);
+}
+
+std::int64_t ArcherTopologyHandle::GetSparseCacheLimitOverride(
+    int device_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = sparse_cache_limit_override_.find(device_id);
+  return (it == sparse_cache_limit_override_.end()) ? -1 : it->second;
 }
 
 std::tuple<std::size_t, std::size_t>

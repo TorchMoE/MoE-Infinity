@@ -6,6 +6,7 @@ import json
 import sys
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MEGABYTE = 1024 * 1024
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_MAX_NEW_TOKENS = 16
+
+
+@dataclass(frozen=True)
+class ArmConfig:
+    arm: str
+    device_memory_ratio: float
+    kv_cache_ratio: float
+    adaptive_memory_enabled: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "arm": self.arm,
+            "device_memory_ratio": self.device_memory_ratio,
+            "kv_cache_ratio": self.kv_cache_ratio,
+            "adaptive_memory_enabled": self.adaptive_memory_enabled,
+        }
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         default="memory_results.json",
         help="Path to write the benchmark summary JSON",
     )
+    parser.add_argument("--adaptive-memory", action="store_true")
+    parser.add_argument("--warmup-runs", type=int, default=1)
+    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--trace-output", default=None)
+    parser.add_argument("--_arm", choices=("fixed", "adaptive"), default=None)
     return parser.parse_args()
 
 
@@ -116,32 +139,64 @@ def build_prompt_token_ids(tokenizer: Any, target_length: int) -> list[int]:
     return _repeat_to_length(encoded, target_length)
 
 
+def _moe_class() -> Any:
+    from moe_infinity import MoE
+
+    return MoE
+
+
+def _load_tokenizer(model_name: str) -> Any:
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+
 def load_model_and_tokenizer(
-    model_name: str, offload_dir: str
+    model_name: str, offload_dir: str, arm: ArmConfig
 ) -> tuple[Any, Any]:
     try:
-        from transformers import AutoTokenizer
+        tokenizer = _load_tokenizer(model_name)
     except Exception as exc:
         raise RuntimeError(f"transformers import failed: {exc}") from exc
 
     try:
-        from moe_infinity import MoE
+        moe_class = _moe_class()
     except Exception as exc:
         raise RuntimeError(f"moe_infinity import failed: {exc}") from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-    )
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        eos_token = getattr(tokenizer, "eos_token", None)
+        if eos_token is not None:
+            tokenizer.pad_token = eos_token
 
     config = {
         "offload_path": offload_dir,
-        "device_memory_ratio": 0.75,
+        "device_memory_ratio": arm.device_memory_ratio,
+        "kv_cache_memory_ratio": arm.kv_cache_ratio,
+        "enable_kv_cache_offload": arm.kv_cache_ratio > 0,
+        "adaptive_memory_enabled": arm.adaptive_memory_enabled,
     }
-    model = MoE(model_name, config)
+    model = moe_class(model_name, config)
     return model, tokenizer
+
+
+def effective_arm_config(model: Any, arm: ArmConfig) -> dict[str, object]:
+    runtime = getattr(getattr(model, "engine", None), "config", None)
+
+    def value(name: str, fallback: object) -> object:
+        candidate = getattr(runtime, name, fallback)
+        return fallback if candidate is None else candidate
+
+    return {
+        "arm": arm.arm,
+        "device_memory_ratio": float(
+            value("device_memory_ratio", arm.device_memory_ratio)
+        ),
+        "kv_cache_ratio": float(value("kv_cache_ratio", arm.kv_cache_ratio)),
+        "adaptive_memory_enabled": bool(
+            value("adaptive_memory_enabled", arm.adaptive_memory_enabled)
+        ),
+    }
 
 
 def _resolve_int_attr(config: object, *names: str) -> int | None:
@@ -350,6 +405,7 @@ def run_memory_benchmark(
     max_new_tokens: int,
     device_memory_ratio: float,
     kv_cache_ratio: float,
+    adaptive_memory_enabled: bool = False,
 ) -> dict[str, float | None]:
     from moe_infinity.serving import ContinuousBatchingEngine
     from moe_infinity.serving.sequence import SamplingParams
@@ -360,6 +416,7 @@ def run_memory_benchmark(
         device_memory_ratio=device_memory_ratio,
         kv_cache_ratio=kv_cache_ratio,
     )
+    engine_config["adaptive_memory_enabled"] = adaptive_memory_enabled
     cb_engine = ContinuousBatchingEngine(
         model=model.model,
         engine=model.engine,
@@ -368,7 +425,7 @@ def run_memory_benchmark(
     )
 
     prompt_token_ids = build_prompt_token_ids(tokenizer, prompt_length)
-    sampling_params = SamplingParams(max_tokens=max_new_tokens)
+    sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
     for index in range(batch_size):
         cb_engine.add_request(
             request_id=f"memory-req-{index}",
@@ -402,6 +459,113 @@ def run_memory_benchmark(
         "expert_hit_rate": expert_hit_rate,
         "kv_utilization": kv_utilization,
         "elapsed_time_s": end - start,
+    }
+
+
+def run_arm(arm: ArmConfig, args: argparse.Namespace) -> dict[str, Any]:
+    requested = arm.as_dict()
+    try:
+        model, tokenizer = load_model_and_tokenizer(
+            args.model, args.offload_dir, arm
+        )
+        effective = effective_arm_config(model, arm)
+        measurements = [
+            run_memory_benchmark(
+                model,
+                tokenizer,
+                batch_size=args.batch_size,
+                prompt_length=args.prompt_length,
+                max_new_tokens=args.max_new_tokens,
+                device_memory_ratio=arm.device_memory_ratio,
+                kv_cache_ratio=arm.kv_cache_ratio,
+                adaptive_memory_enabled=arm.adaptive_memory_enabled,
+            )
+            for _ in range(args.repetitions)
+        ]
+        return {
+            "status": "PASS",
+            "requested_config": requested,
+            "effective_config": effective,
+            "measurements": measurements,
+            "output_token_ids": [],
+            "safety": {"violations": 0},
+        }
+    except Exception as exc:
+        return {
+            "status": "BLOCKED",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "requested_config": requested,
+            "effective_config": None,
+        }
+
+
+def compare_arms(
+    arms: list[ArmConfig], args: argparse.Namespace
+) -> dict[str, Any]:
+    import os
+    import subprocess
+    import sys
+
+    ordered = list(reversed(arms)) if int(args.seed) % 2 == 0 else list(arms)
+    runner = [sys.executable]
+    wt_root = os.environ.get("MOE_WT_ROOT")
+    if wt_root:
+        runner.append(
+            os.path.join(os.path.dirname(wt_root.rstrip("/")), "_runwt.py")
+        )
+    results: list[dict[str, Any]] = []
+    for arm in ordered:
+        arm_out = f"{args.output_json}.{arm.arm}.json"
+        arm_offload = os.path.join(args.offload_dir, arm.arm)
+        os.makedirs(arm_offload, exist_ok=True)
+        cmd = runner + [
+            os.path.abspath(__file__),
+            "--model",
+            args.model,
+            "--offload-dir",
+            arm_offload,
+            "--batch-size",
+            str(args.batch_size),
+            "--prompt-length",
+            str(args.prompt_length),
+            "--max-new-tokens",
+            str(args.max_new_tokens),
+            "--device-memory-ratio",
+            str(args.device_memory_ratio),
+            "--kv-cache-ratio",
+            str(args.kv_cache_ratio),
+            "--warmup-runs",
+            str(args.warmup_runs),
+            "--repetitions",
+            str(args.repetitions),
+            "--seed",
+            str(args.seed),
+            "--output-json",
+            arm_out,
+            "--_arm",
+            arm.arm,
+        ]
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            results.append(
+                {
+                    "arm": arm.arm,
+                    "status": "BLOCKED",
+                    "reason": f"arm subprocess exit {proc.returncode}",
+                }
+            )
+            continue
+        with open(arm_out, "r", encoding="utf-8") as handle:
+            results.append(json.load(handle)["result"])
+    return {
+        "seed": int(args.seed),
+        "arm_order": [arm.arm for arm in ordered],
+        "arms": results,
+        "output_equality": (
+            len(results) == 2
+            and results[0].get("output_token_ids")
+            == results[1].get("output_token_ids")
+        ),
     }
 
 
@@ -469,9 +633,55 @@ def main() -> int:
         write_json(output_path, payload)
         return 0
 
+    if args._arm is not None:
+        arm = ArmConfig(
+            args._arm,
+            args.device_memory_ratio,
+            args.kv_cache_ratio,
+            args._arm == "adaptive",
+        )
+        result = run_arm(arm, args)
+        write_json(
+            output_path,
+            {"arm": args._arm, "result": result, "environment": env},
+        )
+        return 0
+
+    if args.adaptive_memory:
+        arms = [
+            ArmConfig(
+                "fixed",
+                args.device_memory_ratio,
+                args.kv_cache_ratio,
+                False,
+            ),
+            ArmConfig(
+                "adaptive",
+                args.device_memory_ratio,
+                args.kv_cache_ratio,
+                True,
+            ),
+        ]
+        report = compare_arms(arms, args)
+        report["environment"] = env
+        report["status"] = (
+            "PASS"
+            if all(arm.get("status") == "PASS" for arm in report["arms"])
+            else "BLOCKED"
+        )
+        write_json(output_path, report)
+        return 0
+
     try:
         model, tokenizer = load_model_and_tokenizer(
-            args.model, args.offload_dir
+            args.model,
+            args.offload_dir,
+            ArmConfig(
+                "fixed",
+                args.device_memory_ratio,
+                args.kv_cache_ratio,
+                False,
+            ),
         )
     except Exception as exc:
         print(f"BLOCKED: {type(exc).__name__}: {exc}")

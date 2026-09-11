@@ -86,6 +86,29 @@ def _mla_kv_cache_spec(config: object) -> dict[str, int]:
     return {"num_kv_heads": int(num_kv_heads), "head_dim": int(head_dim)}
 
 
+def _valid_token_index(
+    metadata: object,
+    bsz: int,
+    q_len: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    lengths = getattr(metadata, "lengths", None)
+    query_lengths = (
+        getattr(lengths, "query_lengths", None) if lengths is not None else None
+    )
+    if query_lengths is None:
+        return None
+    per_seq = [int(v) for v in query_lengths.reshape(-1).tolist()]
+    if len(per_seq) != bsz or all(length == q_len for length in per_seq):
+        return None
+    indices = [
+        row * q_len + col
+        for row, length in enumerate(per_seq)
+        for col in range(length)
+    ]
+    return torch.tensor(indices, dtype=torch.long, device=device)
+
+
 def _run_paged_mla(
     paged_backend: _SupportsPagedAttention,
     attention_metadata: _Metadata,
@@ -121,6 +144,15 @@ def _run_paged_mla(
         .view(-1, num_heads, cache_head_dim)
     )
 
+    valid_index = _valid_token_index(
+        attention_metadata, batch_size, seq_length, query_tokens.device
+    )
+    packed = valid_index is not None
+    if packed:
+        query_tokens = query_tokens.index_select(0, valid_index)
+        key_tokens = key_tokens.index_select(0, valid_index)
+        value_tokens = value_tokens.index_select(0, valid_index)
+
     attn_output_tokens = paged_backend.forward(
         query_tokens,
         key_tokens,
@@ -132,6 +164,13 @@ def _run_paged_mla(
 
     if attn_output_tokens is None or attn_output_tokens.ndim != 3:
         raise ValueError("paged attention backend must return rank-3 tensor")
+
+    if packed:
+        unpacked = attn_output_tokens.new_zeros(
+            (batch_size * seq_length, num_heads, cache_head_dim)
+        )
+        unpacked.index_copy_(0, valid_index, attn_output_tokens)
+        attn_output_tokens = unpacked
 
     attn_output = attn_output_tokens[..., :v_head_dim].reshape(
         batch_size, seq_length, num_heads * v_head_dim

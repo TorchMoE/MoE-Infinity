@@ -1,5 +1,10 @@
 # Model compatibility matrix
 
+Adaptive candidate evaluation is limited to unquantized Mixtral, Qwen3-MoE, and DeepSeek-V2. GPT-OSS MXFP4, GLM-5.2 FP8, DeepSeek-V4-Flash FP4, DeepSeek-V3 FP8, and GPTQ/AWQ remain protected.
+
+This guide is the source of truth for the families registered in
+`moe_infinity/common/constants.py` and the runtime adapters wired in
+`moe_infinity/runtime/model_offload.py`.
 This page separates general model support from DFlash evidence. `validated`
 means the named scope has a repository harness; `implemented/experimental`
 means code plus tiny/unit evidence; `not recorded` means no direct evidence.

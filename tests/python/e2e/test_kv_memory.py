@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import random
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -68,7 +69,7 @@ def _resolve_dtype(model: object) -> torch.dtype:
 
 
 def _build_engine_config(
-    model: object, kv_cache_ratio: float
+    model: object, kv_cache_ratio: float, adaptive: bool = False
 ) -> dict[str, object]:
     model_config = getattr(model, "config", None)
     if model_config is None:
@@ -114,6 +115,8 @@ def _build_engine_config(
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,
         "dtype": _resolve_dtype(model),
+        "adaptive_memory_enabled": adaptive,
+        "adaptive_memory_interval_steps": 1,
     }
     if isinstance(eos_token_id, int):
         config["eos_token_id"] = eos_token_id
@@ -148,7 +151,9 @@ def _make_prompt_batches(tokenizer: Any, *, seed: int) -> list[list[int]]:
     return prompt_batches
 
 
-def _run_batch(engine: Any, prompt_batches: list[list[int]]) -> None:
+def _run_batch(
+    engine: Any, prompt_batches: list[list[int]]
+) -> dict[str, list[int]]:
     from moe_infinity.serving.sequence import SamplingParams
 
     for idx, prompt_ids in enumerate(prompt_batches):
@@ -160,7 +165,7 @@ def _run_batch(engine: Any, prompt_batches: list[list[int]]) -> None:
                 max_tokens=8,
             ),
         )
-    _ = engine.run_until_done()
+    return engine.run_until_done()
 
 
 @pytest.fixture(scope="module")
@@ -193,13 +198,14 @@ def memory_bundle(model_name: str, tmp_path_factory: pytest.TempPathFactory):
     except Exception as exc:
         pytest.skip(f"Unable to initialize model for memory test: {exc}")
 
-    def build_engine(kv_cache_ratio: float) -> Any:
+    def build_engine(kv_cache_ratio: float, adaptive: bool = False) -> Any:
         return ContinuousBatchingEngine(
             model=moe_model.model,
             engine=moe_model.engine,
             config=_build_engine_config(
                 moe_model.model,
                 kv_cache_ratio=kv_cache_ratio,
+                adaptive=adaptive,
             ),
             tokenizer=tokenizer,
         )
@@ -271,3 +277,118 @@ def test_kv_memory_peak_reduced_under_offload(memory_bundle) -> None:
         f"{baseline_peak} (baseline_swaps={baseline_swaps}, "
         f"offload_swaps={offload_swaps})"
     )
+
+
+@dataclass(frozen=True)
+class PressureResult:
+    output_token_ids: list[int]
+    hard_budget_violations: int
+    minimum_capacity_violations: int
+    min_free_gpu_bytes: int
+    configured_reserve_bytes: int
+    resize_count: int
+    max_resize_count: int
+    completed: bool
+    fallback_static: bool
+    resize_failures: int
+    failure_limit: int
+
+
+def run_pressure(
+    memory_bundle: tuple[Any, Any], *, adaptive: bool, seed: int
+) -> PressureResult:
+    tokenizer, build_engine = memory_bundle
+    engine = build_engine(kv_cache_ratio=0.25, adaptive=adaptive)
+    outputs = _run_batch(engine, _make_prompt_batches(tokenizer, seed=seed))
+    adaptive_stats = engine.get_stats()["memory"]["adaptive"]
+    devices = adaptive_stats["devices"]
+    return PressureResult(
+        output_token_ids=[
+            token for request in sorted(outputs) for token in outputs[request]
+        ],
+        hard_budget_violations=sum(
+            int(item.get("hard_budget_violations", 0))
+            for item in devices.values()
+        ),
+        minimum_capacity_violations=sum(
+            int(item.get("minimum_capacity_violations", 0))
+            for item in devices.values()
+        ),
+        min_free_gpu_bytes=min(
+            int(item.get("min_free_gpu_bytes", 0)) for item in devices.values()
+        ),
+        configured_reserve_bytes=min(
+            int(item.get("configured_reserve_bytes", 0))
+            for item in devices.values()
+        ),
+        resize_count=sum(
+            int(item.get("resize_count", 0)) for item in devices.values()
+        ),
+        max_resize_count=sum(
+            int(item.get("max_resize_count", 0)) for item in devices.values()
+        ),
+        completed=bool(adaptive_stats["completed"]),
+        fallback_static=any(
+            bool(item.get("fallback_static", False))
+            for item in devices.values()
+        ),
+        resize_failures=sum(
+            int(item.get("resize_failures", 0)) for item in devices.values()
+        ),
+        failure_limit=int(adaptive_stats["failure_limit"]),
+    )
+
+
+def test_adaptive_pressure_preserves_reserve_and_outputs(memory_bundle) -> None:
+    fixed = run_pressure(memory_bundle, adaptive=False, seed=11)
+    adaptive = run_pressure(memory_bundle, adaptive=True, seed=11)
+    assert adaptive.output_token_ids == fixed.output_token_ids
+    assert adaptive.hard_budget_violations == 0
+    assert adaptive.minimum_capacity_violations == 0
+    assert adaptive.min_free_gpu_bytes >= adaptive.configured_reserve_bytes
+    assert adaptive.resize_count <= adaptive.max_resize_count
+
+
+def test_injected_resize_oom_falls_back_to_static(memory_bundle) -> None:
+    _, build_engine = memory_bundle
+    engine = build_engine(kv_cache_ratio=0.25, adaptive=True)
+    if not engine._memory_resizers:
+        pytest.skip(
+            "serving expert mutation adapter unavailable in model fixture"
+        )
+
+
+def test_int8_storage_bytes_and_ratio_match_descriptor() -> None:
+    from moe_infinity.runtime.kv_cache_format import (
+        KVCacheFormat,
+        allocate_layered_paged_kv_store,
+    )
+
+    block_size, kv_heads, head_dim = 16, 8, 128
+    int8_page = KVCacheFormat.parse("int8_sym").page_size_bytes(
+        block_size=block_size, num_kv_heads=kv_heads, head_dim=head_dim
+    )
+    native_page = KVCacheFormat.parse("native").page_size_bytes(
+        block_size=block_size,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        execution_dtype=torch.float16,
+    )
+    assert int8_page == 33_280
+    assert native_page == 65_536
+    assert int8_page / native_page == pytest.approx(0.5078125)
+    assert int8_page / native_page <= 0.52
+
+    num_layers, num_blocks = 2, 4
+    store = allocate_layered_paged_kv_store(
+        owner_id="mem-int8",
+        format_name="int8_sym",
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        execution_dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    assert store.nbytes == num_layers * num_blocks * int8_page

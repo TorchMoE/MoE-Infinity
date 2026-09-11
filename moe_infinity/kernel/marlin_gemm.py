@@ -22,6 +22,22 @@ def is_marlin_available() -> bool:
     return _MARLIN_AVAILABLE
 
 
+def marlin_supports_shape(
+    k: int,
+    n: int,
+    groupsize: int,
+    extension_available: bool | None = None,
+) -> bool:
+    available = (
+        _MARLIN_AVAILABLE
+        if extension_available is None
+        else extension_available
+    )
+    return bool(
+        available and groupsize in (-1, 128) and k % 128 == 0 and n % 256 == 0
+    )
+
+
 def _get_perms() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     perm: list[int] = []
     for i in range(32):
