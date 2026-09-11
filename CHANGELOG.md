@@ -22,6 +22,7 @@ All notable changes to MoE-Infinity will be documented in this file.
 - Direct bare-HF batch-1/batch>1 greedy, sampled, and mixed-row execution with dense reconstruction, right-padded output, and `last_generated_lengths`.
 - Stage 4a persistent serving sessions and default-off Stage 4b engine-owned DeepSeek V2/V3 MLA pages for eligible greedy batch-1 requests.
 - No-download unified-execution benchmark/validator and compatibility assertions that fail closed on sampling, ordering, cache invariant, or ownership failures.
+- GLM-5.3-Flash (`zai-org/GLM-5.3-Flash`) glm5_next family support: guarded registry entry, nested text_config parsing, `SyncGlm5NextMoEBlock`, and offload runtime wiring (routed FP8 experts offloaded; KDA/DSA/mHC/vision resident, text-only).
 
 ### Changed
 

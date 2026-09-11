@@ -27,6 +27,11 @@ try:
 except ImportError:
     GlmMoeDsaForCausalLM = None
 
+try:
+    from transformers import Glm5NextForConditionalGeneration
+except ImportError:
+    Glm5NextForConditionalGeneration = None
+
 MODEL_MAPPING_NAMES = {
     "nllb": NllbMoeForConditionalGeneration,
     "mixtral": MixtralForCausalLM,
@@ -75,6 +80,17 @@ if Qwen3_5MoeForConditionalGeneration is not None:
 if GlmMoeDsaForCausalLM is not None:
     MODEL_MAPPING_NAMES["glmmoedsa"] = GlmMoeDsaForCausalLM
     MODEL_MAPPING_TYPES["glmmoedsa"] = 5
+
+# GLM-5.3-Flash (arch "Glm5NextForConditionalGeneration", model_type
+# "glm5_next") nests its MoE fields under text_config and routes 288
+# per-expert gate_proj/up_proj/down_proj experts with the same sigmoid/
+# noaux_tc router family as GlmMoeDsa (expert-type 5). The hybrid KDA
+# linear-attention layers, DSA indexer, mHC hyper-connections, and vision
+# tower stay resident. Requires transformers >= 5.16 which ships the class;
+# registered only when it is importable (mirrors the guards above).
+if Glm5NextForConditionalGeneration is not None:
+    MODEL_MAPPING_NAMES["glm5next"] = Glm5NextForConditionalGeneration
+    MODEL_MAPPING_TYPES["glm5next"] = 5
 
 
 def parse_expert_type(config: PretrainedConfig) -> int:

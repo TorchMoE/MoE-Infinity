@@ -12,6 +12,7 @@ from .device import (
 )
 from .gptq import is_gptq_packed_tensor, is_gptq_quantized
 from .hf_config import (
+    moe_text_config,
     parse_expert_dtype,
     parse_expert_id,
     parse_moe_param,
@@ -37,6 +38,7 @@ __all__ = [
     "is_cuda_available",
     "is_gptq_packed_tensor",
     "is_gptq_quantized",
+    "moe_text_config",
     "parse_expert_dtype",
     "parse_expert_id",
     "parse_moe_param",

@@ -7,6 +7,7 @@ from .dbrx import SyncDbrxFFNBlock
 from .deepseek import DeepseekMoEBlock
 from .deepseek_v2_wrapper import SyncDeepseekV2MoEBlock
 from .deepseek_v3_wrapper import SyncDeepseekV3MoEBlock
+from .glm5_next import SyncGlm5NextMoEBlock
 from .glm_moe_dsa import SyncGlmMoeDsaMoEBlock
 from .gpt_oss import SyncGptOssMLP
 from .jamba import SyncJambaMoEBlock
@@ -34,6 +35,7 @@ __all__ = [
     "SyncDbrxFFNBlock",
     "SyncDeepseekV2MoEBlock",
     "SyncDeepseekV3MoEBlock",
+    "SyncGlm5NextMoEBlock",
     "SyncGlmMoeDsaMoEBlock",
     "SyncGptOssMLP",
     "SyncJambaMoEBlock",

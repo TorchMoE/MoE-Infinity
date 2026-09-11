@@ -627,8 +627,15 @@ void ArcherTopologyHandle::BuildTopologyFromSpecs(
   // int dense_gpu_idx = 0;
   // int sparse_gpu_idx = 0;
 
-  // Split evently dense nodes only
-  int num_dense_nodes_per_device = std::ceil(dense_nodes.size() / num_gpu / 2);
+  // Split evenly dense nodes only. Guard the per-device quota against zero:
+  // integer division truncates to 0 for fewer than 2*num_gpu dense nodes,
+  // which would make the modulo below divide by zero. Topologies whose
+  // families keep every non-expert tensor resident (e.g. qwen3_5_moe,
+  // glm5_next) have NO dense nodes at all, so the back() placement must also
+  // be guarded against an empty vector.
+  int num_dense_nodes_per_device = std::max(
+      1, static_cast<int>(
+             std::ceil(static_cast<double>(dense_nodes.size()) / num_gpu / 2)));
   // int total_dense_nodes = dense_nodes.size();
   int counter = 0;
   DLOG_INFO("Moving dense parameters to CPU");
@@ -640,7 +647,10 @@ void ArcherTopologyHandle::BuildTopologyFromSpecs(
     }
     node_ptr->SetDevice(CPU_DEVICE, false);
   }
-  dense_nodes.back()->default_device = torch::Device(torch::kCUDA, num_gpu - 1);
+  if (!dense_nodes.empty()) {
+    dense_nodes.back()->default_device =
+        torch::Device(torch::kCUDA, num_gpu - 1);
+  }
 
   DLOG_INFO("Moving sparse parameters to CPU");
   if (!sparse_nodes.empty()) {
