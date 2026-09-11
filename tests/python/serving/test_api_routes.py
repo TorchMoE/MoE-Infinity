@@ -41,6 +41,21 @@ def _make_mock_stats() -> dict[str, Any]:
             "total_gpu_memory_bytes": 0,
             "expert_cache_bytes": 0,
             "kv_cache_bytes": 0,
+            "adaptive": {
+                "devices": {
+                    0: {
+                        "enabled": True,
+                        "fallback_static": False,
+                        "expert_target_bytes": 10,
+                        "kv_target_blocks": 4,
+                        "resize_attempts": 2,
+                        "resize_failures": 1,
+                        "reserve_rejections": 0,
+                        "expert_miss_cost": 1.5,
+                        "kv_pressure_cost": 2.5,
+                    }
+                }
+            },
         },
         "kv_swap": {
             "mode": "async",
@@ -584,6 +599,8 @@ def test_metrics_endpoint(client: TestClient) -> None:
     assert "moe_queue_depth" in body
     assert "moe_kv_cache_free_blocks" in body
     assert "moe_tokens_generated_total" in body
+    assert 'moe_adaptive_memory_enabled{device="0"} 1' in body
+    assert 'moe_adaptive_memory_kv_target_blocks{device="0"} 4' in body
     required = [
         "moe_kv_swap_inflight 2",
         "moe_kv_swap_inflight_bytes 512",

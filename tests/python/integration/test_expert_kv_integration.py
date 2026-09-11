@@ -20,6 +20,7 @@ def _kv_swap_in_request(transfer_id: str) -> TransferRequest:
         priority=TransferPriority.NORMAL,
         source_device="cpu",
         target_device="cuda:0",
+        device_id=0,
         block_ids=[0, 1],
     )
 
@@ -91,6 +92,7 @@ def test_coordinator_registers_handler() -> None:
                 priority=TransferPriority.HIGH,
                 source_device="cpu",
                 target_device="cuda:0",
+                device_id=0,
                 tensor_id="3",
                 block_ids=[10, 11],
             )
@@ -102,6 +104,7 @@ def test_coordinator_registers_handler() -> None:
                 priority=TransferPriority.NORMAL,
                 source_device="cuda:0",
                 target_device="cpu",
+                device_id=0,
                 tensor_id="4",
                 block_ids=[12],
             )

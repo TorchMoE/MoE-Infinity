@@ -68,6 +68,58 @@ def fused_ffn(
     return _impl(x, gate_weight, up_weight, down_weight)
 
 
+def _decode_attention_eager(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Eager equivalent of the fused decode kernel, in the same paged layout.
+
+    query is ``[batch, 1, num_heads, head_dim]`` and the caches are
+    ``[num_blocks, block_size, num_kv_heads, head_dim]``, which is the layout
+    ``fused_decode_attn`` uses -- not the vLLM layout ``paged_attention_fwd``
+    expects.
+    """
+    batch, _, num_heads, _ = query.shape
+    _, block_size, num_kv_heads, _ = key_cache.shape
+    if num_heads % num_kv_heads != 0:
+        raise ValueError("num_heads must be divisible by num_kv_heads")
+    query_group_size = num_heads // num_kv_heads
+
+    out = torch.zeros(
+        query.shape[0],
+        num_heads,
+        query.shape[-1],
+        dtype=query.dtype,
+        device=query.device,
+    )
+    for seq_idx in range(batch):
+        seq_len = int(seq_lens[seq_idx].item())
+        if seq_len <= 0:
+            continue
+
+        offsets = torch.arange(seq_len, device=query.device)
+        physical_block = block_tables[seq_idx][offsets // block_size].long()
+        token_in_block = offsets % block_size
+
+        # [seq_len, num_kv_heads, head_dim] -> [seq_len, num_heads, head_dim]
+        k = key_cache[physical_block, token_in_block].float()
+        v = value_cache[physical_block, token_in_block].float()
+        if query_group_size > 1:
+            k = k.repeat_interleave(query_group_size, dim=1)
+            v = v.repeat_interleave(query_group_size, dim=1)
+
+        q = query[seq_idx, 0].float()
+        logits = (k * q.unsqueeze(0)).sum(dim=-1) * scale
+        probs = torch.softmax(logits, dim=0)
+        out[seq_idx] = (probs.unsqueeze(-1) * v).sum(dim=0).to(query.dtype)
+
+    return out
+
+
 def fused_decode_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -76,9 +128,9 @@ def fused_decode_attention(
     seq_lens: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Fused decode attention with paged KV. Falls back to FlashInfer/SDPA if disabled."""
+    """Fused decode attention with paged KV. Falls back to eager if disabled."""
     if _FUSED_KERNELS_DISABLED:
-        return paged_attention_fwd(
+        return _decode_attention_eager(
             query, key_cache, value_cache, block_tables, seq_lens, scale
         )
     from .fused_decode_attn import fused_decode_attention as _impl

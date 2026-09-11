@@ -5,6 +5,7 @@
 
 # EfficientMoE Team
 
+import math
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -78,9 +79,9 @@ class ArcherConfig:
         },
     )
     enable_attention_offload: bool = field(
-        default=False,
+        default=True,
         metadata={
-            "help": "Enable attention backend offloading. Default False (uses HuggingFace attention)."
+            "help": "Enable the paged attention backend on the native serving path. Default True; set False to fall back to HuggingFace attention."
         },
     )
     enable_deepseek_mla_paging: bool = field(
@@ -111,6 +112,162 @@ class ArcherConfig:
         default="default",
         metadata={
             "help": "Attention backend name. 'default' = no-op PlaceholderAttentionBackend."
+        },
+    )
+    adaptive_memory_enabled: bool = False
+    adaptive_memory_interval_steps: int = 64
+    adaptive_memory_cooldown_steps: int = 256
+    adaptive_memory_ewma_alpha: float = 0.20
+    adaptive_memory_hysteresis_ratio: float = 0.15
+    adaptive_memory_max_resize_step_bytes: int = 256 * 1024**2
+    adaptive_memory_min_expert_cache_bytes: int = 512 * 1024**2
+    adaptive_memory_min_kv_cache_blocks: int = 128
+    adaptive_memory_free_reserve_bytes: int = 1024 * 1024**2
+    adaptive_memory_failure_limit: int = 3
+    phase_specific_expert_policy: bool = field(
+        default=False,
+        metadata={
+            "help": "Master gate for phase-specific expert admission, prefetch, and eviction policy (PR #179 substrate). Default False keeps legacy behavior. Adaptive precision does not require this to be True; when False the adaptive path still uses ExpertResidencyManager with neutral, legacy-equivalent phase utility."
+        },
+    )
+    adaptive_expert_precision: bool = field(
+        default=False,
+        metadata={
+            "help": "Opt-in adaptive mixed-precision expert policy. Default False. Never enabled by default; validated only when True."
+        },
+    )
+    adaptive_hbm_budget_bytes: int = field(
+        default=0,
+        metadata={
+            "help": "Fixed HBM budget in bytes for adaptive expert representations. Must be positive when adaptive_expert_precision is True."
+        },
+    )
+    adaptive_policy_epoch_tokens: int = field(
+        default=128,
+        metadata={"help": "Tokens per adaptive policy epoch. Nonnegative."},
+    )
+    adaptive_hotness_decay: float = field(
+        default=0.95,
+        metadata={
+            "help": "Per-epoch hotness decay factor. Must satisfy 0 < decay <= 1."
+        },
+    )
+    adaptive_promotion_threshold: float = field(
+        default=0.70,
+        metadata={
+            "help": "Hotness at or above which an expert is promoted. Must satisfy demotion < promotion <= 1."
+        },
+    )
+    adaptive_demotion_threshold: float = field(
+        default=0.30,
+        metadata={
+            "help": "Hotness below which an expert is demoted. Must satisfy 0 <= demotion < promotion."
+        },
+    )
+    adaptive_min_residency_epochs: int = field(
+        default=2,
+        metadata={
+            "help": "Minimum epochs a representation stays resident before transition. Nonnegative."
+        },
+    )
+    adaptive_transition_cooldown_epochs: int = field(
+        default=2,
+        metadata={
+            "help": "Cooldown epochs between transitions for an expert. Nonnegative."
+        },
+    )
+    adaptive_variant_build: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable explicit candidate-build mode for derivative variants. Default False."
+        },
+    )
+    adaptive_derivative_root: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Root for adaptive derivative artifacts. Resolves to <offload_path>/adaptive_derivatives when None and adaptive precision is enabled."
+        },
+    )
+    prefill_expert_admission: str = field(
+        default="transient_on_pressure",
+        metadata={
+            "help": "Prefill admission mode: cache or transient_on_pressure."
+        },
+    )
+    decode_expert_admission: str = field(
+        default="cache",
+        metadata={
+            "help": "Decode admission mode: cache or transient_on_pressure."
+        },
+    )
+    prefill_expert_prefetch_top_k: int = field(
+        default=0,
+        metadata={
+            "help": "Predictive prefill prefetch top-k in [0, num_experts]; zero disables."
+        },
+    )
+    decode_expert_prefetch_top_k: int = field(
+        default=2,
+        metadata={
+            "help": "Predictive decode prefetch top-k in [0, num_experts]."
+        },
+    )
+    prefill_expert_prefetch_priority: int = field(
+        default=2,
+        metadata={"help": "Native prefill prefetch band in [1, 19]."},
+    )
+    decode_expert_prefetch_priority: int = field(
+        default=1,
+        metadata={"help": "Native decode prefetch band in [1, 19]."},
+    )
+    prefill_expert_eviction_weight: float = field(
+        default=1.0,
+        metadata={"help": "Prefill eviction weight; finite and > 0."},
+    )
+    decode_expert_eviction_weight: float = field(
+        default=4.0,
+        metadata={"help": "Decode eviction weight; finite and > 0."},
+    )
+    expert_policy_starvation_limit: int = field(
+        default=8,
+        metadata={
+            "help": "Positive maximum prefetch bypasses before promotion."
+        },
+    )
+    overlap_prefetch_policy: str = field(
+        default="off",
+        metadata={
+            "help": "off, observe, or enforce overlap-window byte admission for speculative expert prefetch."
+        },
+    )
+    overlap_prefetch_ewma_alpha: float = field(
+        default=0.2,
+        metadata={
+            "help": "EWMA smoothing factor in (0, 1] for compute/bandwidth/queue/issue calibration."
+        },
+    )
+    overlap_prefetch_safety_factor: float = field(
+        default=0.8,
+        metadata={
+            "help": "Fraction in (0, 1] of measured compute time usable as the transfer overlap window."
+        },
+    )
+    overlap_prefetch_cold_start_experts: int = field(
+        default=1,
+        metadata={
+            "help": "Max experts admitted before both a compute and a transfer sample exist."
+        },
+    )
+    overlap_prefetch_max_window_bytes: int = field(
+        default=256 * 1024 * 1024,
+        metadata={
+            "help": "Upper bound on the per-layer admitted prefetch window in bytes."
+        },
+    )
+    overlap_prefetch_max_inflight_bytes: int = field(
+        default=512 * 1024 * 1024,
+        metadata={
+            "help": "Upper bound on outstanding speculative prefetch bytes."
         },
     )
     kv_cache_format: str = field(
@@ -257,7 +414,136 @@ class ArcherConfig:
             raise ValueError(
                 f"device_memory_ratio ({self.device_memory_ratio}) + kv_cache_memory_ratio ({self.kv_cache_memory_ratio}) > 1.0"
             )
+        positive_adaptive = (
+            "adaptive_memory_interval_steps",
+            "adaptive_memory_cooldown_steps",
+            "adaptive_memory_max_resize_step_bytes",
+            "adaptive_memory_min_expert_cache_bytes",
+            "adaptive_memory_min_kv_cache_blocks",
+            "adaptive_memory_free_reserve_bytes",
+            "adaptive_memory_failure_limit",
+        )
+        for name in positive_adaptive:
+            value = getattr(self, name)
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if not 0.0 < self.adaptive_memory_ewma_alpha <= 1.0:
+            raise ValueError("adaptive_memory_ewma_alpha must be in (0, 1]")
+        if not 0.0 <= self.adaptive_memory_hysteresis_ratio <= 1.0:
+            raise ValueError(
+                "adaptive_memory_hysteresis_ratio must be in [0, 1]"
+            )
 
+        if self.adaptive_expert_precision:
+            if self.adaptive_hbm_budget_bytes <= 0:
+                raise ValueError(
+                    "adaptive_hbm_budget_bytes must be positive when "
+                    "adaptive_expert_precision is enabled"
+                )
+            if self.adaptive_policy_epoch_tokens < 0:
+                raise ValueError(
+                    "adaptive_policy_epoch_tokens must be a nonnegative integer"
+                )
+            if self.adaptive_min_residency_epochs < 0:
+                raise ValueError(
+                    "adaptive_min_residency_epochs must be a nonnegative integer"
+                )
+            if self.adaptive_transition_cooldown_epochs < 0:
+                raise ValueError(
+                    "adaptive_transition_cooldown_epochs must be a nonnegative integer"
+                )
+            if not 0.0 < self.adaptive_hotness_decay <= 1.0:
+                raise ValueError(
+                    "adaptive_hotness_decay must satisfy 0 < decay <= 1"
+                )
+            if not (
+                0.0
+                <= self.adaptive_demotion_threshold
+                < self.adaptive_promotion_threshold
+                <= 1.0
+            ):
+                raise ValueError(
+                    "adaptive thresholds must satisfy 0 <= demotion < promotion <= 1"
+                )
+            if self.adaptive_derivative_root is None:
+                self.adaptive_derivative_root = os.path.join(
+                    self.offload_path, "adaptive_derivatives"
+                )
+        valid_admissions = ("cache", "transient_on_pressure")
+        for name in ("prefill_expert_admission", "decode_expert_admission"):
+            value = getattr(self, name)
+            if value not in valid_admissions:
+                raise ValueError(
+                    f"{name} must be one of {valid_admissions}, got {value!r}"
+                )
+        for name in (
+            "prefill_expert_prefetch_top_k",
+            "decode_expert_prefetch_top_k",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        for name in (
+            "prefill_expert_prefetch_priority",
+            "decode_expert_prefetch_priority",
+        ):
+            value = getattr(self, name)
+            if not 1 <= value <= 19:
+                raise ValueError(f"{name} must be in [1, 19], got {value}")
+        for name in (
+            "prefill_expert_eviction_weight",
+            "decode_expert_eviction_weight",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and > 0, got {value}")
+        if self.expert_policy_starvation_limit <= 0:
+            raise ValueError(
+                f"expert_policy_starvation_limit must be > 0, got {self.expert_policy_starvation_limit}"
+            )
+        valid_policies = ("off", "observe", "enforce")
+        if self.overlap_prefetch_policy not in valid_policies:
+            raise ValueError(
+                f"overlap_prefetch_policy must be one of {valid_policies}, got {self.overlap_prefetch_policy!r}"
+            )
+        if not 0.0 < self.overlap_prefetch_ewma_alpha <= 1.0:
+            raise ValueError(
+                f"overlap_prefetch_ewma_alpha must be in (0, 1], got {self.overlap_prefetch_ewma_alpha}"
+            )
+        if not 0.0 < self.overlap_prefetch_safety_factor <= 1.0:
+            raise ValueError(
+                f"overlap_prefetch_safety_factor must be in (0, 1], got {self.overlap_prefetch_safety_factor}"
+            )
+        if self.overlap_prefetch_cold_start_experts < 0:
+            raise ValueError(
+                f"overlap_prefetch_cold_start_experts must be >= 0, got {self.overlap_prefetch_cold_start_experts}"
+            )
+        if self.overlap_prefetch_max_window_bytes < 0:
+            raise ValueError(
+                f"overlap_prefetch_max_window_bytes must be >= 0, got {self.overlap_prefetch_max_window_bytes}"
+            )
+        if self.overlap_prefetch_max_inflight_bytes < 0:
+            raise ValueError(
+                f"overlap_prefetch_max_inflight_bytes must be >= 0, got {self.overlap_prefetch_max_inflight_bytes}"
+            )
+        if (
+            self.overlap_prefetch_policy == "enforce"
+            and self.overlap_prefetch_max_window_bytes
+            > self.overlap_prefetch_max_inflight_bytes
+        ):
+            raise ValueError(
+                f"overlap_prefetch_max_window_bytes ({self.overlap_prefetch_max_window_bytes}) must be <= "
+                f"overlap_prefetch_max_inflight_bytes ({self.overlap_prefetch_max_inflight_bytes}) when policy is enforce"
+            )
+        if (
+            self.gpu_only_expert_routing
+            and self.overlap_prefetch_policy != "off"
+        ):
+            raise ValueError(
+                "gpu_only_expert_routing cannot be combined with overlap "
+                "prefetch (overlap_prefetch_policy=observe|enforce) in the "
+                "first release"
+            )
         from moe_infinity.runtime.kv_cache_format import KVCacheFormat
 
         KVCacheFormat.parse(self.kv_cache_format)

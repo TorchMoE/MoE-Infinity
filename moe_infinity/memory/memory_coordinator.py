@@ -114,6 +114,38 @@ class MemoryCoordinator:
         n = max(1, self.num_gpu_devices())
         return sum(self.kv_cache_bytes(i) for i in range(n))
 
+    def compute_safe_budget(
+        self,
+        *,
+        model_bytes: int,
+        activation_reserve_bytes: int,
+        free_reserve_bytes: int,
+        device_id: int = 0,
+    ) -> int:
+        return max(
+            0,
+            self.total_gpu_memory_bytes(device_id)
+            - model_bytes
+            - activation_reserve_bytes
+            - free_reserve_bytes,
+        )
+
+    def validate_targets(
+        self,
+        *,
+        device_id: int,
+        expert_bytes: int,
+        kv_blocks: int,
+        kv_block_bytes: int,
+        safe_budget_bytes: int,
+    ) -> None:
+        if device_id < 0:
+            raise ValueError("device_id must be non-negative")
+        if min(expert_bytes, kv_blocks, kv_block_bytes, safe_budget_bytes) < 0:
+            raise ValueError("memory targets must be non-negative")
+        if expert_bytes + kv_blocks * kv_block_bytes > safe_budget_bytes:
+            raise ValueError("expert and KV targets exceed safe GPU budget")
+
     def remaining_bytes(self, device_id: int = 0) -> int:
         total = self.total_gpu_memory_bytes(device_id)
         used = self.expert_cache_bytes(device_id) + self.kv_cache_bytes(

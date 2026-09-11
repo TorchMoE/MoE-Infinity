@@ -36,6 +36,7 @@ import pytest
 import torch
 
 from moe_infinity.distributed.expert_executor import DistributedExpertExecutor
+from moe_infinity.memory.expert_policy import ExpertPhase
 from moe_infinity.memory.expert_prefetcher import ExpertPrefetcher
 from moe_infinity.spec_decode._route_ahead_ctx import (
     current_prefetcher,
@@ -69,7 +70,7 @@ def _cpu_dispatch_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
 
 
-def _make_executor(*, overlap: bool = False, prefetcher=None):
+def _make_executor(*, overlap: bool = False, prefetcher=None, policy=None):
     config = ArcherConfig.load_from_json(
         {
             "offload_path": "/tmp/moe-infinity-route-ahead-test",
@@ -82,8 +83,17 @@ def _make_executor(*, overlap: bool = False, prefetcher=None):
     executor = DistributedExpertExecutor(config)
     executor.set_expert_dispatcher(MagicMock(name="ExpertDispatcher"))
     if prefetcher is not None:
+        if policy in ("observe", "enforce"):
+            prefetcher._overlap_active.return_value = True
+            prefetcher._overlap_caps = SimpleNamespace(
+                scheduler_ready=True, dispatcher_timing_ready=True
+            )
         executor.set_prefetcher(prefetcher)
     return executor
+
+
+def _compute_sample(*, invocation_id, layer_id):
+    return SimpleNamespace(invocation_id=invocation_id, layer_id=layer_id)
 
 
 def _make_real_prefetcher(num_layers: int = 8, num_experts: int = 8):
@@ -152,7 +162,11 @@ def test_active_context_prefetches_exact_union_for_current_layer():
         lambda layer, **kw: events.append(("prefetch", layer, kw))
     )
     executor.expert_dispatcher.enqueue_expert.side_effect = (
-        lambda layer, expert, gpu, remote: events.append(("enqueue", expert))
+        lambda layer,
+        expert,
+        gpu,
+        remote,
+        phase=int(ExpertPhase.MIXED): events.append(("enqueue", expert))
     )
 
     with route_ahead_context(prefetcher=prefetcher):
@@ -161,7 +175,10 @@ def test_active_context_prefetches_exact_union_for_current_layer():
 
     prefetcher.fetch_experts_lock_cache.assert_called_once_with(LAYER_ID, UNION)
     prefetcher.speculative_prefetch.assert_called_once_with(
-        LAYER_ID, expert_ids=UNION, prefetch_layer_id=LAYER_ID
+        LAYER_ID,
+        expert_ids=UNION,
+        prefetch_layer_id=LAYER_ID,
+        phase=ExpertPhase.DECODE,
     )
     first_read = next(i for i, e in enumerate(events) if e[0] == "enqueue")
     assert events.index(("lock", LAYER_ID, UNION)) < first_read
@@ -171,7 +188,14 @@ def test_active_context_prefetches_exact_union_for_current_layer():
     # Routing untouched: exactly the union experts are dispatched to compute.
     assert [e[1] for e in events if e[0] == "enqueue"] == UNION
     # A0 section 3: legacy pooled prediction suppressed for this dispatch.
-    assert executor._pending_prefetch == (None, LAYER_ID, UNION, None)
+    assert executor._pending_prefetch == (
+        None,
+        LAYER_ID,
+        UNION,
+        None,
+        [],
+        None,
+    )
 
 
 def test_active_context_falls_back_to_executor_prefetcher():
@@ -189,7 +213,14 @@ def test_active_context_falls_back_to_executor_prefetcher():
     assert _issued_tensor_ids(engine) == [300, 301, 302, 305, 307]
     assert prefetcher._last_speculative_prediction == set(UNION)
     trigger_spy.assert_not_called()
-    assert executor._pending_prefetch == (prefetcher, LAYER_ID, UNION, None)
+    assert executor._pending_prefetch == (
+        prefetcher,
+        LAYER_ID,
+        UNION,
+        None,
+        [],
+        None,
+    )
 
     # The pending correct_prefetch(layer+1, expert_list) no-ops because the
     # recorded prediction IS the actual union; nothing further is enqueued.
@@ -212,7 +243,10 @@ def test_active_context_prefetcher_arg_wins_over_context_handle():
         LAYER_ID, UNION
     )
     arg_prefetcher.speculative_prefetch.assert_called_once_with(
-        LAYER_ID, expert_ids=UNION, prefetch_layer_id=LAYER_ID
+        LAYER_ID,
+        expert_ids=UNION,
+        prefetch_layer_id=LAYER_ID,
+        phase=ExpertPhase.DECODE,
     )
     ctx_prefetcher.fetch_experts_lock_cache.assert_not_called()
     self_prefetcher.fetch_experts_lock_cache.assert_not_called()
@@ -262,9 +296,17 @@ def test_inactive_context_overlap_path_byte_identical():
     prefetcher.fetch_experts_lock_cache.assert_not_called()
     assert prefetcher.speculative_prefetch.call_count == 1
     args, kwargs = prefetcher.speculative_prefetch.call_args
-    assert args[0] == LAYER_ID and args[1] is LOGITS and not kwargs
+    assert args[0] == LAYER_ID and kwargs.get("phase") == ExpertPhase.MIXED
+    assert args[1] is LOGITS
     trigger_spy.assert_called_once()
-    assert executor._pending_prefetch == (prefetcher, LAYER_ID, UNION, None)
+    assert executor._pending_prefetch == (
+        prefetcher,
+        LAYER_ID,
+        UNION,
+        None,
+        [],
+        None,
+    )
 
 
 def test_inactive_context_deferred_legacy_path_byte_identical():
@@ -279,10 +321,13 @@ def test_inactive_context_deferred_legacy_path_byte_identical():
     assert pending is not None and pending[3] is LOGITS
 
     executor.wait_dispatch_local()
-    prefetcher.correct_prefetch.assert_called_once_with(LAYER_ID + 1, UNION)
+    prefetcher.correct_prefetch.assert_called_once_with(
+        LAYER_ID + 1, UNION, phase=ExpertPhase.MIXED
+    )
     assert prefetcher.speculative_prefetch.call_count == 1
     args, kwargs = prefetcher.speculative_prefetch.call_args
-    assert args[0] == LAYER_ID and args[1] is LOGITS and not kwargs
+    assert args[0] == LAYER_ID and kwargs.get("phase") == ExpertPhase.MIXED
+    assert args[1] is LOGITS
 
 
 def test_inactive_context_without_router_logits_makes_no_prefetch_calls():
@@ -295,7 +340,9 @@ def test_inactive_context_without_router_logits_makes_no_prefetch_calls():
     prefetcher.fetch_experts_lock_cache.assert_not_called()
     prefetcher.speculative_prefetch.assert_not_called()
     # Pre-A3 behavior: correction still fires from the pending tuple.
-    prefetcher.correct_prefetch.assert_called_once_with(LAYER_ID + 1, UNION)
+    prefetcher.correct_prefetch.assert_called_once_with(
+        LAYER_ID + 1, UNION, phase=ExpertPhase.MIXED
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -510,3 +557,130 @@ def test_gpt_oss_resident_loop_does_not_observe_when_context_inactive(
     current_stats.assert_not_called()
     assert stats.commit_step(kept_rows=1).layers == 0
     assert stats.as_dict() == RouteAheadStats().as_dict()
+
+
+# ---------------------------------------------------------------------------
+# overlap-aware dispatch integration (plan Task 6)
+# ---------------------------------------------------------------------------
+
+
+def test_partial_exact_route_prefetch_still_dispatches_full_native_union():
+    prefetcher = MagicMock()
+    prefetcher.plan_candidates.return_value = (41, [0, 2])
+    executor = _make_executor(prefetcher=prefetcher, policy="enforce")
+    with route_ahead_context(prefetcher=prefetcher):
+        _dispatch(executor, router_logits=LOGITS)
+    prefetcher.fetch_experts_lock_cache.assert_called_once_with(
+        LAYER_ID, [0, 2]
+    )
+    assert _enqueued_experts(executor) == UNION
+
+
+def test_empty_budget_does_not_replace_pin_or_suppress_dispatch():
+    prefetcher = MagicMock()
+    prefetcher.plan_candidates.return_value = (42, [])
+    executor = _make_executor(prefetcher=prefetcher, policy="enforce")
+    with route_ahead_context(prefetcher=prefetcher):
+        _dispatch(executor)
+    prefetcher.fetch_experts_lock_cache.assert_not_called()
+    assert _enqueued_experts(executor) == UNION
+
+
+def test_exact_route_correction_precedes_every_expert_enqueue():
+    events = []
+    prefetcher = MagicMock()
+    prefetcher._overlap_active.return_value = True
+    prefetcher.correct_to_native_route.side_effect = (
+        lambda layer, ids: events.append("correct") or ids
+    )
+    executor = _make_executor(prefetcher=prefetcher, policy="enforce")
+    executor.expert_dispatcher.enqueue_expert.side_effect = (
+        lambda *a: events.append("enqueue")
+    )
+    _dispatch(executor)
+    assert events[0] == "correct"
+
+
+def test_wait_error_cancels_owned_generations_drains_and_reraises():
+    prefetcher = MagicMock()
+    executor = _make_executor(prefetcher=prefetcher)
+    executor._pending_prefetch = (
+        prefetcher,
+        LAYER_ID,
+        UNION,
+        None,
+        [41, 42],
+        None,
+    )
+    executor.expert_dispatcher.wait_expert.side_effect = RuntimeError(
+        "wait failed"
+    )
+    with pytest.raises(RuntimeError, match="wait failed"):
+        executor.wait_dispatch_local()
+    prefetcher.abort_prefetch_generations.assert_called_once_with(
+        [41, 42], reason="wait_expert_error"
+    )
+    prefetcher.drain_native_prefetch_samples.assert_called()
+    assert executor._pending_prefetch is None
+
+
+def test_cleanup_error_does_not_mask_wait_error():
+    prefetcher = MagicMock()
+    prefetcher.abort_prefetch_generations.side_effect = RuntimeError(
+        "cleanup failed"
+    )
+    executor = _make_executor(prefetcher=prefetcher)
+    executor._pending_prefetch = (
+        prefetcher,
+        LAYER_ID,
+        UNION,
+        None,
+        [41],
+        None,
+    )
+    executor.expert_dispatcher.wait_expert.side_effect = RuntimeError(
+        "wait failed"
+    )
+    with pytest.raises(RuntimeError, match="wait failed"):
+        executor.wait_dispatch_local()
+    prefetcher.drain_native_prefetch_samples.assert_called()
+
+
+def test_delayed_compute_sample_from_prior_invocation_is_not_calibration():
+    prefetcher = MagicMock()
+    executor = _make_executor(prefetcher=prefetcher, policy="observe")
+    executor._pending_prefetch = (
+        prefetcher,
+        LAYER_ID,
+        UNION,
+        None,
+        [],
+        102,
+    )
+    executor.expert_dispatcher.drain_compute_samples.return_value = [
+        _compute_sample(invocation_id=101, layer_id=LAYER_ID),
+        _compute_sample(invocation_id=102, layer_id=LAYER_ID),
+    ]
+    executor.wait_dispatch_local()
+    prefetcher.observe_compute_samples.assert_called_once()
+    observed = prefetcher.observe_compute_samples.call_args.args[0]
+    assert [s.invocation_id for s in observed] == [102]
+    prefetcher.record_stale_compute_samples.assert_called_once_with(1)
+
+
+def test_same_layer_sample_without_matching_invocation_is_rejected():
+    prefetcher = MagicMock()
+    executor = _make_executor(prefetcher=prefetcher, policy="enforce")
+    executor._pending_prefetch = (
+        prefetcher,
+        LAYER_ID,
+        UNION,
+        None,
+        [],
+        202,
+    )
+    executor.expert_dispatcher.drain_compute_samples.return_value = [
+        _compute_sample(invocation_id=201, layer_id=LAYER_ID),
+    ]
+    executor.wait_dispatch_local()
+    prefetcher.observe_compute_samples.assert_not_called()

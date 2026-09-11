@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from typing import Optional, Protocol, cast
 
 from moe_infinity.engine.transfer_types import (
@@ -40,6 +41,14 @@ class CPAwareKVManager(Protocol):
         self, request_id: str, block_hashes: list[int]
     ) -> None: ...
 
+
+@dataclass(frozen=True)
+class MemoryResizeToken:
+    device_id: int
+    waiting_ids: tuple[str, ...]
+    running_ids: tuple[str, ...]
+    swapped_ids: tuple[str, ...]
+
     def notify_blocks_freed(
         self, request_id: str, block_hashes: list[int]
     ) -> None: ...
@@ -52,7 +61,13 @@ class Scheduler:
         transfer_scheduler: Optional[TransferScheduler] = None,
         max_num_seqs: int = 256,
         max_num_batched_tokens: int = 4096,
+        device_id: int = 0,
     ):
+        if device_id < 0:
+            raise ValueError("device_id must be non-negative")
+        if kv_cache_manager.device_id != device_id:
+            raise ValueError("scheduler device_id must match KV cache owner")
+        self.device_id = device_id
         self.kv_mgr: KVCacheManager = kv_cache_manager
         self._transfer_scheduler: Optional[TransferScheduler] = (
             transfer_scheduler
@@ -68,14 +83,22 @@ class Scheduler:
         self._seq_generated_tokens: dict[str, int] = {}
         self._cp_kv_manager: Optional[CPAwareKVManager] = None
         self._cp_request_block_hashes: dict[str, list[int]] = {}
+        self._admissions_paused = False
+        self._maintenance_backlog: deque[Request] = deque()
+        self._resize_preemptions = 0
 
     def set_cp_kv_manager(self, manager: CPAwareKVManager) -> None:
         self._cp_kv_manager = manager
 
     def add_request(self, request: Request) -> None:
-        self._waiting.append(request)
+        if self._admissions_paused:
+            self._maintenance_backlog.append(request)
+        else:
+            self._waiting.append(request)
 
     def schedule(self) -> SchedulerOutput:
+        if self._admissions_paused:
+            return SchedulerOutput([], [], [], 0)
         scheduled: list[Request] = []
         preempted: list[Request] = []
         swapped_in: list[Request] = []
@@ -303,7 +326,7 @@ class Scheduler:
         return self.kv_mgr.num_free_gpu_blocks >= blocks_needed
 
     def _preempt_with_transfer(self, victim: Request) -> None:
-        pairs = self.kv_mgr.prepare_swap_out(victim.request_id)
+        pairs = self.kv_mgr.prepare_swap_out(self.device_id, victim.request_id)
         if not pairs:
             self._notify_cp_blocks_freed(victim.request_id)
             self.kv_mgr.free_sequence(victim.request_id)
@@ -320,7 +343,8 @@ class Scheduler:
                 transfer_id=f"swap_out_{victim.request_id}",
                 transfer_type=TransferType.KV_SWAP_OUT,
                 priority=TransferPriority.HIGH,
-                source_device="cuda:0",
+                source_device=f"cuda:{self.device_id}",
+                device_id=self.device_id,
                 target_device="cpu",
                 block_ids=orig_gpu_ids,
             )
@@ -329,16 +353,22 @@ class Scheduler:
                 transfer_id, timeout_ms=5000.0
             )
             if completed:
-                self.kv_mgr.commit_swap_out(victim.request_id, pairs)
+                self.kv_mgr.commit_swap_out(
+                    self.device_id, victim.request_id, pairs
+                )
             else:
                 _ = self._transfer_scheduler.cancel(transfer_id)
-                self.kv_mgr.commit_swap_out(victim.request_id, pairs)
+                self.kv_mgr.commit_swap_out(
+                    self.device_id, victim.request_id, pairs
+                )
                 self._notify_cp_blocks_freed(victim.request_id)
                 self.kv_mgr.free_sequence(victim.request_id)
                 _ = self._swapped_gpu_ids.pop(victim.request_id, None)
                 self._swap_needs_reprefill.add(victim.request_id)
         else:
-            self.kv_mgr.commit_swap_out(victim.request_id, pairs)
+            self.kv_mgr.commit_swap_out(
+                self.device_id, victim.request_id, pairs
+            )
 
         victim.transition_to(SequenceStatus.SWAPPED)
         self._swapped.append(victim)
@@ -351,7 +381,9 @@ class Scheduler:
             return True
 
         orig_gpu_ids = self._swapped_gpu_ids.get(req.request_id, [])
-        pairs = self.kv_mgr.prepare_swap_in(req.request_id, orig_gpu_ids)
+        pairs = self.kv_mgr.prepare_swap_in(
+            self.device_id, req.request_id, orig_gpu_ids
+        )
         if not pairs:
             return False
 
@@ -361,7 +393,8 @@ class Scheduler:
                 transfer_type=TransferType.KV_SWAP_IN,
                 priority=TransferPriority.NORMAL,
                 source_device="cpu",
-                target_device="cuda:0",
+                target_device=f"cuda:{self.device_id}",
+                device_id=self.device_id,
                 block_ids=[cpu_id for cpu_id, _ in pairs],
             )
             transfer_id = self._transfer_scheduler.enqueue(transfer_req)
@@ -369,11 +402,15 @@ class Scheduler:
                 transfer_id, timeout_ms=5000.0
             )
             if completed:
-                self.kv_mgr.commit_swap_in(req.request_id, orig_gpu_ids, pairs)
+                self.kv_mgr.commit_swap_in(
+                    self.device_id, req.request_id, orig_gpu_ids, pairs
+                )
                 _ = self._swapped_gpu_ids.pop(req.request_id, None)
             else:
                 _ = self._transfer_scheduler.cancel(transfer_id)
-                self.kv_mgr.commit_swap_in(req.request_id, orig_gpu_ids, pairs)
+                self.kv_mgr.commit_swap_in(
+                    self.device_id, req.request_id, orig_gpu_ids, pairs
+                )
                 self._notify_cp_blocks_freed(req.request_id)
                 self.kv_mgr.free_sequence(req.request_id)
                 _ = self._swapped_gpu_ids.pop(req.request_id, None)
@@ -383,7 +420,9 @@ class Scheduler:
                 self._waiting.appendleft(req)
                 return True
         else:
-            self.kv_mgr.commit_swap_in(req.request_id, orig_gpu_ids, pairs)
+            self.kv_mgr.commit_swap_in(
+                self.device_id, req.request_id, orig_gpu_ids, pairs
+            )
             _ = self._swapped_gpu_ids.pop(req.request_id, None)
 
         req.transition_to(SequenceStatus.WAITING)
@@ -422,3 +461,57 @@ class Scheduler:
     @property
     def num_swapped(self) -> int:
         return len(self._swapped)
+
+    @property
+    def admissions_paused(self) -> bool:
+        return self._admissions_paused
+
+    def begin_memory_resize(
+        self, device_id: int, timeout_ms: float = 5000.0
+    ) -> MemoryResizeToken:
+        if device_id != self.device_id:
+            raise ValueError("resize device_id must match scheduler owner")
+        if self._admissions_paused:
+            raise RuntimeError("memory resize is already active")
+        token = MemoryResizeToken(
+            device_id=device_id,
+            waiting_ids=tuple(req.request_id for req in self._waiting),
+            running_ids=tuple(req.request_id for req in self._running),
+            swapped_ids=tuple(req.request_id for req in self._swapped),
+        )
+        self._admissions_paused = True
+        try:
+            while self._running:
+                request = self._running.popleft()
+                self._preempt_with_transfer(request)
+                self._resize_preemptions += 1
+            if (
+                self._transfer_scheduler is not None
+                and not self._transfer_scheduler.wait_for_device(
+                    device_id, timeout_ms
+                )
+            ):
+                raise TimeoutError("timed out draining device transfers")
+            return token
+        except Exception:
+            self._admissions_paused = False
+            while self._maintenance_backlog:
+                self._waiting.append(self._maintenance_backlog.popleft())
+            raise
+
+    def end_memory_resize(self, token: MemoryResizeToken) -> None:
+        if token.device_id != self.device_id:
+            raise ValueError(
+                "resize token device_id must match scheduler owner"
+            )
+        while self._maintenance_backlog:
+            self._waiting.append(self._maintenance_backlog.popleft())
+        self._admissions_paused = False
+
+    def memory_pressure_snapshot(self) -> dict[str, int | float]:
+        used = self.kv_mgr.num_gpu_blocks - self.kv_mgr.num_free_gpu_blocks
+        return {
+            "kv_used_blocks": used,
+            "kv_total_blocks": self.kv_mgr.num_gpu_blocks,
+            "kv_preemptions": self._resize_preemptions,
+        }

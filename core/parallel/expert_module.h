@@ -8,6 +8,7 @@
 
 #include "model/model_topology.h"
 #include "aio/archer_tensor_handle.h"
+#include "prefetch/expert_residency.h"
 
 // Expert type enum
 enum class ExpertType {
@@ -194,12 +195,16 @@ torch::Tensor launch_fused_moe_ffn(torch::Tensor hidden,  // [M, K]
 
 struct MoEMLP : public torch::nn::Module {
   explicit MoEMLP(int dtype, int expert_type);
-  torch::Tensor forward(torch::Tensor hidden_states, cudaStream_t stream);
+  torch::Tensor forward(torch::Tensor hidden_states, cudaStream_t stream,
+                        cudaEvent_t kernel_start = nullptr,
+                        cudaEvent_t kernel_stop = nullptr);
 
   void SetTensorsFromIds(const std::vector<std::uint32_t>& tensor_ids);
   void DequantMxfp4Params(cudaStream_t stream);
   void SetFp8Scales(const std::vector<torch::Tensor>& scales);
   void DequantFp8Params(cudaStream_t stream);
+  void SetRepresentation(const ExpertExecutionDescriptor& descriptor);
+  void PrepareRepresentation(cudaStream_t stream);
 
  private:
   void ForwardHelper(cudaStream_t stream);
@@ -220,6 +225,7 @@ struct MoEMLP : public torch::nn::Module {
 
   std::vector<torch::Tensor> fp8_scales_;
   bool has_fp8_scales_ = false;
+  std::uint8_t representation_execution_kind_ = 0;
 };
 
 struct ExpertNode {

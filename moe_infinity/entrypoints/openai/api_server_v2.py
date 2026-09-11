@@ -794,6 +794,43 @@ def _format_prometheus_metrics(stats: dict[str, object]) -> str:
     lines.append("# HELP moe_engine_steps_total Total engine steps")
     lines.append("# TYPE moe_engine_steps_total counter")
     lines.append(f"moe_engine_steps_total {stats.get('num_steps', 0)}")
+    memory = stats.get("memory", {})
+    adaptive = memory.get("adaptive", {}) if isinstance(memory, dict) else {}
+    devices = adaptive.get("devices", {}) if isinstance(adaptive, dict) else {}
+    metric_fields = (
+        ("moe_adaptive_memory_enabled", "enabled", True),
+        ("moe_adaptive_memory_fallback_static", "fallback_static", True),
+        (
+            "moe_adaptive_memory_expert_target_bytes",
+            "expert_target_bytes",
+            False,
+        ),
+        ("moe_adaptive_memory_kv_target_blocks", "kv_target_blocks", False),
+        ("moe_adaptive_memory_resize_attempts_total", "resize_attempts", False),
+        ("moe_adaptive_memory_resize_failures_total", "resize_failures", False),
+        (
+            "moe_adaptive_memory_reserve_rejections_total",
+            "reserve_rejections",
+            False,
+        ),
+        ("moe_adaptive_memory_expert_miss_cost", "expert_miss_cost", False),
+        ("moe_adaptive_memory_kv_pressure_cost", "kv_pressure_cost", False),
+    )
+    if isinstance(devices, dict):
+        for device_id in sorted(devices, key=lambda value: int(value)):
+            state = devices[device_id]
+            if not isinstance(state, dict):
+                continue
+            for metric, field, boolean in metric_fields:
+                value = state.get(field, 0)
+                if boolean:
+                    value = int(bool(value))
+                lines.append(f'{metric}{{device="{device_id}"}} {value}')
+
+    policy = stats.get("expert_policy")
+    if isinstance(policy, dict):
+        lines.extend(_format_expert_policy_metrics(policy))
+
     kv_swap_obj = stats.get("kv_swap", {})
     kv_swap = kv_swap_obj if isinstance(kv_swap_obj, dict) else {}
     gauges = {
@@ -874,6 +911,82 @@ def _format_prometheus_metrics(stats: dict[str, object]) -> str:
             f'moe_cuda_graph_fallback_total{{reason="{reason}"}} {count}'
         )
     return "\n".join(lines) + "\n"
+
+
+_POLICY_PHASES = ("prefill", "decode")
+_POLICY_PREFETCH_RESULTS = ("issued", "completed", "rejected")
+
+
+def _format_expert_policy_metrics(policy: dict[str, object]) -> list[str]:
+    def value(key: str) -> int:
+        raw = policy.get(key, 0)
+        try:
+            return int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+
+    lines: list[str] = []
+    lines.append("# HELP moe_expert_phase_policy_enabled Phase policy enabled")
+    lines.append("# TYPE moe_expert_phase_policy_enabled gauge")
+    lines.append(f"moe_expert_phase_policy_enabled {value('enabled')}")
+    lines.append("# HELP moe_expert_cache_resident_bytes Shared resident bytes")
+    lines.append("# TYPE moe_expert_cache_resident_bytes gauge")
+    lines.append(f"moe_expert_cache_resident_bytes {value('resident_bytes')}")
+    lines.append(
+        "# HELP moe_expert_cache_resident_experts Shared resident experts"
+    )
+    lines.append("# TYPE moe_expert_cache_resident_experts gauge")
+    lines.append(
+        f"moe_expert_cache_resident_experts {value('resident_experts')}"
+    )
+
+    lines.append("# HELP moe_expert_cache_accesses_total Expert cache accesses")
+    lines.append("# TYPE moe_expert_cache_accesses_total counter")
+    for phase in (*_POLICY_PHASES, "mixed"):
+        lines.append(
+            f'moe_expert_cache_accesses_total{{phase="{phase}"}} '
+            f"{value(f'{phase}_accesses')}"
+        )
+
+    for name in ("hits", "misses", "admissions", "transient", "evictions"):
+        lines.append(
+            f"# HELP moe_expert_cache_{name}_total Expert cache {name}"
+        )
+        lines.append(f"# TYPE moe_expert_cache_{name}_total counter")
+        for phase in _POLICY_PHASES:
+            lines.append(
+                f'moe_expert_cache_{name}_total{{phase="{phase}"}} '
+                f"{value(f'{phase}_{name}')}"
+            )
+
+    lines.append("# HELP moe_expert_prefetch_total Expert prefetch operations")
+    lines.append("# TYPE moe_expert_prefetch_total counter")
+    for phase in _POLICY_PHASES:
+        for result in _POLICY_PREFETCH_RESULTS:
+            count = value(f"{phase}_prefetch_{result}")
+            labels = f'phase="{phase}",result="{result}"'
+            lines.append(f"moe_expert_prefetch_total{{{labels}}} {count}")
+
+    lines.append(
+        "# HELP moe_expert_cache_transition_hits_total Decode reuse of "
+        "prefill-admitted experts"
+    )
+    lines.append("# TYPE moe_expert_cache_transition_hits_total counter")
+    lines.append(
+        f"moe_expert_cache_transition_hits_total {value('transition_hits')}"
+    )
+    lines.append(
+        "# HELP moe_expert_prefetch_starvation_promotions_total Bounded "
+        "bypass promotions"
+    )
+    lines.append(
+        "# TYPE moe_expert_prefetch_starvation_promotions_total counter"
+    )
+    lines.append(
+        "moe_expert_prefetch_starvation_promotions_total "
+        f"{value('starvation_promotions')}"
+    )
+    return lines
 
 
 def _tokenize_text(prompt: str) -> list[int]:
@@ -1244,6 +1357,9 @@ async def _initialize_model() -> None:
         moe_config = {
             "offload_path": os.path.join(args.offload_dir, args.model),
             "device_memory_ratio": args.device_memory_ratio,
+            "phase_specific_expert_policy": bool(
+                getattr(args, "phase_specific_expert_policy", False)
+            ),
             "kv_swap_mode": getattr(args, "kv_swap_mode", "sync"),
             "kv_swap_host_memory_bytes": getattr(
                 args, "kv_swap_host_memory_bytes", 512 * 1024 * 1024
@@ -2039,6 +2155,19 @@ def _build_engine_config(
             raise RuntimeError("unable to resolve model hidden_size/head_dim")
         head_dim = hidden_size // max(1, num_attention_heads)
 
+    qk_rope_head_dim = _resolve_int_attr(text_config, "qk_rope_head_dim")
+    qk_nope_head_dim = _resolve_int_attr(text_config, "qk_nope_head_dim")
+    if qk_rope_head_dim is not None and qk_nope_head_dim is not None:
+        from moe_infinity.models.deepseek_v2_paged_attention import (
+            DeepseekV2PagedAttention,
+        )
+
+        mla_spec = DeepseekV2PagedAttention.get_kv_cache_spec_for_config(
+            text_config
+        )
+        head_dim = mla_spec["head_dim"]
+        num_kv_heads = mla_spec["num_kv_heads"]
+
     eos_token_id: Optional[int] = _resolve_int_attr(
         model_config, "eos_token_id"
     )
@@ -2269,6 +2398,12 @@ def parse_args() -> argparse.Namespace:
         "--decode-cuda-graph-max-memory-bytes",
         type=int,
         default=0,
+    )
+    parser.add_argument(
+        "--phase-specific-expert-policy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable phase-specific expert admission, prefetch, and eviction policy.",
     )
     parser.add_argument(
         "--startup-timeout",

@@ -14,6 +14,10 @@ class MemoryBudget:
     expert_cache_ratio: float
     kv_cache_ratio: float
     activation_reserve_ratio: float = 0.10
+    device_id: int = 0
+    free_memory_reserve_bytes: int = 0
+    expert_cache_target_bytes: Optional[int] = None
+    kv_cache_target_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.total_gpu_memory_bytes < 0:
@@ -31,6 +35,19 @@ class MemoryBudget:
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if self.device_id < 0:
+            raise ValueError(f"device_id must be >= 0, got {self.device_id}")
+        if self.free_memory_reserve_bytes < 0:
+            raise ValueError(
+                "free_memory_reserve_bytes must be >= 0, got "
+                f"{self.free_memory_reserve_bytes}"
+            )
+        for name, target in (
+            ("expert_cache_target_bytes", self.expert_cache_target_bytes),
+            ("kv_cache_target_bytes", self.kv_cache_target_bytes),
+        ):
+            if target is not None and target < 0:
+                raise ValueError(f"{name} must be >= 0, got {target}")
 
     @property
     def available_bytes(self) -> int:
@@ -41,20 +58,29 @@ class MemoryBudget:
             self.total_gpu_memory_bytes
             - self.model_memory_bytes
             - activation_reserve_bytes
+            - self.free_memory_reserve_bytes
         )
         return max(0, available)
 
     @property
     def expert_cache_bytes(self) -> int:
+        if self.expert_cache_target_bytes is not None:
+            return min(
+                self.available_bytes, max(0, self.expert_cache_target_bytes)
+            )
         requested = int(self.available_bytes * self.expert_cache_ratio)
         return min(self.available_bytes, max(0, requested))
 
     @property
     def kv_cache_bytes(self) -> int:
-        requested = int(self.available_bytes * self.kv_cache_ratio)
         remaining_after_expert = max(
             0, self.available_bytes - self.expert_cache_bytes
         )
+        if self.kv_cache_target_bytes is not None:
+            return min(
+                remaining_after_expert, max(0, self.kv_cache_target_bytes)
+            )
+        requested = int(self.available_bytes * self.kv_cache_ratio)
         return min(remaining_after_expert, max(0, requested))
 
 
@@ -65,6 +91,7 @@ class MemoryManager:
     activation_reserve_ratio: float
     total_gpu_memory_bytes: int
     _last_budget: Optional[MemoryBudget]
+    _committed_targets: dict[int, tuple[int, int]]
 
     def __init__(
         self,
@@ -94,13 +121,23 @@ class MemoryManager:
             self.device
         )
         self._last_budget = None
+        self._committed_targets = {}
         self._cuda_graph_pool_bytes = 0
         self._cuda_graph_scratch_kv_bytes = 0
 
-    def compute_budget(self, model_memory_bytes: int) -> MemoryBudget:
+    def compute_budget(
+        self,
+        model_memory_bytes: int,
+        free_memory_reserve_bytes: int = 0,
+    ) -> MemoryBudget:
         if model_memory_bytes < 0:
             raise ValueError(
                 f"model_memory_bytes must be >= 0, got {model_memory_bytes}"
+            )
+        if free_memory_reserve_bytes < 0:
+            raise ValueError(
+                "free_memory_reserve_bytes must be >= 0, got "
+                f"{free_memory_reserve_bytes}"
             )
 
         budget = MemoryBudget(
@@ -109,9 +146,30 @@ class MemoryManager:
             expert_cache_ratio=self.get_expert_cache_ratio(),
             kv_cache_ratio=self.device_memory_ratio * self.kv_cache_ratio,
             activation_reserve_ratio=self.activation_reserve_ratio,
+            free_memory_reserve_bytes=free_memory_reserve_bytes,
         )
         self._last_budget = budget
         return budget
+
+    def commit_targets(
+        self,
+        device_id: int,
+        expert_bytes: int,
+        kv_blocks: int,
+        kv_block_bytes: int,
+    ) -> None:
+        for name, value in (
+            ("device_id", device_id),
+            ("expert_bytes", expert_bytes),
+            ("kv_blocks", kv_blocks),
+            ("kv_block_bytes", kv_block_bytes),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        self._committed_targets[device_id] = (
+            expert_bytes,
+            kv_blocks * kv_block_bytes,
+        )
 
     def get_max_kv_blocks(
         self,
@@ -168,6 +226,17 @@ class MemoryManager:
         if budget is None:
             budget = self.compute_budget(model_memory_bytes=0)
 
+        committed_targets: dict[str, dict[str, int]] = {
+            str(device_id): {
+                "expert_cache_bytes": expert_bytes,
+                "kv_cache_bytes": kv_bytes,
+            }
+            for device_id, (
+                expert_bytes,
+                kv_bytes,
+            ) in self._committed_targets.items()
+        }
+
         return {
             "device": str(self.device),
             "total_gpu_memory_bytes": budget.total_gpu_memory_bytes,
@@ -178,6 +247,7 @@ class MemoryManager:
             "activation_reserve_ratio": budget.activation_reserve_ratio,
             "expert_cache_bytes": budget.expert_cache_bytes,
             "kv_cache_bytes": budget.kv_cache_bytes,
+            "committed_targets": committed_targets,
             "cuda_graph_pool_bytes": self._cuda_graph_pool_bytes,
             "cuda_graph_scratch_kv_bytes": self._cuda_graph_scratch_kv_bytes,
             "cuda_graph_total_bytes": (

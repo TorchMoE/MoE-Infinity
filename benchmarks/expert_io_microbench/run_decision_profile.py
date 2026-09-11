@@ -34,6 +34,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--speculative-prefetch", action="store_true")
     p.add_argument("--speculative-prefetch-overlap", action="store_true")
     p.add_argument(
+        "--overlap-prefetch-policy",
+        choices=["off", "observe", "enforce"],
+        default="off",
+    )
+    p.add_argument("--overlap-prefetch-ewma-alpha", type=float, default=0.2)
+    p.add_argument("--overlap-prefetch-safety-factor", type=float, default=0.8)
+    p.add_argument("--overlap-prefetch-cold-start-experts", type=int, default=1)
+    p.add_argument(
         "--gpu-only-expert-routing", choices=("off", "on"), default="off"
     )
     p.add_argument("--warmup-iters", type=int, default=3)
@@ -143,6 +151,24 @@ def main() -> int:
 
     t0 = time.time()
     print(f"[{time.time() - t0:.1f}s] loading model", flush=True)
+    m = MoE(
+        args.model,
+        {
+            "offload_path": args.offload_dir,
+            "device_memory_ratio": args.device_memory_ratio,
+            "speculative_prefetch": args.speculative_prefetch,
+            "speculative_prefetch_overlap": args.speculative_prefetch_overlap,
+            "overlap_prefetch_policy": args.overlap_prefetch_policy,
+            "overlap_prefetch_ewma_alpha": args.overlap_prefetch_ewma_alpha,
+            "overlap_prefetch_safety_factor": (
+                args.overlap_prefetch_safety_factor
+            ),
+            "overlap_prefetch_cold_start_experts": (
+                args.overlap_prefetch_cold_start_experts
+            ),
+            "num_threads": args.num_threads,
+        },
+    )
     m = MoE(args.model, model_config)
     print(f"[{time.time() - t0:.1f}s] model loaded", flush=True)
 
@@ -208,6 +234,39 @@ def main() -> int:
     use_width = max(link_width, link_width_after)
     use_gen = max(link_gen, link_gen_after)
 
+    overlap_stats = {}
+    try:
+        prefetcher = m.engine.expert_prefetcher
+        stats_getter = getattr(prefetcher, "overlap_prefetch_stats", None)
+        if callable(stats_getter):
+            overlap_stats = stats_getter()
+    except Exception:
+        overlap_stats = {}
+
+    out = {
+        "model": args.model,
+        "mode": args.mode,
+        "hardware_tag": args.hardware_tag,
+        "offload_dir": args.offload_dir,
+        "max_new_tokens": args.max_new_tokens,
+        "warmup_tokens": args.warmup_tokens,
+        "iters": args.iters,
+        "device_memory_ratio": args.device_memory_ratio,
+        "speculative_prefetch": args.speculative_prefetch,
+        "speculative_prefetch_overlap": args.speculative_prefetch_overlap,
+        "overlap_prefetch_policy": args.overlap_prefetch_policy,
+        "overlap_prefetch_stats": overlap_stats,
+        "num_threads": args.num_threads,
+        "decode_step_times_ns": decode_step_times_ns,
+        "decode_step_total_ns": sum(decode_step_times_ns),
+        "decode_step_count": args.iters * args.max_new_tokens,
+        "pcie_link_width_observed": use_width,
+        "pcie_link_gen_observed": use_gen,
+        "pcie_link_width_pre": link_width,
+        "pcie_link_gen_pre": link_gen,
+        "pcie_link_width_post": link_width_after,
+        "pcie_link_gen_post": link_gen_after,
+    }
     out = build_profile_payload(
         args=args,
         decode_step_times_ns=decode_step_times_ns,

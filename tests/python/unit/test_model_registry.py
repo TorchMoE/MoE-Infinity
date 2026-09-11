@@ -28,6 +28,8 @@ def test_all_models_registered():
         expected_models.add("qwen3_5")
     if "glmmoedsa" in MODEL_MAPPING_NAMES:
         expected_models.add("glmmoedsa")
+    if "glm5next" in MODEL_MAPPING_NAMES:
+        expected_models.add("glm5next")
     actual_models = set(MODEL_MAPPING_NAMES.keys())
     assert expected_models == actual_models, (
         f"Missing: {expected_models - actual_models}, "
@@ -64,7 +66,7 @@ def test_parse_expert_type_new_models():
     for arch_prefix, expected_type in [
         ("DbrxForCausalLM", 4),
         ("OlmoeForCausalLM", 5),
-        ("JambaForCausalLM", 4),
+        ("JambaForCausalLM", 5),
     ]:
         config = SimpleNamespace(architectures=[arch_prefix])
         result = parse_expert_type(cast(Any, config))

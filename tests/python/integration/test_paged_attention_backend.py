@@ -144,10 +144,10 @@ def test_write_kv_and_read_back() -> None:
         slot = int(slot_mapping[i].item())
         block_id = slot // backend.spec.block_size
         token_offset = slot % backend.spec.block_size
-        k_cached = backend.k_cache[block_id, :, :, token_offset, :].reshape(
+        k_cached = backend.k_cache[0, block_id, :, :, token_offset, :].reshape(
             2, 8
         )
-        v_cached = backend.v_cache[block_id, :, :, token_offset]
+        v_cached = backend.v_cache[0, block_id, :, :, token_offset]
         torch.testing.assert_close(k_cached, key[i])
         torch.testing.assert_close(v_cached, value[i])
 
@@ -227,5 +227,5 @@ def test_kv_cache_shape() -> None:
         spec=spec,
         num_gpu_blocks=10,
     )
-    assert k_shape == (10, 2, 1, 4, 8)
-    assert v_shape == (10, 2, 8, 4)
+    assert k_shape == (1, 10, 2, 1, 4, 8)
+    assert v_shape == (1, 10, 2, 8, 4)

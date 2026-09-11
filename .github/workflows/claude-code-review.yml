@@ -40,9 +40,11 @@ jobs:
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          # The code-review plugin posts its findings through gh; without this
-          # allow-list (and pull-requests/issues write perms above) the agent
-          # finishes with permission denials and no review ever appears.
-          claude_args: '--allowedTools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue comment:*)"'
+          # The review posts through the action's buffered GitHub MCP tools
+          # (inline comments + sticky summary comment) and gh; without ALL of
+          # these in the allow-list (plus pull-requests/issues write perms
+          # above) the agent finishes with permission denials and no review
+          # ever appears.
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment,mcp__github_comment__update_claude_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue comment:*)"'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
