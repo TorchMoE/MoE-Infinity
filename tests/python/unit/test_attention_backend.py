@@ -156,10 +156,10 @@ def test_paged_backend_resize_requires_synchronized_receipt_and_recreates_stores
     )
     backend.resize_num_blocks(0, 4, receipt)
     assert backend.k_cache is not old_k and backend.v_cache is not old_v
-    assert backend.k_cache.shape[0] == backend.v_cache.shape[0] == 4
+    assert backend.k_cache.shape[:2] == backend.v_cache.shape[:2] == (1, 4)
     assert backend.k_cache.dtype == old_k.dtype
     assert backend.v_cache.dtype == old_v.dtype
     assert backend.k_cache.device == old_k.device
     assert backend.v_cache.device == old_v.device
-    assert backend.k_cache.stride() == old_k.stride()
-    assert backend.v_cache.stride() == old_v.stride()
+    assert backend.k_cache.stride()[1:] == old_k.stride()[1:]
+    assert backend.v_cache.stride()[1:] == old_v.stride()[1:]

@@ -79,9 +79,9 @@ class ArcherConfig:
         },
     )
     enable_attention_offload: bool = field(
-        default=False,
+        default=True,
         metadata={
-            "help": "Enable attention backend offloading. Default False (uses HuggingFace attention)."
+            "help": "Enable the paged attention backend on the native serving path. Default True; set False to fall back to HuggingFace attention."
         },
     )
     enable_deepseek_mla_paging: bool = field(

@@ -54,6 +54,8 @@ from moe_infinity.memory.adaptive_precision_policy import (
     ExpertKey,
 )
 from moe_infinity.models import (
+    DeepseekV2PagedAttention,
+    DeepseekV3PagedAttention,
     Qwen3MoEBlock,
     Qwen3PagedAttention,
     SyncDbrxFFNBlock,
@@ -1007,10 +1009,13 @@ class OffloadEngine(object):
             else "DeepseekV2Moe"
         )
         setattr(_dsv2_mod, _dsv2_attr, SyncDeepseekV2MoEBlock)
-        transformers.models.deepseek_v3.modeling_deepseek_v3._old_deepseek_v3_moe = transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MoE
-        transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MoE = (
-            SyncDeepseekV3MoEBlock
-        )
+        _dsv2_mod._old_deepseek_v2_attention = _dsv2_mod.DeepseekV2Attention
+        _dsv2_mod.DeepseekV2Attention = DeepseekV2PagedAttention
+        _dsv3_mod = transformers.models.deepseek_v3.modeling_deepseek_v3
+        _dsv3_mod._old_deepseek_v3_moe = _dsv3_mod.DeepseekV3MoE
+        _dsv3_mod.DeepseekV3MoE = SyncDeepseekV3MoEBlock
+        _dsv3_mod._old_deepseek_v3_attention = _dsv3_mod.DeepseekV3Attention
+        _dsv3_mod.DeepseekV3Attention = DeepseekV3PagedAttention
 
         transformers.models.gpt_oss.modeling_gpt_oss._old_gpt_oss_mlp = (
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP
@@ -2520,7 +2525,16 @@ class OffloadEngine(object):
             else "DeepseekV2Moe"
         )
         setattr(_dsv2_mod2, _dsv2_attr2, _dsv2_mod2._old_deepseek_v2_moe)
-        transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MoE = transformers.models.deepseek_v3.modeling_deepseek_v3._old_deepseek_v3_moe
+        if hasattr(_dsv2_mod2, "_old_deepseek_v2_attention"):
+            _dsv2_mod2.DeepseekV2Attention = (
+                _dsv2_mod2._old_deepseek_v2_attention
+            )
+        _dsv3_mod2 = transformers.models.deepseek_v3.modeling_deepseek_v3
+        _dsv3_mod2.DeepseekV3MoE = _dsv3_mod2._old_deepseek_v3_moe
+        if hasattr(_dsv3_mod2, "_old_deepseek_v3_attention"):
+            _dsv3_mod2.DeepseekV3Attention = (
+                _dsv3_mod2._old_deepseek_v3_attention
+            )
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = (
             transformers.models.gpt_oss.modeling_gpt_oss._old_gpt_oss_mlp
         )

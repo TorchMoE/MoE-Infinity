@@ -2155,6 +2155,19 @@ def _build_engine_config(
             raise RuntimeError("unable to resolve model hidden_size/head_dim")
         head_dim = hidden_size // max(1, num_attention_heads)
 
+    qk_rope_head_dim = _resolve_int_attr(text_config, "qk_rope_head_dim")
+    qk_nope_head_dim = _resolve_int_attr(text_config, "qk_nope_head_dim")
+    if qk_rope_head_dim is not None and qk_nope_head_dim is not None:
+        from moe_infinity.models.deepseek_v2_paged_attention import (
+            DeepseekV2PagedAttention,
+        )
+
+        mla_spec = DeepseekV2PagedAttention.get_kv_cache_spec_for_config(
+            text_config
+        )
+        head_dim = mla_spec["head_dim"]
+        num_kv_heads = mla_spec["num_kv_heads"]
+
     eos_token_id: Optional[int] = _resolve_int_attr(
         model_config, "eos_token_id"
     )

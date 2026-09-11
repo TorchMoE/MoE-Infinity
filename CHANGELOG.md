@@ -4,6 +4,12 @@ All notable changes to MoE-Infinity will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- The non-MLA paged KV cache now allocates one plane per decoder layer
+  (previously all layers aliased one plane). Memory use for the paged KV
+  cache grows by the layer count; deployments tuned to the undersized cache
+  may need a lower `device_memory_ratio`.
+
 ### Added
 
 - Opt-in phase-specific expert admission, prefetch, eviction, and telemetry over one shared residency manager, with the legacy policy retained by default and one-flag rollback requiring no offload-store migration.

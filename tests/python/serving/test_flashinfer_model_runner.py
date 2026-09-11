@@ -288,7 +288,7 @@ def _make_transactional_backend(
     backend = PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=2,
-            head_dim=8,
+            head_dim=64,
             dtype=torch.float16,
             block_size=block_size,
         ),
@@ -312,7 +312,7 @@ def test_model_runner_detects_real_qwen3_paged_attention(
         hidden_size=32,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=8,
+        head_dim=64,
         num_hidden_layers=1,
         intermediate_size=64,
         moe_intermediate_size=16,

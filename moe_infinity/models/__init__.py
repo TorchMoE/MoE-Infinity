@@ -21,12 +21,14 @@ from .olmoe import SyncOlmoeMoEBlock
 from .qwen import Qwen3MoEBlock
 from .qwen3_5_moe import SyncQwen3_5MoeSparseMoeBlock
 
-# Qwen3PagedAttention is lazily imported to avoid a circular dependency:
-# model_offload -> moe_infinity.models -> qwen3_paged_attention
+# Qwen3PagedAttention / Deepseek*PagedAttention are lazily imported to avoid a
+# circular dependency: model_offload -> moe_infinity.models -> *_paged_attention
 #   -> moe_infinity.runtime.attention_backend -> (back to runtime)
 
 __all__ = [
     "DeepseekMoEBlock",
+    "DeepseekV2PagedAttention",
+    "DeepseekV3PagedAttention",
     "Qwen3MoEBlock",
     "Qwen3PagedAttention",
     "SyncDbrxFFNBlock",
@@ -50,4 +52,14 @@ def __getattr__(name: str):
         from .qwen3_paged_attention import Qwen3PagedAttention
 
         return Qwen3PagedAttention
+    if name in ("DeepseekV2PagedAttention", "DeepseekV3PagedAttention"):
+        from .deepseek_v2_paged_attention import (
+            DeepseekV2PagedAttention,
+            DeepseekV3PagedAttention,
+        )
+
+        return {
+            "DeepseekV2PagedAttention": DeepseekV2PagedAttention,
+            "DeepseekV3PagedAttention": DeepseekV3PagedAttention,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

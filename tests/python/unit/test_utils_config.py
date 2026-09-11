@@ -54,7 +54,7 @@ def test_kv_cache_fields_default(monkeypatch):
         config = ArcherConfig(offload_path="/tmp")
     assert config.kv_cache_memory_ratio == 0.15
     assert config.use_native_engine is True
-    assert config.enable_attention_offload is False
+    assert config.enable_attention_offload is True
     assert config.enable_kv_cache_offload is False
     assert config.attention_backend == "default"
 
