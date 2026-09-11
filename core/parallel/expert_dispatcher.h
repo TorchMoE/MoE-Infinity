@@ -40,6 +40,19 @@ enum MUTEX_TYPE {
 struct CUevent_st;
 using cudaEvent_t = CUevent_st*;
 
+struct ExpertComputeSample {
+  std::uint64_t invocation_id = 0;
+  int layer_id = -1;
+  int expert_id = -1;
+  int gpu_id = -1;
+  std::int64_t kernel_start_offset_ns = 0;
+  std::int64_t kernel_end_offset_ns = 0;
+  std::int64_t kernel_duration_ns = 0;
+  std::int64_t forward_return_host_ns = 0;
+  std::int64_t output_complete_host_ns = 0;
+  std::int64_t output_delay_ns = 0;
+};
+
 class ExpertDispatcher : public base::noncopyable {
  public:
   typedef struct {
@@ -48,6 +61,8 @@ class ExpertDispatcher : public base::noncopyable {
     int gpu_id = -1;
     bool remote = false;
     bool wait_for_prefetch = false;
+    ExpertPhase phase = ExpertPhase::MIXED;
+    std::uint64_t invocation_id = 0;
     // Stamp the creating generation so late workers cannot underflow a failed
     // generation's pending count.
     std::uint64_t generation = 0;
@@ -62,7 +77,10 @@ class ExpertDispatcher : public base::noncopyable {
     torch::ScalarType out_dtype = torch::kFloat32;
     bool evict = false;
     bool hit = false;
+    bool managed_transient = false;
+    std::uint64_t residency_lease = 0;
     cudaEvent_t transfer_event = nullptr;
+    std::uint64_t invocation_id = 0;
     std::uint64_t generation = 0;
     bool cache_slot_reserved = false;
     bool cache_key_inserted = false;
@@ -108,6 +126,8 @@ class ExpertDispatcher : public base::noncopyable {
     std::uint64_t generation = 0;
     int gpu_id = -1;
     bool evict = false;
+    bool managed_transient = false;
+    std::uint64_t residency_lease = 0;
     std::uint64_t execution_lease_id = 0;
     ResidencyVariantKey execution_key;
   } ExpertRetireArgs;
@@ -235,8 +255,15 @@ class ExpertDispatcher : public base::noncopyable {
                  const torch::Tensor& router_mask,
                  const torch::Tensor& router_weight);
 
+  std::uint64_t SetInputsWithInvocation(const torch::Tensor& hidden_states,
+                                        const torch::Tensor& router_mask,
+                                        const torch::Tensor& router_weight);
+  void SetOverlapComputeTimingEnabled(bool enabled);
+  std::vector<ExpertComputeSample> DrainComputeSamples();
+
   void EnqueueExpert(int layer_idx, int expert_idx, int gpu_id = -1,
-                     bool remote = false);
+                     bool remote = false,
+                     int phase = static_cast<int>(ExpertPhase::MIXED));
   void NotifyFetchStart();
 
   void RegisterExpert(int layer_idx, int expert_idx,
@@ -422,6 +449,11 @@ class ExpertDispatcher : public base::noncopyable {
   std::optional<std::pair<std::uint64_t, ExpertFormat>> fail_transition_once_;
 #endif
 
+  std::atomic<bool> overlap_timing_enabled_{false};
+  std::atomic<std::uint64_t> invocation_counter_{0};
+  std::uint64_t current_invocation_id_{0};
+  std::mutex compute_samples_mutex_;
+  std::vector<ExpertComputeSample> compute_samples_;
   ThreadSafeQueue<RouteArgs> route_queue_;
   std::atomic<bool> route_pending_{false};
   std::atomic<std::uint64_t> dispatch_generation_{0};

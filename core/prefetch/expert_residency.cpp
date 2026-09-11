@@ -594,6 +594,34 @@ void ExpertResidencyManager::ReplaceProtectedCandidates(
   }
 }
 
+void ExpertResidencyManager::ConfigurePolicy(const PhasePolicyConfig& config) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  config_ = config;
+  counters_["enabled"] = config.enabled ? 1 : 0;
+}
+
+bool ExpertResidencyManager::PolicyEnabled() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return config_.enabled;
+}
+
+AdmissionMode ExpertResidencyManager::AdmissionFor(ExpertPhase phase) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return EffectivePhase(phase) == ExpertPhase::PREFILL
+             ? config_.prefill_admission
+             : config_.decode_admission;
+}
+
+std::uint32_t ExpertResidencyManager::StarvationLimit() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return config_.starvation_limit;
+}
+
+void ExpertResidencyManager::RecordStarvationPromotion() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  counters_["starvation_promotions"] += 1;
+}
+
 void ExpertResidencyManager::RecordAccess(const NodePtr& node,
                                           ExpertPhase phase, bool hit) {
   std::lock_guard<std::mutex> lock(mutex_);

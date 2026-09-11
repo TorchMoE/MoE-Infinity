@@ -8,6 +8,30 @@ import torch
 
 from moe_infinity.runtime import attention_backend as attention_backend_module
 from moe_infinity.runtime import flashinfer_utils
+from moe_infinity.runtime.attention_types import AttentionMetadata, KVCacheSpec
+from moe_infinity.runtime.kv_cache_format import allocate_layered_paged_kv_store
+
+
+def _make_layered_store(
+    *,
+    format_name: str = "int8_sym",
+    num_layers: int = 2,
+    num_blocks: int = 4,
+    owner_id: str = "serving-engine-1",
+):
+    return allocate_layered_paged_kv_store(
+        owner_id=owner_id,
+        format_name=format_name,
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=8,
+        execution_dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+
+
 from moe_infinity.runtime.attention_types import (
     AttentionMetadata,
     KVCacheSpec,
@@ -575,3 +599,22 @@ def test_flashinfer_workspace_reuse_across_batches() -> None:
         attention_metadata=metadata,
     )
     assert backend._fi_workspace is workspace0
+
+
+def test_int8_request_does_not_allocate_duplicate_flashinfer_cache(
+    monkeypatch,
+) -> None:
+    _enable_fake_flashinfer(monkeypatch)
+    spec = _spec()
+    spec.format_name = "int8_sym"
+    backend = attention_backend_module.PagedAttentionBackend(
+        spec, 4, torch.device("cpu")
+    )
+    store = _make_layered_store(
+        format_name="int8_sym", num_layers=2, num_blocks=4
+    )
+    backend.bind_store(store, owner_id="serving-engine-1")
+    assert backend._fi_kv_cache is None
+    assert backend.store is store
+    assert backend.effective_format == "int8_sym"
+    assert backend.format_decision_reason == "flashinfer_no_int8_sym_contract"

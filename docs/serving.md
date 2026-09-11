@@ -56,6 +56,8 @@ Stable options from `api_server_v2.py`:
 | `--enable-prefix-caching` | off | Enable correctness-preserving prefix KV reuse (Qwen3 + FlashInfer) |
 | `--prefix-cache-max-entries` | 1000 | Max prefix-index entries (startup-only, >= 1) |
 | `--enable-prefix-caching` | off | Enable prefix-cache bookkeeping flag |
+| `--kv-cache-format` | `native` | KV storage format: `native` or `int8_sym` (opt-in) |
+| `--no-kv-cache-format-fallback` | off | Refuse a native fallback when `int8_sym` is unsupported |
 | `--enable-decode-cuda-graphs` | off | Permit decode graph qualification; unsafe runtimes still run eagerly |
 | `--decode-cuda-graph-batch-sizes` | `1 2 4 8 16 32` | Positive capture/replay batch buckets |
 | `--decode-cuda-graph-context-sizes` | `128 256 512 1024 2048 4096` | Positive native-paged context buckets |
@@ -66,6 +68,7 @@ Stable options from `api_server_v2.py`:
 | `--enable-pyspy-dump` | off | Scaffolded flag; currently accepted and stored, but no py-spy dump is triggered |
 | `--enable-contextpilot` | off | Enable ContextPilot middleware |
 | `--contextpilot-debug` | off | Enable ContextPilot fault-injection/admin hooks |
+| `--phase-specific-expert-policy` / `--no-phase-specific-expert-policy` | off | Enable or explicitly disable phase-specific admission, prefetch, eviction, and mixed-batch ordering over the shared expert cache |
 
 Internal / deprecated:
 
@@ -73,6 +76,38 @@ Internal / deprecated:
   `MoE.serve(...)` is the continuous-batching HTTP transition path, not a
   drop-in in-process call replacement.
 - `--max-waiting-requests` and `--max-n` feed internal module state used by middleware.
+
+## KV-cache quantization (opt-in)
+
+`--kv-cache-format int8_sym` opts into symmetric INT8 KV storage. It is
+disabled by default; `native` remains the default and one-setting rollback.
+See [Configuration](./configuration.md) for the storage/transfer/execution
+precision contract, memory formula, and MLA fallback behavior.
+
+```bash
+# Opt in to INT8 KV storage
+python -m moe_infinity.entrypoints.openai.api_server_v2 \
+    --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+    --host 127.0.0.1 --kv-cache-format int8_sym
+
+# Strict qualification: refuse any fallback
+python -m moe_infinity.entrypoints.openai.api_server_v2 \
+    --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+    --host 127.0.0.1 --kv-cache-format int8_sym \
+    --no-kv-cache-format-fallback
+
+# Immediate rollback; native remains the default
+python -m moe_infinity.entrypoints.openai.api_server_v2 \
+    --model Qwen/Qwen3-30B-A3B --offload-dir /local/ssd/qwen3-kv \
+    --host 127.0.0.1 --kv-cache-format native
+```
+
+Engine stats and `/v1/config` expose `requested_kv_cache_format`,
+`effective_kv_cache_format`, `kv_cache_execution_backend`, and
+`kv_cache_format_decision_reason` so operators can confirm the effective
+format and detect a fallback. If `effective_kv_cache_format` reports `native`
+after requesting `int8_sym`, the request fell back (for example
+`mla_not_validated`) and storage is not quantized.
 
 ## Python Startup
 
@@ -386,6 +421,37 @@ The optional `/contextpilot/toggle`, `/contextpilot/inject-fault`, and
 serving table. The fault-injection route is debug-only and requires
 `--contextpilot-debug`.
 
+## Phase-specific expert policy
+
+The opt-in policy keeps one expert store and one GPU cache; it does not create
+prefill and decode pools. `ExpertResidencyManager` is the sole enabled-mode
+authority for persistent membership, resident bytes, leases, candidate
+protection, eviction reservations, and policy counters. Dispatcher and
+prefetch telemetry are views of that shared snapshot.
+
+With `--phase-specific-expert-policy`, a mixed serving batch executes decode
+rows first and prefill rows second, once each, then restores original output
+order. With `--no-phase-specific-expert-policy` (the default), a non-paged mixed
+batch remains one combined forward and a paged mixed batch retains prefill-then-
+decode order.
+
+To roll back, restart with `--no-phase-specific-expert-policy`. For in-process
+configuration, set `"phase_specific_expert_policy": false`. Subordinate policy
+keys may remain in JSON because they are inert while the master gate is false.
+No cache deletion or offload-store migration is required: phase is not stored
+in tensor IDs, topology, or checkpoint metadata.
+
+Before disabling after a regression, capture `/admin/stats`, `/metrics`, the
+effective config, and the benchmark JSON. Check `starvation_promotions`,
+`prefetch_rejected`, TTFT, and TPOT, and do not change `device_memory_ratio`
+between A/B runs. See [Configuration](configuration.md#phase-specific-expert-policy-fields),
+[Benchmarking](benchmarking.md#phase-specific-expert-policy-matrix), and
+[Troubleshooting](troubleshooting.md#phase-specific-expert-policy-regression-or-rollback).
+
+Adaptive expert precision is not parallel-merge composable with this fixed-size
+manager. Land this policy first, then rebase adaptive precision onto the same
+lease/accounting transactions and add combined tests before co-enabling them.
+
 ## Watchdogs and Diagnostics
 
 - `--startup-timeout` is disabled by default.
@@ -405,6 +471,76 @@ If you need timeout debugging, use the watchdog logs and the troubleshooting gui
 - `finish_reason="error"`: JSON-object validation failure.
 - Penalties and `logit_bias` are accepted by the request models but are not applied in sampling.
 
+## KV swap lifecycle and recovery
+
+KV transfer state is independent from request `SequenceStatus`:
+
+```text
+GPU_RESIDENT -> SWAP_OUT_IN_FLIGHT -> HOST_RESIDENT
+HOST_RESIDENT -> SWAP_IN_IN_FLIGHT -> GPU_RESIDENT
+SWAP_OUT_IN_FLIGHT / SWAP_IN_IN_FLIGHT -> CANCEL_PENDING -> CANCELLED
+HOST_RESIDENT / SWAP_IN_IN_FLIGHT -> FAILED -> reprefill recovery
+```
+
+The scheduler calls `poll_transfers()` once at the start of a scheduling pass
+and aggregates all members of a request group before changing queues. Group
+phases are `OUT_IN_FLIGHT`, `HOST_RESIDENT`, `IN_IN_FLIGHT`,
+`ROLLBACK_IN_FLIGHT`, and `REPREFILL_PENDING`. Partial completion never makes a
+member runnable. Successful H2D restores each member's prior status; terminal
+metadata, checksum, or retry failure first removes cache transfer records and
+then separately moves the group from `SequenceStatus.SWAPPED` to
+`SequenceStatus.WAITING` for reprefill.
+
+The producer stream happens-before the transfer stream, and an early consumer
+waits on the completion event. A ticket retains its stream, event, and staging
+tensors until `retire` succeeds. Cancellation removes scheduler visibility but
+keeps a generation-keyed tombstone, EVICTING/RESTORING blocks, host lease, and
+ticket until DMA retires. Shutdown stops admission, synchronizes every event,
+retires tickets, finalizes blocks and leases, closes transfer streams, and only
+then releases the pool. Exceeding the shutdown warning deadline does not permit
+unsafe reclamation.
+
+`/v1/reload` reloads Python modules; it does not migrate live KV state. Drain
+and replace/restart the old engine for model changes.
+
+### KV swap telemetry
+
+`/admin/stats` exposes the `kv_swap` object and `/metrics` exports:
+
+- `moe_kv_swap_inflight`, `moe_kv_swap_inflight_bytes`
+- `moe_kv_swap_retiring_records`, `moe_kv_swap_host_resident`
+- `moe_kv_swap_host_bytes`, `moe_kv_swap_host_capacity_bytes`
+- `moe_kv_swap_backpressure_total`
+- `moe_kv_swap_out_completed_total`, `moe_kv_swap_in_completed_total`
+- `moe_kv_swap_failures_total{direction="out|in"}`
+- `moe_kv_swap_bytes_total{direction="d2h|h2d"}`
+- `moe_kv_swap_duration_seconds_sum{direction="d2h|h2d"}`
+
+Durations are observed completion latency from monotonic submission to event
+observation, not pure PCIe time. Metrics contain no sequence IDs, request IDs,
+tokens, or checksums.
+
+### External tier and non-goals
+
+`ExternalKVStore` is a future pinned-host-to-external seam. This release has no
+external-store implementation, distributed storage, SSD/RDMA/object-store
+backend, multi-node protocol, or KV quantization. The
+[Mooncake paper](https://arxiv.org/abs/2407.00079) motivates decoupling transfer
+control from storage tiers; it is not a dependency or performance claim.
+In short, there is no external store implementation in this change.
+In short, there is no external storage implementation in this change.
+
+### Rollout and rollback
+
+1. **Stage 0:** keep default sync; land CPU/CUDA correctness tests and telemetry.
+2. **Stage 1:** enable async on one canary; alert on failures, checksum failures,
+   backpressure, pinned utilization, and p99 swap latency.
+3. **Stage 2:** expand async opt-in only after workload-specific A/B review;
+   retain immediate restart/drain rollback to sync.
+4. **Stage 3:** consider changing defaults only in a separate change backed by
+   production data.
+Rollback requires draining/restarting with `kv_swap_mode="sync"`; never change
+the backend while transfers are in flight.
 ### Chunked prefill (experimental)
 
 Chunked prefill is disabled by default. Enable it with

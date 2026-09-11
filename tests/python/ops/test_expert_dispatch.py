@@ -19,6 +19,7 @@ class _FakeExpertDispatcher:
         self.router_weights = None
         self.expected_wait_cnt = 0
         self.enqueued_expert_ids: list[int] = []
+        self.enqueued_phases: list[int] = []
         self.notify_fetch_start_called = False
         self.token_contribution_counts = None
 
@@ -30,8 +31,9 @@ class _FakeExpertDispatcher:
     def set_expected_queue(self, expected_wait_cnt):
         self.expected_wait_cnt = int(expected_wait_cnt)
 
-    def enqueue_expert(self, layer_id, expert_id, gpu_id, remote):
+    def enqueue_expert(self, layer_id, expert_id, gpu_id, remote, phase=2):
         self.enqueued_expert_ids.append(int(expert_id))
+        self.enqueued_phases.append(int(phase))
 
     def notify_fetch_start(self):
         self.notify_fetch_start_called = True
@@ -181,6 +183,53 @@ def test_dispatch_local_routing_weighted_accumulation_and_no_drops():
         rtol=BF16_RTOL,
         atol=BF16_ATOL,
     )
+
+
+@requires_cuda
+def test_dispatch_local_passes_current_phase_to_enqueue_expert():
+    from moe_infinity.memory.expert_policy import (
+        ExpertPhase,
+        expert_phase_scope,
+    )
+
+    hidden_states = torch.tensor(
+        [[1.0, 2.0, -1.0], [0.5, -0.5, 1.5]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    router_mask = torch.tensor(
+        [[True, False], [False, True]],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    router_weights = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    expert_fns: dict[int, Callable[[Any], Any]] = {
+        0: lambda x: x,
+        1: lambda x: x,
+    }
+    fake_dispatcher = _FakeExpertDispatcher(expert_fns)
+    executor = DistributedExpertExecutor(
+        archer_config=ArcherConfig(offload_path="")
+    )
+    executor.set_expert_dispatcher(fake_dispatcher)
+
+    with expert_phase_scope(ExpertPhase.DECODE):
+        executor.dispatch_local(
+            layer_id=0,
+            hidden_states=hidden_states,
+            router_mask=router_mask,
+            router_weights=router_weights,
+        )
+        _ = executor.wait_dispatch_local()
+
+    assert fake_dispatcher.enqueued_phases == [int(ExpertPhase.DECODE)] * len(
+        fake_dispatcher.enqueued_expert_ids
+    )
+    assert fake_dispatcher.enqueued_expert_ids
 
 
 @requires_cuda

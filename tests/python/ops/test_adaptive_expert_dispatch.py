@@ -9,6 +9,17 @@ import torch
 from moe_infinity import _store
 
 
+def _wait_for_lease_drain(dispatcher, timeout_s: float = 5.0):
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    metrics = dispatcher.get_precision_metrics()
+    while metrics["active_leases"] != 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+        metrics = dispatcher.get_precision_metrics()
+    return metrics
+
+
 @dataclass
 class NativeAdaptiveFixture:
     dispatcher: object
@@ -22,11 +33,14 @@ class NativeAdaptiveFixture:
         self.dispatcher.set_expected_queue(1)
         self.dispatcher.enqueue_expert(0, 0, 0, False)
         self.dispatcher.notify_fetch_start()
-        return self.dispatcher.wait_expert()
+        result = self.dispatcher.wait_expert()
+        _wait_for_lease_drain(self.dispatcher)
+        return result
 
 
-@pytest.fixture
-def native_adaptive_fixture(tmp_path):
+@pytest.fixture(scope="module")
+def native_adaptive_fixture(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("adaptive_dispatch")
     handle = _store.prefetch_handle(str(tmp_path), 0.5)
     tensors = [torch.randn(128, 128, dtype=torch.bfloat16) for _ in range(3)]
     for tensor_id, tensor in enumerate(tensors):
@@ -144,7 +158,7 @@ def test_dispatcher_publishes_only_ready_generation(native_adaptive_fixture):
     before = dispatcher.get_precision_metrics()
     assert dispatcher.set_precision_targets([(0, 0, "bf16", 1)], epoch=1)
     output = native_adaptive_fixture.run()
-    after = dispatcher.get_precision_metrics()
+    after = _wait_for_lease_drain(dispatcher)
     assert torch.isfinite(output).all()
     assert after["published_generation"] == before["published_generation"] + 1
     assert after["active_leases"] == 0
@@ -161,9 +175,9 @@ def test_failed_transition_keeps_canonical_generation(native_adaptive_fixture):
     dispatcher = native_adaptive_fixture.dispatcher
     canonical = native_adaptive_fixture.run()
     dispatcher.inject_transition_failure_once_for_test(0, 0, "bf16")
-    assert dispatcher.set_precision_targets([(0, 0, "bf16", 1)], epoch=1)
+    assert dispatcher.set_precision_targets([(0, 0, "bf16", 1)], epoch=2)
     actual = native_adaptive_fixture.run()
-    metrics = dispatcher.get_precision_metrics()
+    metrics = _wait_for_lease_drain(dispatcher)
     assert torch.equal(actual, canonical)
     assert metrics["fallback_counts"]["transition_failed"] == 1
     assert metrics["active_format"] == "bf16"

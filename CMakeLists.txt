@@ -40,10 +40,21 @@ endif()
 
 find_package(OpenMP REQUIRED)
 
+option(MOE_BUILD_TESTS "Build native unit tests" OFF)
+
 add_subdirectory(core)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_subdirectory(tests/cpp/unit/prefetch)
+endif()
+
 add_subdirectory(extensions)
 
 include(CTest)
 if(BUILD_TESTING)
   add_subdirectory(tests/cpp/unit/prefetch)
+if(MOE_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests/cpp)
 endif()

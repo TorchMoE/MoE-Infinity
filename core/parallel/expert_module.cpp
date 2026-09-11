@@ -220,8 +220,9 @@ void MoEMLP::DequantMxfp4Params(cudaStream_t stream) {
   gpt_oss_param_.push_back(param_[5]);
 }
 
-torch::Tensor MoEMLP::forward(torch::Tensor hidden_states,
-                              cudaStream_t stream) {
+torch::Tensor MoEMLP::forward(torch::Tensor hidden_states, cudaStream_t stream,
+                              cudaEvent_t kernel_start,
+                              cudaEvent_t kernel_stop) {
   DLOG_FATAL_IF(param_set_ == false, "param_set_ should be true");
   DLOG_FATAL_IF(param_init_ == false, "param_init_ should be true");
 
@@ -256,7 +257,13 @@ torch::Tensor MoEMLP::forward(torch::Tensor hidden_states,
     }
   }
 
+  if (kernel_start != nullptr) {
+    cudaEventRecord(kernel_start, stream);
+  }
   ForwardHelper(stream);
+  if (kernel_stop != nullptr) {
+    cudaEventRecord(kernel_stop, stream);
+  }
   param_set_ = false;
   auto output = output_.clone();
 

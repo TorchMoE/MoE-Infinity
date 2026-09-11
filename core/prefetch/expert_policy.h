@@ -14,6 +14,12 @@ enum class AdmissionMode : std::uint8_t {
   TRANSIENT_ON_PRESSURE = 1
 };
 
+inline std::uint32_t ServiceClass(std::uint32_t priority,
+                                  std::uint32_t bypasses, std::uint32_t limit) {
+  if (priority == 0) return 0;
+  return bypasses >= limit ? 1 : priority;
+}
+
 struct PhasePolicyConfig {
   bool enabled = false;
   AdmissionMode prefill_admission = AdmissionMode::TRANSIENT_ON_PRESSURE;

@@ -34,7 +34,18 @@ class ArcherPrefetchHandle {
   void ReplaceCacheCandidates(const std::vector<std::uint32_t>& tensor_ids);
   void EnqueuePrefetch(const uint32_t tensor_id, int gpu_id);
   void EnqueuePrefetchTensors(const std::vector<std::uint32_t>& tensor_ids,
-                              std::uint32_t priority = kRouteAheadPriority);
+                              std::uint32_t priority = kRouteAheadPriority,
+                              int phase = static_cast<int>(ExpertPhase::MIXED));
+
+  PrefetchAdmission SchedulePrefetchTensors(
+      const std::vector<std::uint32_t>& tensor_ids, std::uint32_t priority,
+      std::uint64_t generation, std::int64_t layer_id,
+      std::int64_t max_inflight_bytes);
+  std::int64_t CancelPrefetchGeneration(
+      std::uint64_t generation, std::int64_t layer_id,
+      const std::vector<std::uint32_t>& keep_tensor_ids);
+  std::vector<PrefetchSample> DrainPrefetchSamples();
+  std::int64_t GetInflightPrefetchBytes();
 
   void OffloadTensor(torch::Tensor& tensor, const std::uint32_t tensor_id);
   void RegisterTensor(torch::Tensor& tensor, const std::uint32_t tensor_id);
@@ -62,7 +73,6 @@ class ArcherPrefetchHandle {
   std::vector<std::tuple<std::uint64_t, bool, int>> GetTopologySnapshot();
   NodePtr CreateDetachedNode(const std::vector<TensorID>& tensor_ids,
                              int gpu_id);
-  std::unordered_map<std::string, std::int64_t> GetExpertPolicyStats() const;
   std::uintptr_t GetResidencyManagerId() const;
   void ConfigureResidencyManager(bool manager_enabled,
                                  bool phase_policy_enabled);
@@ -91,10 +101,17 @@ class ArcherPrefetchHandle {
   void CleanUpResources();
   void ResetCache();
 
+  void ConfigureExpertPolicy(bool enabled, int prefill_admission,
+                             int decode_admission, double prefill_weight,
+                             double decode_weight, int starvation_limit);
+  ExpertPolicyStats GetExpertPolicyStats() const;
+
   // void SetNodeCachePriority(const std::uint64_t corr_id, const float
   // priority);
 
  private:
+  void ConfigureExpertCapacityAfterTopology();
+
   std::string prefix_;
   std::unordered_map<std::size_t, std::unordered_set<std::uint32_t>>
       node_id_to_tensor_ids_;

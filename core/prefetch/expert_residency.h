@@ -184,6 +184,12 @@ class ExpertResidencyManager {
   void ReplaceProtectedCandidates(const NodePtrList& candidates);
   void RecordAccess(const NodePtr& node, ExpertPhase phase, bool hit);
 
+  void ConfigurePolicy(const PhasePolicyConfig& config);
+  bool PolicyEnabled() const;
+  AdmissionMode AdmissionFor(ExpertPhase phase) const;
+  std::uint32_t StarvationLimit() const;
+  void RecordStarvationPromotion();
+
   ExpertPolicyStats Snapshot() const;
   std::int64_t ResidentBytes(int gpu_id) const;
   std::size_t ResidentCount(int gpu_id) const;
@@ -220,6 +226,9 @@ class ExpertResidencyManager {
   std::unordered_map<std::size_t, ExpertPolicyMetadata> access_metadata_;
   std::unordered_set<std::size_t> protected_ids_;
   std::vector<ResidencyVariantKey> protected_variants_;
+  PhasePolicyConfig config_;
+  ExpertPolicyStats counters_;
+
   std::uint64_t next_ticket_id_ = 1;
   std::uint64_t next_lease_id_ = 1;
   std::uint64_t access_sequence_ = 0;
