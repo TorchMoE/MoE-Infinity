@@ -84,6 +84,8 @@ class ExpertDispatcher : public base::noncopyable {
     std::uint64_t generation = 0;
     bool cache_slot_reserved = false;
     bool cache_key_inserted = false;
+    std::uint64_t execution_lease_id = 0;
+    ResidencyVariantKey execution_key;
   } ExecArgs;
   typedef std::tuple<torch::Tensor, int, int, int> CallResult;
 
@@ -126,6 +128,8 @@ class ExpertDispatcher : public base::noncopyable {
     bool evict = false;
     bool managed_transient = false;
     std::uint64_t residency_lease = 0;
+    std::uint64_t execution_lease_id = 0;
+    ResidencyVariantKey execution_key;
   } ExpertRetireArgs;
 
   struct CompletionEventRecord {
@@ -274,6 +278,29 @@ class ExpertDispatcher : public base::noncopyable {
   }
 
   void SetScales(const std::map<std::string, torch::Tensor>& scales);
+  bool RegisterExpertVariant(
+      int layer_idx, int expert_idx, const std::string& format,
+      std::uint64_t generation, const std::string& execution,
+      const std::vector<std::uint32_t>& tensor_ids,
+      const std::vector<std::string>& tensor_roles, std::int64_t payload_bytes,
+      std::int64_t aligned_bytes, std::int64_t workspace_bytes);
+  bool SetPrecisionTargets(
+      const std::vector<std::tuple<int, int, std::string, std::uint64_t>>&
+          targets,
+      std::uint64_t epoch);
+  bool SetAdaptiveHbmBudgetBytes(std::int64_t bytes);
+  ExpertPolicyStats GetPrecisionMetrics() const;
+  std::vector<std::tuple<std::uint64_t, std::uint8_t, std::uint64_t,
+                         std::int64_t, std::int64_t, std::uint8_t>>
+  GetResidentGenerationEntries() const;
+  std::uintptr_t GetResidencyManagerId() const;
+  void ConfigureResidencyManager(bool manager_enabled,
+                                 bool phase_policy_enabled);
+  std::string GetActiveFormat() const;
+#ifdef MOE_INFINITY_TESTING
+  void InjectTransitionFailureOnceForTest(int layer_idx, int expert_idx,
+                                          const std::string& format);
+#endif
 
   std::vector<CallResult> WaitExpert() { return Wait(); }
   torch::Tensor WaitHiddenStates();
@@ -292,6 +319,7 @@ class ExpertDispatcher : public base::noncopyable {
 
   void GPUFetchFunc(int gpu_id);
   void GPUExecFunc(int gpu_id, int thread_idx);
+  bool ApplyPrecisionTarget(const ExpertNodePtr& expert_node, int gpu_id);
 
   // void GPUThreadFunc(int gpu_id);
 
@@ -342,7 +370,7 @@ class ExpertDispatcher : public base::noncopyable {
 
  private:
   std::vector<std::unique_ptr<base::Thread>> threads_;
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   // std::vector<std::deque<CallArgs>> input_queue_;
   std::vector<ThreadSafeQueue<CallArgs>> input_queue_;
   // std::vector<std::deque<ExecArgs>> exec_queue_;
@@ -400,6 +428,26 @@ class ExpertDispatcher : public base::noncopyable {
 
   bool fp8_in_store_ = false;
   std::vector<std::vector<std::vector<torch::Tensor>>> fp8_scales_;
+  std::map<ResidencyVariantKey, ResidencyVariant> registered_variants_;
+  std::map<ResidencyVariantKey, ExpertExecutionDescriptor>
+      execution_descriptors_;
+  std::unordered_map<std::uint64_t, ResidencyVariantKey> precision_targets_;
+  std::uint64_t precision_epoch_ = 0;
+  std::uint64_t published_generation_ = 0;
+  std::int64_t adaptive_hbm_budget_bytes_ = 0;
+  std::int64_t transition_failed_count_ = 0;
+  std::int64_t h2d_payload_bytes_ = 0;
+  std::int64_t h2d_transfers_ = 0;
+  std::int64_t promotions_ = 0;
+  std::int64_t demotions_ = 0;
+  std::int64_t representation_hits_ = 0;
+  std::int64_t representation_misses_ = 0;
+  bool manager_enabled_ = false;
+  bool phase_policy_enabled_ = false;
+  std::string active_format_ = "bf16";
+#ifdef MOE_INFINITY_TESTING
+  std::optional<std::pair<std::uint64_t, ExpertFormat>> fail_transition_once_;
+#endif
 
   std::atomic<bool> overlap_timing_enabled_{false};
   std::atomic<std::uint64_t> invocation_counter_{0};

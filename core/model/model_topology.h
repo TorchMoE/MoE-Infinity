@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -194,6 +195,8 @@ class ArcherTopologyHandle : public base::noncopyable {
   void SetChildVisitCounts(const std::vector<std::size_t>& visit_counts);
 
   NodePtr GetNodeFromTensorID(const TensorID& tensor_id);
+  NodePtr CreateDetachedNode(const std::vector<TensorID>& tensor_ids,
+                             int gpu_id);
   NodeBodyPtr GetNodeBodyFromCorrID(const std::uint64_t& correlation_id);
 
   std::tuple<std::size_t, std::size_t> GetNumLayersAndExperts();
@@ -223,6 +226,8 @@ class ArcherTopologyHandle : public base::noncopyable {
   bool trace_enabled_ = true;
 
   std::unordered_map<TensorID, NodePtr> tensor_id_to_node_;
+  std::size_t next_detached_node_id_ =
+      std::numeric_limits<std::size_t>::max() / 2;
 };
 
 extern std::unique_ptr<ArcherTopologyHandle> kTopologyHandle;

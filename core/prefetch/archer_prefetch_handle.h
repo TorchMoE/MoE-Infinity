@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <string>
+#include <unordered_map>
+
 #include "aio/archer_tensor_handle.h"
 #include "model/model_topology.h"
 #include "parallel/expert_dispatcher.h"
@@ -68,10 +71,32 @@ class ArcherPrefetchHandle {
           std::tuple<std::string, bool, std::vector<std::vector<TensorID>>,
                      std::vector<std::uint64_t>>>& topology);
   std::vector<std::tuple<std::uint64_t, bool, int>> GetTopologySnapshot();
+  NodePtr CreateDetachedNode(const std::vector<TensorID>& tensor_ids,
+                             int gpu_id);
+  std::uintptr_t GetResidencyManagerId() const;
+  void ConfigureResidencyManager(bool manager_enabled,
+                                 bool phase_policy_enabled);
+  bool SetAdaptiveHbmBudgetBytes(std::int64_t bytes);
+  std::size_t PrefetchExpertVariants(
+      const std::vector<std::tuple<int, int, std::string, std::uint64_t>>& keys,
+      std::uint32_t priority, const std::string& phase);
   void UpdateTensorMap(std::uint64_t old_ptr, std::uint64_t new_ptr);
   bool IsTensorIndexInitialized() const;
   bool IsTensorOnDevice(const torch::Tensor& tensor) const;
   bool IsTensorOnDevice(const TensorID tensor_id) const;
+
+  std::vector<std::unordered_map<std::string, py::object>>
+  GetCanonicalTensorIndexSnapshot() const;
+  void BeginDerivativeOverlay(const std::string& generation,
+                              std::int64_t canonical_max_tensor_id,
+                              std::int64_t canonical_max_file_id);
+  void RegisterDerivativeTensor(const std::string& generation,
+                                std::int64_t tensor_id, std::int64_t file_id,
+                                std::int64_t offset, std::int64_t size,
+                                const std::vector<std::int64_t>& shape,
+                                const std::string& dtype);
+  void CommitDerivativeOverlay(const std::string& generation);
+  void AbortDerivativeOverlay(const std::string& generation);
 
   void CleanUpResources();
   void ResetCache();
@@ -94,6 +119,8 @@ class ArcherPrefetchHandle {
   uint64_t last_layer_id_;
   NodePtr last_node_;
   bool has_cleaned_up_resources_;
+  bool manager_enabled_ = false;
+  bool phase_policy_enabled_ = false;
 
   std::unordered_map<std::uint64_t, std::unordered_set<NodePtr>>
       request_id_to_nodes_;

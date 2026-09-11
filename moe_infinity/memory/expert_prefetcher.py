@@ -158,6 +158,18 @@ class ExpertPrefetcher(object):
         _expert_prefetcher = archer_engine
         self.archer_engine = archer_engine
 
+    def get_residency_manager_id(self) -> int:
+        if self.archer_engine is None:
+            return 0
+        getter = getattr(self.archer_engine, "get_residency_manager_id", None)
+        return int(getter()) if callable(getter) else 0
+
+    def get_policy_stats(self) -> dict:
+        if self.archer_engine is None:
+            return {}
+        getter = getattr(self.archer_engine, "get_policy_stats", None)
+        return dict(getter()) if callable(getter) else {}
+
     @property
     def num_offloaded_experts(self) -> int:
         engine = self.archer_engine
@@ -287,6 +299,19 @@ class ExpertPrefetcher(object):
         for tensor_id in tensor_ids:
             gpu_id = self.archer_engine.get_node_default_device([tensor_id])
             self.archer_engine.enqueue_prefetch(tensor_id, gpu_id)
+
+    def prefetch_expert_variants(
+        self,
+        targets: list[tuple[int, int, str, int]],
+        priority: int,
+        phase: str,
+    ) -> int:
+        if self.archer_engine is None:
+            return 0
+        prefetch = getattr(self.archer_engine, "prefetch_expert_variants", None)
+        return (
+            int(prefetch(targets, priority, phase)) if callable(prefetch) else 0
+        )
 
     def fetch_experts_lock_cache(self, layer_id: int, expert_list: List[int]):
         if self.archer_engine is None:

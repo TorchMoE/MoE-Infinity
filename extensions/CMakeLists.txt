@@ -21,6 +21,9 @@ target_link_libraries(prefetch_op PRIVATE
 
 # TORCH_EXTENSION_NAME is normally injected by setuptools; define it here for CMake.
 target_compile_definitions(prefetch_op PRIVATE TORCH_EXTENSION_NAME=prefetch_op)
+if(MOE_INFINITY_TESTING)
+  target_compile_definitions(prefetch_op PRIVATE MOE_INFINITY_TESTING=1)
+endif()
 
 target_compile_options(prefetch_op PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -Wno-reorder -fPIC -fopenmp -march=native>

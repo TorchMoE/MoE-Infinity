@@ -1,5 +1,7 @@
 # Configuration and memory planning
 
+Adaptive expert precision is disabled by default (`adaptive_expert_precision: false`). Its `adaptive_hbm_budget_bytes` unit is bytes; see [adaptive expert precision](adaptive-expert-precision.md).
+
 This page is the source of truth for `ArcherConfig` in
 `moe_infinity.utils.config`.
 It documents the Python config layer only. The OpenAI server has a separate

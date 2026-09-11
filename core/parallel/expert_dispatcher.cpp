@@ -4,6 +4,7 @@
 // EfficientMoE Team
 
 #include "expert_dispatcher.h"
+#include <optional>
 #include "aio/archer_tensor_index.h"
 #include "common/pytorch.h"
 #include "common/time.h"
@@ -196,6 +197,67 @@ static torch::Tensor _fp8_dequant_on_device(const torch::Tensor& w_fp8,
   return out;
 }
 
+namespace {
+
+std::optional<ExpertFormat> ParseExpertFormat(const std::string& value) {
+  if (value == "bf16") return ExpertFormat::BF16;
+  if (value == "fp8_e4m3_block128") return ExpertFormat::FP8_E4M3_BLOCK128;
+  if (value == "marlin_int4_group128")
+    return ExpertFormat::MARLIN_INT4_GROUP128;
+  if (value == "gpt_oss_mxfp4") return ExpertFormat::GPT_OSS_MXFP4;
+  if (value == "glm_fp8_block128") return ExpertFormat::GLM_FP8_BLOCK128;
+  if (value == "deepseek_v4_fp4") return ExpertFormat::DEEPSEEK_V4_FP4;
+  if (value == "gptq") return ExpertFormat::GPTQ;
+  if (value == "awq") return ExpertFormat::AWQ;
+  return std::nullopt;
+}
+
+std::optional<std::uint8_t> ParseExecutionKind(const std::string& value) {
+  if (value == "bf16_gemm") return 0;
+  if (value == "fp8_dequant_bf16_gemm") return 1;
+  if (value == "marlin_w4a16") return 2;
+  if (value == "gpt_oss_mxfp4") return 3;
+  if (value == "deepseek_v4_fp4") return 4;
+  if (value == "legacy_quantized") return 5;
+  return std::nullopt;
+}
+
+std::string FormatName(ExpertFormat format) {
+  switch (format) {
+    case ExpertFormat::BF16:
+      return "bf16";
+    case ExpertFormat::FP8_E4M3_BLOCK128:
+      return "fp8_e4m3_block128";
+    case ExpertFormat::MARLIN_INT4_GROUP128:
+      return "marlin_int4_group128";
+    case ExpertFormat::GPT_OSS_MXFP4:
+      return "gpt_oss_mxfp4";
+    case ExpertFormat::GLM_FP8_BLOCK128:
+      return "glm_fp8_block128";
+    case ExpertFormat::DEEPSEEK_V4_FP4:
+      return "deepseek_v4_fp4";
+    case ExpertFormat::GPTQ:
+      return "gptq";
+    case ExpertFormat::AWQ:
+      return "awq";
+  }
+  return "unknown";
+}
+
+std::uint64_t LogicalExpertKey(int layer_idx, int expert_idx) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(layer_idx))
+          << 32) |
+         static_cast<std::uint32_t>(expert_idx);
+}
+
+bool GenericFormatExecutionPair(ExpertFormat format, std::uint8_t execution) {
+  return (format == ExpertFormat::BF16 && execution == 0) ||
+         (format == ExpertFormat::FP8_E4M3_BLOCK128 && execution == 1) ||
+         (format == ExpertFormat::MARLIN_INT4_GROUP128 && execution == 2);
+}
+
+}  // namespace
+
 void ExpertDispatcher::SetScales(
     const std::map<std::string, torch::Tensor>& scales) {
   if (scales.empty()) return;
@@ -354,6 +416,162 @@ ExpertDispatcher::ExpertDispatcher(int num_experts, int num_layers, int dtype,
   }
 }
 
+bool ExpertDispatcher::RegisterExpertVariant(
+    int layer_idx, int expert_idx, const std::string& format,
+    std::uint64_t generation, const std::string& execution,
+    const std::vector<std::uint32_t>& tensor_ids,
+    const std::vector<std::string>& tensor_roles, std::int64_t payload_bytes,
+    std::int64_t aligned_bytes, std::int64_t workspace_bytes) {
+  const auto parsed_format = ParseExpertFormat(format);
+  const auto parsed_execution = ParseExecutionKind(execution);
+  if (!parsed_format.has_value() || !parsed_execution.has_value() ||
+      !GenericFormatExecutionPair(*parsed_format, *parsed_execution) ||
+      layer_idx < 0 || expert_idx < 0 || tensor_ids.empty() ||
+      tensor_ids.size() != tensor_roles.size() || payload_bytes <= 0 ||
+      aligned_bytes < payload_bytes || workspace_bytes < 0 ||
+      kTopologyHandle == nullptr || kExpertResidencyManager == nullptr) {
+    return false;
+  }
+
+  NodePtr node;
+  try {
+    const int gpu_id = expert_idx % std::max(kNumDevices(), 1);
+    node = kTopologyHandle->CreateDetachedNode(tensor_ids, gpu_id);
+  } catch (const std::exception&) {
+    return false;
+  }
+  if (!node || node->byte_size != aligned_bytes) return false;
+
+  ResidencyVariantKey key{LogicalExpertKey(layer_idx, expert_idx),
+                          *parsed_format, generation};
+  ResidencyVariant variant{key, node, payload_bytes, aligned_bytes,
+                           workspace_bytes};
+  ExpertExecutionDescriptor descriptor{key, *parsed_execution, tensor_ids,
+                                       tensor_roles};
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (registered_variants_.count(key) != 0) return false;
+  registered_variants_.emplace(key, variant);
+  execution_descriptors_.emplace(key, std::move(descriptor));
+  kExpertResidencyManager->RegisterVariant(variant);
+  return true;
+}
+
+bool ExpertDispatcher::SetPrecisionTargets(
+    const std::vector<std::tuple<int, int, std::string, std::uint64_t>>&
+        targets,
+    std::uint64_t epoch) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (epoch <= precision_epoch_) return false;
+  std::unordered_map<std::uint64_t, ResidencyVariantKey> validated;
+  for (const auto& target : targets) {
+    const int layer_idx = std::get<0>(target);
+    const int expert_idx = std::get<1>(target);
+    const auto format = ParseExpertFormat(std::get<2>(target));
+    if (!format.has_value()) return false;
+    ResidencyVariantKey key{LogicalExpertKey(layer_idx, expert_idx), *format,
+                            std::get<3>(target)};
+    if (registered_variants_.count(key) == 0 ||
+        validated.count(key.logical_expert_key) != 0) {
+      return false;
+    }
+#ifdef MOE_INFINITY_TESTING
+    if (fail_transition_once_.has_value() &&
+        fail_transition_once_->first == key.logical_expert_key &&
+        fail_transition_once_->second == key.format) {
+      ++transition_failed_count_;
+      fail_transition_once_.reset();
+      continue;
+    }
+#endif
+    validated.emplace(key.logical_expert_key, key);
+  }
+  precision_targets_ = std::move(validated);
+  precision_epoch_ = epoch;
+  return true;
+}
+
+bool ExpertDispatcher::SetAdaptiveHbmBudgetBytes(std::int64_t bytes) {
+  if (bytes <= 0 || kExpertResidencyManager == nullptr) return false;
+  for (int gpu_id = 0; gpu_id < std::max(kNumDevices(), 1); ++gpu_id) {
+    if (!kExpertResidencyManager->ConfigureCapacity(gpu_id, bytes))
+      return false;
+  }
+  adaptive_hbm_budget_bytes_ = bytes;
+  return true;
+}
+
+ExpertPolicyStats ExpertDispatcher::GetPrecisionMetrics() const {
+  ExpertPolicyStats metrics = kExpertResidencyManager == nullptr
+                                  ? ExpertPolicyStats{}
+                                  : kExpertResidencyManager->Snapshot();
+  metrics["budget_bytes"] = adaptive_hbm_budget_bytes_;
+  metrics["published_generation"] =
+      static_cast<std::int64_t>(published_generation_);
+  metrics["manager_instance_id"] =
+      static_cast<std::int64_t>(GetResidencyManagerId());
+  metrics["manager_enabled"] = manager_enabled_ ? 1 : 0;
+  metrics["phase_policy_enabled"] = phase_policy_enabled_ ? 1 : 0;
+  metrics["transition_failed"] = transition_failed_count_;
+  metrics["h2d_payload_bytes"] = h2d_payload_bytes_;
+  metrics["h2d_transfers"] = h2d_transfers_;
+  metrics["promotions"] = promotions_;
+  metrics["demotions"] = demotions_;
+  metrics["representation_hits"] = representation_hits_;
+  metrics["representation_misses"] = representation_misses_;
+  metrics["policy_epochs"] = static_cast<std::int64_t>(precision_epoch_);
+  for (const char* name :
+       {"conversion_input_bytes", "conversion_output_bytes",
+        "conversion_seconds", "external_shared_resident_bytes"}) {
+    metrics.emplace(name, 0);
+  }
+  return metrics;
+}
+
+std::vector<std::tuple<std::uint64_t, std::uint8_t, std::uint64_t, std::int64_t,
+                       std::int64_t, std::uint8_t>>
+ExpertDispatcher::GetResidentGenerationEntries() const {
+  std::vector<std::tuple<std::uint64_t, std::uint8_t, std::uint64_t,
+                         std::int64_t, std::int64_t, std::uint8_t>>
+      rows;
+  if (kExpertResidencyManager == nullptr) return rows;
+  for (int gpu_id = 0; gpu_id < std::max(kNumDevices(), 1); ++gpu_id) {
+    for (const auto& entry :
+         kExpertResidencyManager->ResidentGenerations(gpu_id)) {
+      rows.emplace_back(entry.key.logical_expert_key,
+                        static_cast<std::uint8_t>(entry.key.format),
+                        entry.key.generation, entry.payload_bytes, entry.bytes,
+                        static_cast<std::uint8_t>(entry.state));
+    }
+  }
+  return rows;
+}
+
+std::uintptr_t ExpertDispatcher::GetResidencyManagerId() const {
+  return reinterpret_cast<std::uintptr_t>(kExpertResidencyManager.get());
+}
+
+void ExpertDispatcher::ConfigureResidencyManager(bool manager_enabled,
+                                                 bool phase_policy_enabled) {
+  manager_enabled_ = manager_enabled;
+  phase_policy_enabled_ = phase_policy_enabled;
+}
+
+std::string ExpertDispatcher::GetActiveFormat() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return active_format_;
+}
+
+#ifdef MOE_INFINITY_TESTING
+void ExpertDispatcher::InjectTransitionFailureOnceForTest(
+    int layer_idx, int expert_idx, const std::string& format) {
+  const auto parsed_format = ParseExpertFormat(format);
+  TORCH_CHECK(parsed_format.has_value(), "unknown expert format");
+  std::lock_guard<std::mutex> lock(mutex_);
+  fail_transition_once_ =
+      std::make_pair(LogicalExpertKey(layer_idx, expert_idx), *parsed_format);
+}
+#endif
+
 void ExpertDispatcher::EnqueueExpert(int layer_idx, int expert_idx, int gpu_id,
                                      bool remote, int phase) {
   ExpertDispatcher::CallArgs args;
@@ -378,6 +596,9 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
   int layer_idx = args.layer_idx;
   int expert_idx = args.expert_idx;
   auto expert_node = experts_[expert_idx][layer_idx];
+  if (manager_enabled_ && !ApplyPrecisionTarget(expert_node, args.gpu_id)) {
+    DLOG_WARN("adaptive precision target failed; using current generation");
+  }
 
   {
     auto expected = NodeExecState::IDLE;
@@ -423,6 +644,15 @@ void ExpertDispatcher::Enqueue(CallArgs& args) {
                                             true);
       exec_args.residency_lease = kExpertResidencyManager->AcquireLease(
           expert_node->node, LeaseKind::DEMAND);
+    }
+    if (manager_enabled_ && kExpertResidencyManager != nullptr) {
+      auto active = kExpertResidencyManager->ActiveGeneration(
+          args.gpu_id, LogicalExpertKey(layer_idx, expert_idx));
+      if (active.has_value()) {
+        exec_args.execution_key = *active;
+        exec_args.execution_lease_id =
+            kDemandResidencyClient->AcquireLease(*active, LeaseKind::EXECUTION);
+      }
     }
     cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
     cache_access_count_.fetch_add(1, std::memory_order_relaxed);
@@ -549,6 +779,85 @@ ExpertNodePtr ExpertDispatcher::FindExpertEvict(int gpu_id) {
   return evict_expert_node;
 }
 
+bool ExpertDispatcher::ApplyPrecisionTarget(const ExpertNodePtr& expert_node,
+                                            int gpu_id) {
+  if (!expert_node || gpu_id < 0 || kExpertResidencyManager == nullptr ||
+      kDemandResidencyClient == nullptr) {
+    return true;
+  }
+  const auto logical_key =
+      LogicalExpertKey(expert_node->layer_idx, expert_node->expert_idx);
+  ResidencyVariant destination;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto target = precision_targets_.find(logical_key);
+    if (target == precision_targets_.end()) {
+      destination = ResidencyVariant{
+          ResidencyVariantKey{logical_key, ExpertFormat::BF16, 0},
+          expert_node->node, expert_node->node->byte_size,
+          expert_node->node->byte_size, 0};
+    } else {
+      const auto variant = registered_variants_.find(target->second);
+      if (variant == registered_variants_.end()) return false;
+      destination = variant->second;
+    }
+  }
+  kExpertResidencyManager->RegisterVariant(destination);
+  const auto active =
+      kExpertResidencyManager->ActiveGeneration(gpu_id, logical_key);
+  if (active.has_value() && *active == destination.key) {
+    ++representation_hits_;
+    return true;
+  }
+  ++representation_misses_;
+
+  ResidencyTicket transaction =
+      active.has_value()
+          ? kDemandResidencyClient->BeginTransition(*active, destination,
+                                                    gpu_id, ExpertPhase::MIXED)
+          : kDemandResidencyClient->BeginAdmission(
+                destination, gpu_id, ExpertPhase::MIXED, AdmissionMode::CACHE);
+  if (!transaction.valid) return false;
+  if (transaction.reserved_victim_key.has_value() &&
+      !kExpertResidencyManager->EvictReserved(transaction)) {
+    kExpertResidencyManager->AbortTransaction(transaction);
+    return false;
+  }
+
+  try {
+    cudaEvent_t transfer_done = nullptr;
+    destination.node->SetDevice(CUDA_DEVICE(gpu_id), true,
+                                fetch_streams_[gpu_id], &transfer_done);
+    if (transfer_done != nullptr) {
+      cudaEventSynchronize(transfer_done);
+      kCudaEventPool->Release(transfer_done);
+    }
+  } catch (const std::exception&) {
+    kExpertResidencyManager->AbortTransaction(transaction);
+    ++transition_failed_count_;
+    return false;
+  }
+  if (!kExpertResidencyManager->CommitTransaction(transaction)) return false;
+  h2d_payload_bytes_ += destination.payload_bytes;
+  ++h2d_transfers_;
+  if (active.has_value()) {
+    if (static_cast<int>(destination.key.format) <
+        static_cast<int>(active->format)) {
+      ++promotions_;
+    } else if (static_cast<int>(destination.key.format) >
+               static_cast<int>(active->format)) {
+      ++demotions_;
+    }
+  }
+  expert_node->node = destination.node;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_format_ = FormatName(destination.key.format);
+    ++published_generation_;
+  }
+  return true;
+}
+
 void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
 #ifndef NVTX_DISABLE
   nvtx3::scoped_range r("gpu_fetch");
@@ -638,6 +947,16 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
           cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
           cache_access_count_.fetch_add(1, std::memory_order_relaxed);
           exec_args.transfer_event = nullptr;
+          if (manager_enabled_ && kExpertResidencyManager != nullptr) {
+            auto active = kExpertResidencyManager->ActiveGeneration(
+                gpu_id, LogicalExpertKey(layer_idx, expert_idx));
+            if (active.has_value()) {
+              exec_args.execution_key = *active;
+              exec_args.execution_lease_id =
+                  kDemandResidencyClient->AcquireLease(*active,
+                                                       LeaseKind::EXECUTION);
+            }
+          }
           exec_queue_[gpu_id].Push(exec_args);
           continue;
         }
@@ -836,6 +1155,16 @@ void ExpertDispatcher::GPUFetchFunc(int gpu_id) {
         cache_access_count_.fetch_add(1, std::memory_order_relaxed);
         if (cache_hit) cache_hit_count_.fetch_add(1, std::memory_order_relaxed);
         exec_args.transfer_event = transfer_done;
+        if (manager_enabled_ && kExpertResidencyManager != nullptr) {
+          auto active = kExpertResidencyManager->ActiveGeneration(
+              gpu_id, LogicalExpertKey(layer_idx, expert_idx));
+          if (active.has_value()) {
+            exec_args.execution_key = *active;
+            exec_args.execution_lease_id = kDemandResidencyClient->AcquireLease(
+                *active, LeaseKind::EXECUTION);
+          }
+        }
+
         // std::lock_guard<std::mutex> lock(exec_mutex_[gpu_id]);
         // exec_queue_[gpu_id].emplace_back(std::move(exec_args));
         exec_queue_[gpu_id].Push(exec_args);
@@ -912,8 +1241,24 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
                                 ? hidden_states_.to(device)
                                 : hidden_states_.index({token_mask}).to(device);
 
-      modules_[thread_idx]->SetTensorsFromIds(
-          args.expert_node->node->tensor_ids);
+      std::optional<ExpertExecutionDescriptor> descriptor;
+      if (manager_enabled_ && kExpertResidencyManager != nullptr) {
+        auto active = kExpertResidencyManager->ActiveGeneration(
+            gpu_id, LogicalExpertKey(args.expert_node->layer_idx,
+                                     args.expert_node->expert_idx));
+        if (active.has_value()) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          const auto found = execution_descriptors_.find(*active);
+          if (found != execution_descriptors_.end()) descriptor = found->second;
+        }
+      }
+      if (descriptor.has_value()) {
+        modules_[thread_idx]->SetRepresentation(*descriptor);
+        modules_[thread_idx]->PrepareRepresentation(stream);
+      } else {
+        modules_[thread_idx]->SetTensorsFromIds(
+            args.expert_node->node->tensor_ids);
+      }
 
       if (fp8_in_store_) {
         int64_t layer_idx = args.expert_node->layer_idx;
@@ -969,6 +1314,10 @@ void ExpertDispatcher::GPUExecFunc(int gpu_id, int thread_idx) {
       if (args.transfer_event != nullptr) {
         kCudaEventPool->Release(args.transfer_event);
         args.transfer_event = nullptr;
+      }
+      if (args.execution_lease_id != 0 && kDemandResidencyClient != nullptr) {
+        kDemandResidencyClient->ReleaseLease(args.execution_lease_id);
+        args.execution_lease_id = 0;
       }
       if (args.residency_lease != 0 && kExpertResidencyManager) {
         kExpertResidencyManager->ReleaseLease(args.residency_lease);
@@ -1052,9 +1401,15 @@ bool ExpertDispatcher::OutputFunc(ExecArgs args, torch::Tensor output,
       }
     }
 
-    auto* retire = new ExpertRetireArgs{
-        this,       args.expert_node,       args.generation,     gpu_id,
-        args.evict, args.managed_transient, args.residency_lease};
+    auto* retire = new ExpertRetireArgs{this,
+                                        args.expert_node,
+                                        args.generation,
+                                        gpu_id,
+                                        args.evict,
+                                        args.managed_transient,
+                                        args.residency_lease,
+                                        args.execution_lease_id,
+                                        args.execution_key};
     pending_retirement_callbacks_.fetch_add(1, std::memory_order_acq_rel);
     int retirement_fault =
         static_cast<int>(DispatchFaultPoint::RETIREMENT_CALLBACK_LAUNCH);
@@ -1617,14 +1972,23 @@ void ExpertDispatcher::RetirementFunc() {
                                           true, nullptr);
         gpu_overload_[args.gpu_id].store(false, std::memory_order_release);
       }
-      if (args.residency_lease != 0 && kExpertResidencyManager) {
-        kExpertResidencyManager->ReleaseLease(args.residency_lease);
-      }
       if (args.managed_transient) {
         args.expert_node->node->is_overflow = false;
       }
       args.expert_node->node->exec_state.store(NodeExecState::IDLE,
                                                std::memory_order_release);
+      // Leases release only after the IDLE publish: a zero lease count then
+      // implies the node is enqueueable again, so callers may use lease
+      // drain as the retirement barrier.
+      if (args.execution_lease_id != 0 && kDemandResidencyClient != nullptr) {
+        kExpertResidencyManager->RecordLastUse(args.execution_key, nullptr);
+        kDemandResidencyClient->ReleaseLease(args.execution_lease_id);
+        kDemandResidencyClient->ReapWorkspace(args.gpu_id);
+        kDemandResidencyClient->ReapRetired(args.gpu_id);
+      }
+      if (args.residency_lease != 0 && kExpertResidencyManager) {
+        kExpertResidencyManager->ReleaseLease(args.residency_lease);
+      }
       cache_cv_[args.gpu_id].notify_all();
     } catch (...) {
       FailDispatch(args.generation, std::current_exception(),

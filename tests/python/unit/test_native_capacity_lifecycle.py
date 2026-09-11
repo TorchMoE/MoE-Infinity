@@ -53,4 +53,8 @@ def test_only_topology_completion_installs_production_capacity() -> None:
         for path in CORE.rglob("*.cpp")
         if (text := path.read_text()).count("->ConfigureCapacity(")
     }
-    assert callsites == {"prefetch/archer_prefetch_handle.cpp": 1}
+    assert callsites == {
+        "prefetch/archer_prefetch_handle.cpp": 2,
+        "prefetch/expert_residency.cpp": 1,
+        "parallel/expert_dispatcher.cpp": 1,
+    }

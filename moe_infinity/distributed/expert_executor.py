@@ -135,10 +135,14 @@ class DistributedExpertExecutor:
         self._gpu_route_fallback_count = 0
         self._pending_prefetch = None
         self._pending_prefetch_failure_safe = False
+        self.precision_policy = None
         self.last_executor_evidence = _executor_evidence(
             wiring_reachable=True,
             fallback_reason="context_inactive",
         )
+
+    def set_precision_policy(self, precision_policy):
+        self.precision_policy = precision_policy
 
     def set_expert_dispatcher(self, expert_dispatcher):
         global _expert_dispatcher
@@ -421,6 +425,49 @@ class DistributedExpertExecutor:
                 )
                 use_native_routing = self._can_use_gpu_only_routing(router_mask)
                 expert_list = None
+
+        if self.precision_policy is not None:
+            from moe_infinity.memory.adaptive_precision_policy import ExpertKey
+
+            observations = {
+                ExpertKey(layer_id, expert_id): int(expert_count[expert_id])
+                for expert_id in expert_list
+            }
+            self.precision_policy.observe(
+                observations, tokens=int(router_mask.shape[0])
+            )
+            if self.precision_policy.epoch_due:
+                from moe_infinity.runtime.expert_precision import (
+                    ExpertFormat,
+                    ResidentGeneration,
+                )
+
+                metrics = self.expert_dispatcher.get_precision_metrics()
+                resident = {}
+                for row in metrics.get("resident_generation_entries", []):
+                    if row["state"] != "active":
+                        continue
+                    logical_key = int(row["logical_expert_key"])
+                    resident[
+                        ExpertKey(logical_key >> 32, logical_key & 0xFFFFFFFF)
+                    ] = ResidentGeneration(
+                        ExpertFormat(row["format"]),
+                        int(row["aligned_bytes"]),
+                        int(row["generation"]),
+                        row["state"],
+                    )
+                plan = self.precision_policy.plan(
+                    resident=resident,
+                    admission_candidates=set(observations),
+                    transition_reserved_bytes=int(
+                        metrics.get("transition_reserved_bytes", 0)
+                    ),
+                    workspace_bytes=int(metrics.get("workspace_bytes", 0)),
+                )
+                if self.expert_dispatcher.set_precision_targets(
+                    self.precision_policy.as_native_targets(plan), plan.epoch
+                ):
+                    self.precision_policy.commit(plan)
 
         phase = current_expert_phase()
 

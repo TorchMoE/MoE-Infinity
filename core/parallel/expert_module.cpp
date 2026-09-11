@@ -53,9 +53,47 @@ MoEMLP::MoEMLP(int dtype, int expert_type) {
   for (int i = 0; i < 8; i++) {
     buffer_.push_back(torch::zeros({1}, options));
   }
-  int num_params = expert_type_ == GPT_OSS_MOE_DENSE_ACT_DENSE ? 6 : 4;
+  int num_params = 8;
   for (int i = 0; i < num_params; i++) {
     param_.push_back(torch::zeros({1}, options));
+  }
+}
+
+void MoEMLP::SetRepresentation(const ExpertExecutionDescriptor& descriptor) {
+  const std::size_t expected_roles =
+      descriptor.execution_kind == 1 || descriptor.execution_kind == 2 ? 6 : 3;
+  TORCH_CHECK(descriptor.tensor_ids.size() == descriptor.tensor_roles.size(),
+              "expert tensor IDs and roles must have identical lengths");
+  TORCH_CHECK(descriptor.tensor_ids.size() == expected_roles,
+              "expert representation has an invalid role count");
+  representation_execution_kind_ = descriptor.execution_kind;
+  SetTensorsFromIds(descriptor.tensor_ids);
+}
+
+void MoEMLP::PrepareRepresentation(cudaStream_t stream) {
+  if (representation_execution_kind_ != 1) return;
+  int device = at::cuda::current_device();
+  std::array<torch::Tensor, 3> dequantized;
+  for (std::size_t projection = 0; projection < 3; ++projection) {
+    auto weight = param_[projection * 2];
+    auto scale = param_[projection * 2 + 1];
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn,
+                "generic FP8 representation requires float8_e4m3fn weights");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32,
+                "generic FP8 representation requires float32 scales");
+    auto output =
+        torch::empty(weight.sizes(), torch::TensorOptions()
+                                         .dtype(torch::kBFloat16)
+                                         .device(CUDA_DEVICE(device)));
+    auto weight_bytes = weight.view(torch::kUInt8).contiguous();
+    auto scale_f32 = scale.contiguous();
+    fp8_dequant_blockwise_cuda(weight_bytes.data_ptr(), scale_f32.data_ptr(),
+                               output.data_ptr(), weight.size(0),
+                               weight.size(1), stream);
+    dequantized[projection] = std::move(output);
+  }
+  for (std::size_t projection = 0; projection < 3; ++projection) {
+    param_[projection] = std::move(dequantized[projection]);
   }
 }
 

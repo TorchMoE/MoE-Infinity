@@ -264,3 +264,54 @@ def test_paged_mla_admission_guard_rejects_invalid_values(
 
     with pytest.raises(ValueError, match=field_name):
         ArcherConfig(use_native_engine=False, **{field_name: value})
+
+
+def test_adaptive_fields_default_disabled(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig(
+        offload_path="/tmp",
+        use_native_engine=False,
+    )
+    assert config.adaptive_expert_precision is False
+    assert config.adaptive_hbm_budget_bytes == 0
+    assert config.adaptive_variant_build is False
+    assert config.adaptive_derivative_root is None
+
+
+def test_adaptive_budget_must_be_positive_when_enabled(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(
+        ValueError, match="adaptive_hbm_budget_bytes must be positive"
+    ):
+        ArcherConfig(
+            offload_path="/tmp",
+            use_native_engine=False,
+            adaptive_expert_precision=True,
+            adaptive_hbm_budget_bytes=0,
+        )
+
+
+def test_adaptive_threshold_ordering_validated(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    with pytest.raises(ValueError):
+        ArcherConfig(
+            offload_path="/tmp",
+            use_native_engine=False,
+            adaptive_expert_precision=True,
+            adaptive_hbm_budget_bytes=1024,
+            adaptive_promotion_threshold=0.2,
+            adaptive_demotion_threshold=0.5,
+        )
+
+
+def test_adaptive_derivative_root_resolves_from_offload(monkeypatch):
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    config = ArcherConfig(
+        offload_path="/tmp/offload",
+        use_native_engine=False,
+        adaptive_expert_precision=True,
+        adaptive_hbm_budget_bytes=2048,
+    )
+    assert config.adaptive_derivative_root == os.path.join(
+        "/tmp/offload", "adaptive_derivatives"
+    )

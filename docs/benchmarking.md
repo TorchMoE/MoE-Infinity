@@ -1,5 +1,7 @@
 # Benchmarking MoE-Infinity
 
+Adaptive benchmarks use `deterministic-v1`, canonical/static-low/adaptive arms, H2D and `peak_accounted_bytes`, TTFT, TPOT p50/p90/p99, throughput, quality-attestation, five measured repetitions, and a `release_gate`; no speedup is guaranteed.
+
 This guide covers the benchmark entry points under `benchmarks/`, labels each one as a stable user workflow, contributor-only spike, helper or report tool, or excluded helper module, and keeps the TTFT vs decode guidance in one place.
 
 If you want the cross-framework comparison table, start with [Benchmark reproduction](benchmark_reproduction.md). For the expert I/O profiler flow, see [benchmarks/expert_io_microbench/README.md](../benchmarks/expert_io_microbench/README.md). For ContextPilot and DeepSeek-V4-Flash background, see [ContextPilot](contextpilot/README.md) and [DeepSeek-V4-Flash](../moe_infinity/models/deepseek_v4/README.md).

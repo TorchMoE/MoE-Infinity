@@ -92,6 +92,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                             std::vector<std::uint64_t>>>&)) &
                ArcherPrefetchHandle::SetTopologyV2)
       .def("get_topology_snapshot", &ArcherPrefetchHandle::GetTopologySnapshot)
+      .def("get_expert_policy_stats",
+           &ArcherPrefetchHandle::GetExpertPolicyStats)
+      .def("get_policy_stats", &ArcherPrefetchHandle::GetExpertPolicyStats)
+      .def("get_residency_manager_id",
+           &ArcherPrefetchHandle::GetResidencyManagerId)
+      .def("configure_residency_manager",
+           &ArcherPrefetchHandle::ConfigureResidencyManager)
+      .def("set_adaptive_hbm_budget_bytes",
+           &ArcherPrefetchHandle::SetAdaptiveHbmBudgetBytes)
+      .def("prefetch_expert_variants",
+           &ArcherPrefetchHandle::PrefetchExpertVariants, py::arg("keys"),
+           py::arg("priority") = kBackgroundPrefetchPriority,
+           py::arg("phase") = "mixed")
       .def("update_tensor_map",
            (void(ArcherPrefetchHandle::*)(std::uint64_t, std::uint64_t)) &
                ArcherPrefetchHandle::UpdateTensorMap)
@@ -126,6 +139,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &ArcherPrefetchHandle::ReplaceCacheCandidates)
       .def("enqueue_prefetch", &ArcherPrefetchHandle::EnqueuePrefetch)
       .def("fetch_tensors", &ArcherPrefetchHandle::FetchTensors)
+      .def("get_canonical_tensor_index_snapshot",
+           &ArcherPrefetchHandle::GetCanonicalTensorIndexSnapshot)
+      .def("begin_derivative_overlay",
+           &ArcherPrefetchHandle::BeginDerivativeOverlay)
+      .def("register_derivative_tensor",
+           &ArcherPrefetchHandle::RegisterDerivativeTensor)
+      .def("commit_derivative_overlay",
+           &ArcherPrefetchHandle::CommitDerivativeOverlay)
+      .def("abort_derivative_overlay",
+           &ArcherPrefetchHandle::AbortDerivativeOverlay)
       .def("clean_up_resources", &ArcherPrefetchHandle::CleanUpResources)
       .def("configure_phase_policy",
            &ArcherPrefetchHandle::ConfigureExpertPolicy, py::arg("enabled"),
@@ -163,7 +186,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ExpertDispatcher>(m, "expert_dispatcher")
       .def(py::init<int, int, int, int, int>())
       .def("register_expert", &ExpertDispatcher::RegisterExpert)
-      .def("enqueue_expert", &ExpertDispatcher::EnqueueExpert)
+      .def("enqueue_expert", &ExpertDispatcher::EnqueueExpert,
+           py::arg("layer_idx"), py::arg("expert_idx"), py::arg("gpu_id") = -1,
+           py::arg("remote") = false,
+           py::arg("phase") = static_cast<int>(ExpertPhase::MIXED))
       .def("set_inputs", &ExpertDispatcher::SetInputs)
       .def("set_inputs_with_invocation",
            &ExpertDispatcher::SetInputsWithInvocation)
@@ -184,6 +210,77 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_cache_occupancy_bytes",
            &ExpertDispatcher::GetCacheOccupancyBytes)
       .def("get_cache_hit_rate", &ExpertDispatcher::GetCacheHitRate)
+      .def("register_expert_variant", &ExpertDispatcher::RegisterExpertVariant)
+      .def("set_precision_targets", &ExpertDispatcher::SetPrecisionTargets,
+           py::arg("targets"), py::arg("epoch"))
+      .def("set_adaptive_hbm_budget_bytes",
+           &ExpertDispatcher::SetAdaptiveHbmBudgetBytes)
+      .def("get_precision_metrics",
+           [](const ExpertDispatcher& dispatcher) {
+             py::dict result;
+             const auto metrics = dispatcher.GetPrecisionMetrics();
+             for (const auto& metric : metrics)
+               result[py::str(metric.first)] = metric.second;
+             result["active_format"] = dispatcher.GetActiveFormat();
+             py::dict fallback_counts;
+             auto failed = metrics.find("transition_failed");
+             fallback_counts["transition_failed"] =
+                 failed == metrics.end() ? 0 : failed->second;
+             result["fallback_counts"] = fallback_counts;
+             py::dict leases_by_kind;
+             for (const char* kind : {"demand", "prefetch", "transfer",
+                                      "execution", "transition"}) {
+               const auto found = metrics.find(std::string("leases_") + kind);
+               leases_by_kind[kind] =
+                   found == metrics.end() ? 0 : found->second;
+             }
+             result["leases_by_kind"] = leases_by_kind;
+             static const char* formats[] = {"bf16",
+                                             "fp8_e4m3_block128",
+                                             "marlin_int4_group128",
+                                             "gpt_oss_mxfp4",
+                                             "glm_fp8_block128",
+                                             "deepseek_v4_fp4",
+                                             "gptq",
+                                             "awq"};
+             py::list entries;
+             py::dict by_format;
+             for (const char* format : formats) {
+               py::dict aggregate;
+               aggregate["resident_generations"] = 0;
+               aggregate["resident_bytes"] = 0;
+               by_format[format] = aggregate;
+             }
+             for (const auto& row : dispatcher.GetResidentGenerationEntries()) {
+               const auto format_index = std::get<1>(row);
+               py::dict item;
+               item["logical_expert_key"] = std::get<0>(row);
+               item["format"] = formats[format_index];
+               item["generation"] = std::get<2>(row);
+               item["payload_bytes"] = std::get<3>(row);
+               item["aligned_bytes"] = std::get<4>(row);
+               item["state"] = std::get<5>(row) == 1 ? "active" : "retiring";
+               entries.append(item);
+               auto aggregate =
+                   by_format[formats[format_index]].cast<py::dict>();
+               aggregate["resident_generations"] =
+                   aggregate["resident_generations"].cast<std::int64_t>() + 1;
+               aggregate["resident_bytes"] =
+                   aggregate["resident_bytes"].cast<std::int64_t>() +
+                   std::get<4>(row);
+             }
+             result["resident_generation_entries"] = entries;
+             result["by_format"] = by_format;
+             return result;
+           })
+      .def("get_policy_stats", &ExpertDispatcher::GetPrecisionMetrics)
+      .def("get_residency_manager_id", &ExpertDispatcher::GetResidencyManagerId)
+      .def("configure_residency_manager",
+           &ExpertDispatcher::ConfigureResidencyManager)
+#ifdef MOE_INFINITY_TESTING
+      .def("inject_transition_failure_once_for_test",
+           &ExpertDispatcher::InjectTransitionFailureOnceForTest)
+#endif
       .def("set_scales", &ExpertDispatcher::SetScales,
            "Store fp8 block scales for dequant-on-copy (fp8-in-store path)");
 }
