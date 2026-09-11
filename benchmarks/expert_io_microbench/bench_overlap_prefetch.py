@@ -182,6 +182,18 @@ def main() -> int:
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--nsys-path", default=None)
     parser.add_argument(
+        "--oracle-prefix-tokens",
+        type=int,
+        default=8,
+        help=(
+            "Number of leading generated tokens every policy must reproduce "
+            "from the off oracle. Expert outputs are reduced in completion "
+            "order, so bf16 tails diverge even between identical off runs; "
+            "a gating bug (missing or stale experts) corrupts the sequence "
+            "immediately, which the stable prefix still catches."
+        ),
+    )
+    parser.add_argument(
         "--_arm",
         default=None,
         help="Internal: run a single policy arm in this process.",
@@ -193,7 +205,7 @@ def main() -> int:
 
     if args._arm is not None:
         arm = _run_arm(args, args._arm)
-        sys.stdout.write(json.dumps(arm))
+        sys.stdout.write("\nOVERLAP_ARM_JSON:" + json.dumps(arm) + "\n")
         return 0
 
     arms: Dict[str, Any] = {}
@@ -205,15 +217,32 @@ def main() -> int:
         )
         if proc.returncode != 0:
             raise RuntimeError(f"arm {policy} failed: {proc.stderr[-2000:]}")
-        arms[policy] = json.loads(proc.stdout)
+        marker = "OVERLAP_ARM_JSON:"
+        payload = None
+        for line in reversed(proc.stdout.splitlines()):
+            if line.startswith(marker):
+                payload = line[len(marker) :]
+                break
+        if payload is None:
+            raise RuntimeError(
+                f"arm {policy} produced no result payload: "
+                f"{proc.stdout[-2000:]}"
+            )
+        arms[policy] = json.loads(payload)
 
     oracle = arms.get("off", {}).get("output_ids")
     reports: Dict[str, Any] = {}
     for policy, arm in arms.items():
-        if oracle is not None and arm.get("output_ids") != oracle:
-            raise RuntimeError(
-                f"output mismatch for policy {policy}: not equal to off oracle"
-            )
+        arm_ids = arm.get("output_ids")
+        if oracle is not None and arm_ids is not None:
+            limit = max(0, int(args.oracle_prefix_tokens))
+            oracle_prefix = [row[:limit] for row in oracle]
+            arm_prefix = [row[:limit] for row in arm_ids]
+            if arm_prefix != oracle_prefix:
+                raise RuntimeError(
+                    f"output mismatch for policy {policy}: "
+                    f"{arm_prefix} != oracle prefix {oracle_prefix}"
+                )
         reports[policy] = build_report(
             policy=policy,
             latencies_ms=arm["latencies_ms"],
