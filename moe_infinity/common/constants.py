@@ -54,7 +54,7 @@ MODEL_MAPPING_TYPES = {
     "gptoss": 6,
     "qwen3": 5,
     "dbrx": 4,
-    "olmoe": 4,
+    "olmoe": 5,
     # JambaMLP registers gate_proj, up_proj, down_proj (not w1, w2, w3).
     "jamba": 5,
 }
