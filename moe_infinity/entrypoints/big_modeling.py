@@ -208,7 +208,10 @@ class MoE:
             engine_config.trace_capacity,
             model_config,
             attention_backend=attention_backend,
-            enable_attention_offload=attention_backend is not None,
+            enable_attention_offload=(
+                bool(getattr(engine_config, "enable_attention_offload", True))
+                and attention_backend is not None
+            ),
             kv_cache_manager=kv_cache_manager,
             enable_kv_cache_offload=(
                 bool(
@@ -348,6 +351,7 @@ class MoE:
         from moe_infinity.memory.memory_coordinator import MemoryCoordinator
         from moe_infinity.runtime.attention_backend import PagedAttentionBackend
         from moe_infinity.runtime.attention_types import KVCacheSpec
+        from moe_infinity.serving.engine import build_kv_transfer_resources
 
         model_num_layers = self._resolve_model_int_attr(
             model_config,
@@ -382,6 +386,23 @@ class MoE:
             if hidden_size is None:
                 hidden_size = max(1, num_attention_heads * 128)
             head_dim = max(1, hidden_size // max(1, num_attention_heads))
+
+        qk_rope_head_dim = self._resolve_model_int_attr(
+            model_config, "qk_rope_head_dim"
+        )
+        qk_nope_head_dim = self._resolve_model_int_attr(
+            model_config, "qk_nope_head_dim"
+        )
+        if qk_rope_head_dim is not None and qk_nope_head_dim is not None:
+            from moe_infinity.models.deepseek_v2_paged_attention import (
+                DeepseekV2PagedAttention,
+            )
+
+            mla_spec = DeepseekV2PagedAttention.get_kv_cache_spec_for_config(
+                model_config
+            )
+            head_dim = mla_spec["head_dim"]
+            num_kv_heads = mla_spec["num_kv_heads"]
 
         vocab_size = self._resolve_model_int_attr(model_config, "vocab_size")
         if vocab_size is None:
@@ -429,6 +450,8 @@ class MoE:
         )
         num_cpu_blocks = max(32, num_gpu_blocks * 2)
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device_id = int(device.index or 0)
         from moe_infinity.models.deepseek_mla_attention import (
             is_deepseek_mla_eligible,
         )
@@ -444,6 +467,7 @@ class MoE:
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=kv_spec.block_size,
+            device_id=device_id,
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         mla_cache = None
@@ -466,6 +490,7 @@ class MoE:
                     spec=kv_spec,
                     num_gpu_blocks=num_gpu_blocks,
                     device=device,
+                    num_layers=max(1, int(num_layers)),
                 )
             except Exception:
                 attention_backend = None
@@ -482,18 +507,27 @@ class MoE:
                 KVCacheOffloadCoordinator,
             )
 
-            # kv_tensors=None: The actual KV tensor storage (PagedAttentionBackend
-            # k_cache/v_cache) is not yet available at coordinator construction time.
-            # Call coordinator.set_kv_tensors(tensors) after model initialisation
-            # to enable real tensor copies. Until then, handlers are registered but
-            # copy operations are no-ops (guarded by `if self._kv_tensors is None`).
-            # This is intentional engine-path scaffolding per the plan scope.
+            if attention_backend is None:
+                raise RuntimeError(
+                    "KV offload requires initialized paged KV tensors"
+                )
+            native_kv_transfer_backend, native_kv_transfer_pool, _ = (
+                build_kv_transfer_resources(
+                    engine_config,
+                    attention_backend.k_cache.device,
+                )
+            )
             kv_offload_coordinator = KVCacheOffloadCoordinator(
-                kv_tensors=None,
-                block_pool=None,
+                kv_tensors=(
+                    attention_backend.k_cache,
+                    attention_backend.v_cache,
+                ),
+                block_pool=kv_cache_manager,
                 config=engine_config,
+                transfer_backend=native_kv_transfer_backend,
             )
             kv_offload_coordinator.register_with_scheduler(transfer_scheduler)
+            self._native_kv_transfer_pool = native_kv_transfer_pool
 
         expert_offload_coordinator = None
         if getattr(engine_config, "enable_expert_offload", False):
@@ -517,6 +551,7 @@ class MoE:
         scheduler = Scheduler(
             kv_cache_manager=kv_cache_manager,
             transfer_scheduler=transfer_scheduler,
+            device_id=device_id,
         )
 
         generation_engine = GenerationEngine(
@@ -1243,6 +1278,12 @@ class MoE:
         prefill_starvation_threshold_steps: int = 8,
         offload_dir: Optional[str] = None,
         speculative_draft: Optional[object] = None,
+        kv_swap_mode: Optional[str] = None,
+        kv_swap_host_memory_bytes: Optional[int] = None,
+        kv_swap_max_inflight_bytes: Optional[int] = None,
+        kv_swap_checksum: Optional[bool] = None,
+        kv_swap_max_retries: Optional[int] = None,
+        kv_swap_allow_sync_fallback: Optional[bool] = None,
         enable_deepseek_mla_paging: bool = False,
         max_resident_paged_speculative_sessions: int = 1,
         min_free_mla_blocks_after_admission: int = 1,
@@ -1275,6 +1316,36 @@ class MoE:
 
         from moe_infinity.entrypoints.openai import api_server_v2
 
+        def _resolve_swap(
+            override: object, attr: str, default: object
+        ) -> object:
+            if override is not None:
+                return override
+            return getattr(self.engine_config, attr, default)
+
+        resolved_kv_swap_mode = _resolve_swap(
+            kv_swap_mode, "kv_swap_mode", "sync"
+        )
+        resolved_kv_swap_host_memory_bytes = _resolve_swap(
+            kv_swap_host_memory_bytes,
+            "kv_swap_host_memory_bytes",
+            512 * 1024 * 1024,
+        )
+        resolved_kv_swap_max_inflight_bytes = _resolve_swap(
+            kv_swap_max_inflight_bytes,
+            "kv_swap_max_inflight_bytes",
+            256 * 1024 * 1024,
+        )
+        resolved_kv_swap_checksum = _resolve_swap(
+            kv_swap_checksum, "kv_swap_checksum", False
+        )
+        resolved_kv_swap_max_retries = _resolve_swap(
+            kv_swap_max_retries, "kv_swap_max_retries", 2
+        )
+        resolved_kv_swap_allow_sync_fallback = _resolve_swap(
+            kv_swap_allow_sync_fallback, "kv_swap_allow_sync_fallback", True
+        )
+
         serving_speculator = None
         if speculative_draft:
             self._resolve_spec_strategy(speculative_draft)
@@ -1292,6 +1363,12 @@ class MoE:
             kv_cache_ratio=kv_cache_ratio,
             max_batch_size=max_batch_size,
             enable_prefix_caching=enable_prefix_caching,
+            kv_swap_mode=resolved_kv_swap_mode,
+            kv_swap_host_memory_bytes=resolved_kv_swap_host_memory_bytes,
+            kv_swap_max_inflight_bytes=resolved_kv_swap_max_inflight_bytes,
+            kv_swap_checksum=resolved_kv_swap_checksum,
+            kv_swap_max_retries=resolved_kv_swap_max_retries,
+            kv_swap_allow_sync_fallback=resolved_kv_swap_allow_sync_fallback,
             enable_chunked_prefill=enable_chunked_prefill,
             prefill_chunk_size=prefill_chunk_size,
             prefill_starvation_threshold_steps=(

@@ -28,6 +28,8 @@ def _ensure_package(name: str, path: Path) -> None:
 
 
 def _load_module(module_name: str, file_path: Path):
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -286,7 +288,7 @@ def _make_transactional_backend(
     backend = PagedAttentionBackend(
         spec=KVCacheSpec(
             num_kv_heads=2,
-            head_dim=8,
+            head_dim=64,
             dtype=torch.float16,
             block_size=block_size,
         ),
@@ -310,7 +312,7 @@ def test_model_runner_detects_real_qwen3_paged_attention(
         hidden_size=32,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=8,
+        head_dim=64,
         num_hidden_layers=1,
         intermediate_size=64,
         moe_intermediate_size=16,

@@ -1,93 +1,28 @@
+# pyright: reportAny=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportMissingParameterType=false, reportUnannotatedClassAttribute=false, reportUnusedCallResult=false
+
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
-import sys
-import types
 from dataclasses import dataclass
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
-
-ROOT = Path(__file__).resolve().parents[3]
-
-if (
-    "flash_attn" not in sys.modules
-    or getattr(sys.modules["flash_attn"], "__spec__", None) is None
-):
-    flash_attn_stub = sys.modules.get(
-        "flash_attn", types.ModuleType("flash_attn")
-    )
-    flash_attn_stub.__spec__ = importlib.machinery.ModuleSpec(
-        name="flash_attn", loader=None
-    )
-    sys.modules["flash_attn"] = flash_attn_stub
-
-
-def _ensure_package(name: str, path: Path) -> None:
-    module = sys.modules.get(name)
-    if module is None:
-        module = types.ModuleType(name)
-        module.__path__ = [str(path)]
-        sys.modules[name] = module
-
-
-def _load_module(module_name: str, file_path: Path):
-    existing = sys.modules.get(module_name)
-    if existing is not None:
-        return existing
-
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_v2_dir = ROOT / "moe_infinity" / "models" / "modeling_deepseek_v2"
-_v3_dir = ROOT / "moe_infinity" / "models" / "modeling_deepseek_v3"
-if not _v2_dir.is_dir() or not _v3_dir.is_dir():
-    pytest.skip(
-        "vendored modeling_deepseek_v2/v3 removed; migrated to upstream transformers",
-        allow_module_level=True,
-    )
-
-_ensure_package("moe_infinity", ROOT / "moe_infinity")
-_ensure_package("moe_infinity.models", ROOT / "moe_infinity" / "models")
-_ensure_package(
-    "moe_infinity.models.modeling_deepseek_v2",
-    _v2_dir,
+from transformers.models.deepseek_v2 import modeling_deepseek_v2 as m2
+from transformers.models.deepseek_v2.configuration_deepseek_v2 import (
+    DeepseekV2Config,
 )
-_ensure_package(
-    "moe_infinity.models.modeling_deepseek_v3",
-    _v3_dir,
+from transformers.models.deepseek_v3 import modeling_deepseek_v3 as m3
+from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
+    DeepseekV3Config,
 )
 
-v2_config_module = _load_module(
-    "moe_infinity.models.modeling_deepseek_v2.configuration_deepseek",
-    _v2_dir / "configuration_deepseek.py",
+from moe_infinity.models import (
+    DeepseekV2PagedAttention,
+    DeepseekV3PagedAttention,
 )
-v2_modeling = _load_module(
-    "moe_infinity.models.modeling_deepseek_v2.modeling_deepseek",
-    _v2_dir / "modeling_deepseek.py",
+from moe_infinity.models.deepseek_v2_paged_attention import (
+    _paged_cache_head_dim,
 )
-v3_config_module = _load_module(
-    "moe_infinity.models.modeling_deepseek_v3.configuration_deepseek",
-    _v3_dir / "configuration_deepseek.py",
-)
-v3_modeling = _load_module(
-    "moe_infinity.models.modeling_deepseek_v3.modeling_deepseek",
-    ROOT
-    / "moe_infinity"
-    / "models"
-    / "modeling_deepseek_v3"
-    / "modeling_deepseek.py",
-)
-
-DeepseekV2Config = v2_config_module.DeepseekV2Config
-DeepseekV3Config = v3_config_module.DeepseekV3Config
 
 
 @dataclass
@@ -113,16 +48,11 @@ class _RecordingBackend:
         attn_metadata: object = None,
         attention_metadata: object = None,
         scale: float | None = None,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
-        _ = (kv_cache, attn_metadata)
+        _ = (kv_cache, attn_metadata, layer_idx)
         self.calls.append(
-            _BackendCall(
-                query=query,
-                key=key,
-                value=value,
-                attention_metadata=attention_metadata,
-                scale=scale,
-            )
+            _BackendCall(query, key, value, attention_metadata, scale)
         )
         return torch.full(
             (query.shape[0], query.shape[1], value.shape[2]),
@@ -132,29 +62,12 @@ class _RecordingBackend:
         )
 
 
-def _make_v2_attention():
-    config = DeepseekV2Config(
-        hidden_size=16,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        max_position_embeddings=32,
-        q_lora_rank=None,
-        kv_lora_rank=4,
-        qk_rope_head_dim=4,
-        qk_nope_head_dim=4,
-        v_head_dim=4,
-        attention_dropout=0.0,
-    )
-    return v2_modeling.DeepseekV2PagedAttention(config, layer_idx=0).eval()
-
-
-def _make_v3_attention():
-    config = DeepseekV3Config(
+def _v2_config() -> DeepseekV2Config:
+    return DeepseekV2Config(
         hidden_size=16,
         intermediate_size=32,
         moe_intermediate_size=8,
         num_hidden_layers=2,
-        num_nextn_predict_layers=1,
         num_attention_heads=2,
         num_key_value_heads=2,
         max_position_embeddings=32,
@@ -163,132 +76,171 @@ def _make_v3_attention():
         qk_rope_head_dim=4,
         qk_nope_head_dim=4,
         v_head_dim=4,
-        n_shared_experts=None,
-        n_routed_experts=None,
-        num_experts_per_tok=None,
-        n_group=None,
-        topk_group=None,
+        first_k_dense_replace=0,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
         attention_dropout=0.0,
     )
-    return v3_modeling.DeepseekV3PagedAttention(config, layer_idx=0).eval()
+
+
+def _v3_config() -> DeepseekV3Config:
+    return DeepseekV3Config(
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        q_lora_rank=None,
+        kv_lora_rank=4,
+        qk_rope_head_dim=4,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+        n_shared_experts=1,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_group=1,
+        topk_group=1,
+        first_k_dense_replace=0,
+        attention_dropout=0.0,
+    )
 
 
 @pytest.fixture(autouse=True)
 def _clear_paged_context():
-    v2_modeling.DeepseekV2PagedAttention.clear_paged_context()
-    v3_modeling.DeepseekV3PagedAttention.clear_paged_context()
+    DeepseekV2PagedAttention.clear_paged_context()
+    DeepseekV3PagedAttention.clear_paged_context()
     yield
-    v2_modeling.DeepseekV2PagedAttention.clear_paged_context()
-    v3_modeling.DeepseekV3PagedAttention.clear_paged_context()
+    DeepseekV2PagedAttention.clear_paged_context()
+    DeepseekV3PagedAttention.clear_paged_context()
 
 
-def test_deepseek_v3_paged_attention_uses_backend() -> None:
-    attn = _make_v3_attention()
-    backend = _RecordingBackend(fill_value=0.25)
-    metadata = object()
-    v3_modeling.DeepseekV3PagedAttention.set_paged_context(backend, metadata)
+def test_v2_paged_attention_uses_backend() -> None:
+    config = _v2_config()
+    attn = DeepseekV2PagedAttention(config, layer_idx=0).eval()
+    rotary = m2.DeepseekV2RotaryEmbedding(config=config)
 
-    hidden_states = torch.randn(1, 3, attn.hidden_size)
-    attention_mask = torch.zeros(1, 1, 3, 3)
+    hidden_states = torch.randn(1, 3, config.hidden_size)
     position_ids = torch.arange(3, dtype=torch.long).unsqueeze(0)
+    position_embeddings = rotary(hidden_states, position_ids)
 
-    outputs, attn_weights, past_key_value = attn(
-        hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
-    )
-
-    assert outputs.shape == hidden_states.shape
-    assert attn_weights is None
-    assert past_key_value is None
-    assert len(backend.calls) == 1
-    call = backend.calls[0]
-    assert call.attention_metadata is metadata
-    assert call.query.shape == (3, attn.num_heads, attn.q_head_dim)
-    assert call.key.shape == (3, attn.num_heads, attn.q_head_dim)
-    assert call.value.shape == (3, attn.num_heads, attn.v_head_dim)
-    assert call.scale == pytest.approx(attn.softmax_scale)
-
-
-def test_deepseek_v3_paged_attention_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sentinel = (
-        torch.randn(1, 1, 1),
-        torch.randn(1, 1, 1, 1),
-        object(),
-    )
-
-    def _fake_super_forward(*args, **kwargs):
-        _ = (args, kwargs)
-        return sentinel
-
-    monkeypatch.setattr(
-        v3_modeling.DeepseekV3Attention, "forward", _fake_super_forward
-    )
-    v3_modeling.DeepseekV3PagedAttention.clear_paged_context()
-
-    attn = v3_modeling.DeepseekV3PagedAttention.__new__(
-        v3_modeling.DeepseekV3PagedAttention
-    )
-    torch.nn.Module.__init__(attn)
-
-    outputs = attn.forward(hidden_states=torch.zeros(1, 1, 1))
-    assert outputs is sentinel
-
-
-def test_deepseek_v2_paged_attention_uses_backend() -> None:
-    attn = _make_v2_attention()
     backend = _RecordingBackend(fill_value=1.5)
     metadata = object()
-    v2_modeling.DeepseekV2PagedAttention.set_paged_context(backend, metadata)
+    DeepseekV2PagedAttention.set_paged_context(backend, metadata)
 
-    hidden_states = torch.randn(1, 3, attn.hidden_size)
-    attention_mask = torch.zeros(1, 1, 3, 3)
-    position_ids = torch.arange(3, dtype=torch.long).unsqueeze(0)
-
-    outputs, attn_weights, past_key_value = attn(
+    outputs, attn_weights = attn(
         hidden_states=hidden_states,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
+        attention_mask=None,
+        position_embeddings=position_embeddings,
     )
 
+    cache_dim = _paged_cache_head_dim(attn.qk_head_dim)
     assert outputs.shape == hidden_states.shape
     assert attn_weights is None
-    assert past_key_value is None
     assert len(backend.calls) == 1
     call = backend.calls[0]
     assert call.attention_metadata is metadata
-    assert call.query.shape == (3, attn.num_heads, attn.q_head_dim)
-    assert call.key.shape == (3, attn.num_heads, attn.q_head_dim)
-    assert call.value.shape == (3, attn.num_heads, attn.v_head_dim)
-    assert call.scale == pytest.approx(attn.softmax_scale)
+    assert call.query.shape == (3, attn.num_heads, cache_dim)
+    assert call.key.shape == (3, attn.num_heads, cache_dim)
+    assert call.value.shape == (3, attn.num_heads, cache_dim)
+    assert call.scale == pytest.approx(attn.scaling)
 
 
-def test_deepseek_v2_paged_attention_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sentinel = (
-        torch.randn(1, 1, 1),
-        torch.randn(1, 1, 1, 1),
-        object(),
+def test_v2_paged_attention_fallback() -> None:
+    config = _v2_config()
+    attn = DeepseekV2PagedAttention(config, layer_idx=0).eval()
+    rotary = m2.DeepseekV2RotaryEmbedding(config=config)
+
+    hidden_states = torch.randn(1, 3, config.hidden_size)
+    position_ids = torch.arange(3, dtype=torch.long).unsqueeze(0)
+    position_embeddings = rotary(hidden_states, position_ids)
+
+    backend = _RecordingBackend()
+
+    outputs, _ = attn(
+        hidden_states=hidden_states,
+        attention_mask=None,
+        position_embeddings=position_embeddings,
     )
 
-    def _fake_super_forward(*args, **kwargs):
-        _ = (args, kwargs)
-        return sentinel
+    assert outputs.shape == hidden_states.shape
+    assert backend.calls == []
 
-    monkeypatch.setattr(
-        v2_modeling.DeepseekV2Attention, "forward", _fake_super_forward
+
+def test_v3_paged_attention_uses_backend() -> None:
+    config = _v3_config()
+    attn = DeepseekV3PagedAttention(config, layer_idx=0).eval()
+    rotary = m3.DeepseekV3RotaryEmbedding(config=config)
+
+    hidden_states = torch.randn(1, 3, config.hidden_size)
+    position_ids = torch.arange(3, dtype=torch.long).unsqueeze(0)
+    position_embeddings = rotary(hidden_states, position_ids)
+
+    backend = _RecordingBackend(fill_value=0.25)
+    metadata = object()
+    DeepseekV3PagedAttention.set_paged_context(backend, metadata)
+
+    outputs, attn_weights = attn(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        attention_mask=None,
     )
-    v2_modeling.DeepseekV2PagedAttention.clear_paged_context()
 
-    attn = v2_modeling.DeepseekV2PagedAttention.__new__(
-        v2_modeling.DeepseekV2PagedAttention
+    cache_dim = _paged_cache_head_dim(attn.qk_head_dim)
+    assert outputs.shape == hidden_states.shape
+    assert attn_weights is None
+    assert len(backend.calls) == 1
+    call = backend.calls[0]
+    assert call.attention_metadata is metadata
+    assert call.query.shape == (3, attn.num_heads, cache_dim)
+    assert call.key.shape == (3, attn.num_heads, cache_dim)
+    assert call.value.shape == (3, attn.num_heads, cache_dim)
+    assert call.scale == pytest.approx(attn.scaling)
+
+
+def test_v3_paged_attention_fallback() -> None:
+    config = _v3_config()
+    attn = DeepseekV3PagedAttention(config, layer_idx=0).eval()
+    rotary = m3.DeepseekV3RotaryEmbedding(config=config)
+
+    hidden_states = torch.randn(1, 3, config.hidden_size)
+    position_ids = torch.arange(3, dtype=torch.long).unsqueeze(0)
+    position_embeddings = rotary(hidden_states, position_ids)
+
+    backend = _RecordingBackend()
+
+    outputs, _ = attn(
+        hidden_states=hidden_states,
+        position_embeddings=position_embeddings,
+        attention_mask=None,
     )
-    torch.nn.Module.__init__(attn)
 
-    outputs = attn.forward(hidden_states=torch.zeros(1, 1, 1))
-    assert outputs is sentinel
+    assert outputs.shape == hidden_states.shape
+    assert backend.calls == []
+
+
+def test_mla_kv_cache_spec_is_symmetric_padded() -> None:
+    lite_like = SimpleNamespace(
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        num_attention_heads=16,
+        num_key_value_heads=16,
+        hidden_size=2048,
+        head_dim=None,
+    )
+    assert DeepseekV2PagedAttention.get_kv_cache_spec_for_config(lite_like) == {
+        "num_kv_heads": 16,
+        "head_dim": 256,
+    }
+    assert DeepseekV3PagedAttention.get_kv_cache_spec_for_config(lite_like) == {
+        "num_kv_heads": 16,
+        "head_dim": 256,
+    }
+
+    tiny = _v2_config()
+    assert DeepseekV2PagedAttention.get_kv_cache_spec_for_config(tiny) == {
+        "num_kv_heads": 2,
+        "head_dim": 64,
+    }

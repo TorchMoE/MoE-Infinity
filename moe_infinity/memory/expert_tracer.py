@@ -33,6 +33,12 @@ class ExpertTracer:
         "expert_compute",
         "eviction",
         "queue_coordination",
+        "prefetch_budget",
+        "prefetch_admit",
+        "prefetch_complete",
+        "prefetch_cancel",
+        "prefetch_late",
+        "prefetch_waste",
     }
 
     def __new__(cls, *args, **kwargs):

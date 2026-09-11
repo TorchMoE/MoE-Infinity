@@ -34,10 +34,10 @@ def test_prepare_commit_swap_out() -> None:
     assert ok is True
     assert mgr.num_free_gpu_blocks == 8
 
-    pairs = mgr.prepare_swap_out("seq-c")
+    pairs = mgr.prepare_swap_out(0, "seq-c")
     assert len(pairs) == 2
 
-    mgr.commit_swap_out("seq-c", pairs)
+    mgr.commit_swap_out(0, "seq-c", pairs)
     assert mgr.num_free_gpu_blocks == 10
     assert mgr.num_free_cpu_blocks == 8
     assert mgr.get_block_table("seq-c") == []
@@ -48,14 +48,14 @@ def test_prepare_commit_swap_in() -> None:
     ok = mgr.allocate_blocks_for_sequence("seq-d", num_tokens=8)
     assert ok is True
 
-    pairs_out = mgr.prepare_swap_out("seq-d")
+    pairs_out = mgr.prepare_swap_out(0, "seq-d")
     assert len(pairs_out) == 2
     orig_gpu_ids = [gpu_id for gpu_id, _ in pairs_out]
-    mgr.commit_swap_out("seq-d", pairs_out)
+    mgr.commit_swap_out(0, "seq-d", pairs_out)
 
-    pairs_in = mgr.prepare_swap_in("seq-d", orig_gpu_ids)
+    pairs_in = mgr.prepare_swap_in(0, "seq-d", orig_gpu_ids)
     assert len(pairs_in) == 2
-    mgr.commit_swap_in("seq-d", orig_gpu_ids, pairs_in)
+    mgr.commit_swap_in(0, "seq-d", orig_gpu_ids, pairs_in)
 
     assert len(mgr.get_block_table("seq-d")) == 2
     assert mgr.num_free_cpu_blocks == 10

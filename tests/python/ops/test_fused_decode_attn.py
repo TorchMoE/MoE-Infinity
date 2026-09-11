@@ -172,3 +172,64 @@ def test_fused_decode_attention_matches_reference(
         atol=BF16_ATOL,
         rtol=BF16_RTOL,
     )
+
+
+@pytest.mark.parametrize("num_kv_heads", [8, 32])
+def test_fused_decode_attention_falls_back_to_eager_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    num_kv_heads: int,
+) -> None:
+    """``MOE_DISABLE_FUSED_KERNELS=1`` must still compute decode attention.
+
+    The fallback runs without CUDA or Triton, so this covers the CPU-only
+    path that the parametrized kernel test above cannot reach.
+    """
+    from moe_infinity import kernel
+
+    monkeypatch.setattr(kernel, "_FUSED_KERNELS_DISABLED", True)
+
+    batch, seq_len, num_heads, head_dim, block_size = 2, 40, 32, 128, 16
+    device = torch.device("cpu")
+    query = torch.randn(
+        batch,
+        1,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.float32,
+    ).to(torch.bfloat16)
+    key_cache, value_cache, block_tables, seq_lens = _make_paged_kv(
+        batch=batch,
+        seq_len=seq_len,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        device=device,
+    )
+    scale = 1.0 / math.sqrt(float(head_dim))
+
+    output = kernel.fused_decode_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_lens,
+        scale,
+    )
+    reference = _reference_decode_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        seq_lens,
+        scale,
+    )
+
+    assert output.shape == (batch, num_heads, head_dim)
+    assert output.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        output.float(),
+        reference.float(),
+        atol=BF16_ATOL,
+        rtol=BF16_RTOL,
+    )

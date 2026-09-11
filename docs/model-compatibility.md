@@ -1,5 +1,10 @@
 # Model compatibility matrix
 
+Adaptive candidate evaluation is limited to unquantized Mixtral, Qwen3-MoE, and DeepSeek-V2. GPT-OSS MXFP4, GLM-5.2 FP8, DeepSeek-V4-Flash FP4, DeepSeek-V3 FP8, and GPTQ/AWQ remain protected.
+
+This guide is the source of truth for the families registered in
+`moe_infinity/common/constants.py` and the runtime adapters wired in
+`moe_infinity/runtime/model_offload.py`.
 This page separates general model support from DFlash evidence. `validated`
 means the named scope has a repository harness; `implemented/experimental`
 means code plus tiny/unit evidence; `not recorded` means no direct evidence.
@@ -23,6 +28,7 @@ a claim that any particular DeepSeek DFlash pair has been validated.
 | Qwen3 / Qwen3.5 MoE | Qwen3 validated; Qwen3.5 tiny-fixture validated | implemented/experimental | Qwen3.5 is text-only and requires newer Transformers. |
 | GLM-5.2 (`GlmMoeDsaForCausalLM`) | validated | tiny serving harness | Built-in MTP, not DFlash. |
 | GLM-5.3 (`GlmMoeDsaForCausalLM`) | implemented/experimental | not recorded | Same base and FP8 path as GLM-5.2 (post-training only); config resolution pinned by `tests/python/unit/test_glm53_registry.py`. |
+| GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) | implemented/experimental | not recorded | New glm5_next family (transformers >= 5.16, guarded); routed experts offloaded, KDA/DSA/mHC/vision resident; no real-checkpoint harness yet. |
 | GPT-OSS (`GptOssForCausalLM`) | 20B validated | 20B validated | Resident expert implementation. |
 | DBRX / Jamba / OLMoE / NLLB-MoE | implemented/experimental | not validated | Registry/adapter evidence only. |
 | OPT (`OPTForCausalLM`) | unsupported | unsupported | Registry entry only. |

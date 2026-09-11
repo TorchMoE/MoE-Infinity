@@ -229,6 +229,84 @@ def test_swap_out_free_gpu_blocks_swap_in_round_trip():
     assert cache.block_allocator.num_free_blocks == 4
 
 
+def _make_int8_cache(num_blocks: int):
+    from moe_infinity.runtime.kv_cache_format import (
+        allocate_layered_paged_kv_store,
+    )
+
+    _, PagedKVCache = _load_classes()
+    store = allocate_layered_paged_kv_store(
+        owner_id="int8-lifecycle",
+        format_name="int8_sym",
+        num_layers=1,
+        num_blocks=num_blocks,
+        block_size=4,
+        num_kv_heads=2,
+        head_dim=8,
+        execution_dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+    return PagedKVCache(store=store, owner_id="int8-lifecycle")
+
+
+def test_int8_swap_round_trip_preserves_payload_and_scales() -> None:
+    cache = _make_int8_cache(num_blocks=4)
+    cache.allocate_sequence(1, 8)
+    slots = torch.arange(8)
+    key = torch.randn(8, 2, 8)
+    value = torch.randn(8, 2, 8)
+    cache.store.write_chunk(
+        layer_idx=0, key_chunk=key, value_chunk=value, slot_mapping=slots
+    )
+    before = cache.store.snapshot_page_chunk(
+        cache.get_block_table(1), torch.device("cpu")
+    )
+    cache.swap_out(1, release_gpu_blocks=True)
+    assert cache.sequence_residency(1) == "swapped"
+    assert cache.get_block_table(1) == []
+    cache.swap_in(1)
+    after = cache.store.snapshot_page_chunk(
+        cache.get_block_table(1), torch.device("cpu")
+    )
+    torch.testing.assert_close(after.payload, before.payload)
+    torch.testing.assert_close(after.scales, before.scales)
+
+
+def test_int8_truncate_swapped_cache_slices_scale_pages() -> None:
+    cache = _make_int8_cache(num_blocks=4)
+    cache.allocate_sequence(1, 8)
+    cache.swap_out(1, release_gpu_blocks=True)
+    cache.truncate_tokens(1, 4)
+    swapped = cache._swapped_page_chunks[1]
+    assert swapped.payload.shape[1] == 1
+    assert swapped.scales is not None and swapped.scales.shape[1] == 1
+
+
+def test_swap_then_truncate_releases_each_gpu_block_once(monkeypatch) -> None:
+    cache = _make_int8_cache(num_blocks=4)
+    cache.allocate_sequence(1, 8)
+    released: list[int] = []
+    original_free = cache.block_allocator.free
+
+    def recording_free(block_ids: list[int]) -> None:
+        released.extend(block_ids)
+        original_free(block_ids)
+
+    monkeypatch.setattr(cache.block_allocator, "free", recording_free)
+    cache.swap_out(1, release_gpu_blocks=True)
+    cache.truncate_tokens(1, 4)
+    assert sorted(released) == [0, 1]
+    assert len(released) == len(set(released))
+
+
+def test_free_gpu_blocks_rejects_swapped_sequence() -> None:
+    cache = _make_int8_cache(num_blocks=4)
+    cache.allocate_sequence(1, 8)
+    cache.swap_out(1, release_gpu_blocks=True)
+    with pytest.raises(RuntimeError, match="does not own GPU blocks"):
+        cache.free_gpu_blocks(1)
+
+
 from moe_infinity.runtime.attention_backend import (  # noqa: E402
     KVCacheSpec,
     PagedAttentionBackend,

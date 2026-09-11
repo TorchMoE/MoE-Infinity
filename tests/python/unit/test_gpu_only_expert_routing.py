@@ -18,7 +18,7 @@ class FakeDispatcher:
     def set_expected_queue(self, count):
         self.calls.append(("set_expected_queue", count))
 
-    def enqueue_expert(self, layer, expert, gpu, remote):
+    def enqueue_expert(self, layer, expert, gpu, remote, phase=None):
         self.calls.append(("enqueue_expert", layer, expert, gpu, remote))
 
     def notify_fetch_start(self):
@@ -58,10 +58,10 @@ class FakePrefetcher:
         self.corrected = []
         self.speculative = []
 
-    def correct_prefetch(self, layer, experts):
+    def correct_prefetch(self, layer, experts, phase=None):
         self.corrected.append((layer, experts))
 
-    def speculative_prefetch(self, layer, router_logits):
+    def speculative_prefetch(self, layer, router_logits, phase=None, **kwargs):
         self.speculative.append((layer, router_logits))
 
 
@@ -111,7 +111,7 @@ def test_native_active_list_drives_existing_prefetch_correction():
     executor, dispatcher = make_executor(enabled=True)
     prefetcher = FakePrefetcher()
     executor._last_dispatch_used_native_routing = True
-    executor._pending_prefetch = (prefetcher, 7, None, None)
+    executor._pending_prefetch = (prefetcher, 7, None, None, None, [], None)
 
     result = executor.wait_dispatch_local()
 

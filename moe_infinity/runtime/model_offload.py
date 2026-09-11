@@ -15,6 +15,8 @@ import re
 import tempfile
 import time
 import warnings
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Optional, Type, Union
 
 import torch
@@ -41,13 +43,25 @@ from transformers.modeling_utils import PreTrainedModel
 
 from moe_infinity.common import parse_expert_type
 from moe_infinity.distributed import DistributedExpertExecutor
-from moe_infinity.memory import ExpertPredictor, ExpertPrefetcher, ExpertTracer
+from moe_infinity.memory import (
+    ExpertPredictor,
+    ExpertPrefetcher,
+    ExpertTracer,
+    PhasePolicySettings,
+)
+from moe_infinity.memory.adaptive_precision_policy import (
+    AdaptivePrecisionPolicy,
+    ExpertKey,
+)
 from moe_infinity.models import (
+    DeepseekV2PagedAttention,
+    DeepseekV3PagedAttention,
     Qwen3MoEBlock,
     Qwen3PagedAttention,
     SyncDbrxFFNBlock,
     SyncDeepseekV2MoEBlock,
     SyncDeepseekV3MoEBlock,
+    SyncGlm5NextMoEBlock,
     SyncGlmMoeDsaMoEBlock,
     SyncGptOssMLP,
     SyncJambaMoEBlock,
@@ -56,9 +70,24 @@ from moe_infinity.models import (
     SyncOlmoeMoEBlock,
     SyncQwen3_5MoeSparseMoeBlock,
 )
+from moe_infinity.runtime.adaptive_precision_allowlist import (
+    RELEASED_ADAPTIVE_ENTRIES,
+    ReleasedAdaptiveEntry,
+)
+from moe_infinity.runtime.expert_precision import (
+    PROTECTED_MODEL_PATHS,
+    ModelPrecisionCapabilities,
+    protected_capabilities,
+    resolve_model_precision_capabilities,
+)
+from moe_infinity.runtime.expert_variant_manifest import (
+    ExpertVariantManifest,
+    load_derivative_overlay,
+)
 from moe_infinity.runtime.hooks import *
 from moe_infinity.utils import (
     ArcherConfig,
+    moe_text_config,
     parse_expert_dtype,
     parse_expert_id,
     parse_moe_param,
@@ -81,6 +110,118 @@ from moe_infinity.utils.quantization import (
     should_cast_tensor,
     validate_quantization_support,
 )
+
+
+@dataclass(frozen=True)
+class AdaptivePrecisionResolution:
+    enabled: bool
+    fallback_reason: Optional[str]
+    capabilities: ModelPrecisionCapabilities
+    manifest: object | None = None
+
+
+def _resolve_adaptive_precision(
+    model_config,
+    archer_config,
+    offload_path: str,
+    *,
+    extension_names: set[str],
+    purpose: str = "serve",
+    checkpoint_fingerprint: Optional[str] = None,
+    released_entries=frozenset(),
+    native_handle=None,
+) -> AdaptivePrecisionResolution:
+    model_type = str(getattr(model_config, "model_type", ""))
+    if not bool(getattr(archer_config, "adaptive_expert_precision", False)):
+        return AdaptivePrecisionResolution(
+            False,
+            "disabled",
+            ModelPrecisionCapabilities(model_type, {}, None),
+        )
+    quantization = getattr(model_config, "quantization_config", None) or {}
+    quant_method = str(quantization.get("quant_method", "")).lower()
+    protected_reason = PROTECTED_MODEL_PATHS.get(model_type)
+    if protected_reason is None and quant_method in {
+        "gptq",
+        "awq",
+        "mxfp4",
+        "fp8",
+    }:
+        protected_reason = f"protected:{quant_method}"
+    if protected_reason is not None:
+        capabilities = protected_capabilities(model_type, protected_reason)
+        return AdaptivePrecisionResolution(
+            False, protected_reason, capabilities
+        )
+    capabilities = resolve_model_precision_capabilities(
+        model_config, extension_names
+    )
+    if int(getattr(archer_config, "adaptive_hbm_budget_bytes", 0)) <= 0:
+        return AdaptivePrecisionResolution(
+            False, "invalid_hbm_budget", capabilities
+        )
+    if purpose not in {"build", "serve"}:
+        raise ValueError("purpose must be 'build' or 'serve'")
+    derivative_root = getattr(
+        archer_config, "adaptive_derivative_root", None
+    ) or str(Path(offload_path) / "adaptive_derivatives")
+    if purpose == "build":
+        if not bool(getattr(archer_config, "adaptive_variant_build", False)):
+            return AdaptivePrecisionResolution(
+                False, "variant_build_disabled", capabilities
+            )
+        return AdaptivePrecisionResolution(
+            False, "build_required", capabilities
+        )
+    try:
+        manifest = ExpertVariantManifest.load_current(
+            derivative_root,
+            native_handle=native_handle,
+            register_overlay=False,
+        )
+    except FileNotFoundError:
+        return AdaptivePrecisionResolution(
+            False, "manifest_missing", capabilities
+        )
+    except (KeyError, TypeError, ValueError, OSError):
+        return AdaptivePrecisionResolution(
+            False, "manifest_invalid", capabilities
+        )
+
+    entries = getattr(manifest, "release_entries", None)
+    if entries is None:
+        entries = frozenset(
+            ReleasedAdaptiveEntry(
+                checkpoint_fingerprint=manifest.checkpoint_fingerprint,
+                format=variant.format,
+                converter_version=variant.converter_version,
+                quality_attestation_sha256=variant.quality_attestation_sha256,
+            )
+            for variant in manifest.variants
+        )
+    if checkpoint_fingerprint is not None and any(
+        entry.checkpoint_fingerprint != checkpoint_fingerprint
+        for entry in entries
+    ):
+        return AdaptivePrecisionResolution(
+            False, "checkpoint_fingerprint_mismatch", capabilities
+        )
+    if not entries or not frozenset(entries).issubset(
+        frozenset(released_entries)
+    ):
+        return AdaptivePrecisionResolution(
+            False, "manifest_unapproved", capabilities, manifest
+        )
+    if native_handle is not None:
+        load_derivative_overlay(
+            Path(derivative_root)
+            / "generations"
+            / manifest.generation
+            / "derivative-index.v1.json",
+            native_handle,
+        )
+    return AdaptivePrecisionResolution(True, None, capabilities, manifest)
+
 
 _prefetch_lib = None
 # Alias for compatibility
@@ -500,6 +641,46 @@ class OffloadEngine(object):
         """Zero the exposed-fetch accumulator (per BM3 ablation arm)."""
         self._exposed_fetch_seconds = 0.0
 
+    def adaptive_memory_snapshot(self) -> dict[str, int | float]:
+        hit_rate = min(1.0, max(0.0, self.expert_cache_hit_rate))
+        accesses = 100
+        misses = int(round((1.0 - hit_rate) * accesses))
+        total_stall = self.get_exposed_fetch_seconds() * 1000.0
+        previous = float(getattr(self, "_adaptive_last_fetch_stall_ms", 0.0))
+        self._adaptive_last_fetch_stall_ms = total_stall
+        return {
+            "expert_accesses": accesses,
+            "expert_misses": misses,
+            "expert_fetch_stall_ms": max(0.0, total_stall - previous),
+        }
+
+    def _configure_native_phase_policy(self) -> None:
+        phase_policy = PhasePolicySettings(
+            enabled=bool(self.archer_config.phase_specific_expert_policy),
+            prefill_admission=self.archer_config.prefill_expert_admission,
+            decode_admission=self.archer_config.decode_expert_admission,
+            prefill_prefetch_top_k=self.archer_config.prefill_expert_prefetch_top_k,
+            decode_prefetch_top_k=self.archer_config.decode_expert_prefetch_top_k,
+            prefill_prefetch_priority=self.archer_config.prefill_expert_prefetch_priority,
+            decode_prefetch_priority=self.archer_config.decode_expert_prefetch_priority,
+            prefill_eviction_weight=self.archer_config.prefill_expert_eviction_weight,
+            decode_eviction_weight=self.archer_config.decode_expert_eviction_weight,
+            starvation_limit=self.archer_config.expert_policy_starvation_limit,
+        )
+        self.expert_prefetcher.phase_policy = phase_policy
+        if not phase_policy.enabled:
+            return
+        configure = getattr(self.archer_engine, "configure_phase_policy", None)
+        if callable(configure):
+            configure(
+                phase_policy.enabled,
+                phase_policy.prefill_admission,
+                phase_policy.decode_admission,
+                phase_policy.prefill_eviction_weight,
+                phase_policy.decode_eviction_weight,
+                phase_policy.starvation_limit,
+            )
+
     @property
     def kv_occupancy_bytes(self) -> Optional[float]:
         manager = getattr(self, "kv_cache_manager", None)
@@ -830,10 +1011,13 @@ class OffloadEngine(object):
             else "DeepseekV2Moe"
         )
         setattr(_dsv2_mod, _dsv2_attr, SyncDeepseekV2MoEBlock)
-        transformers.models.deepseek_v3.modeling_deepseek_v3._old_deepseek_v3_moe = transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MoE
-        transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MoE = (
-            SyncDeepseekV3MoEBlock
-        )
+        _dsv2_mod._old_deepseek_v2_attention = _dsv2_mod.DeepseekV2Attention
+        _dsv2_mod.DeepseekV2Attention = DeepseekV2PagedAttention
+        _dsv3_mod = transformers.models.deepseek_v3.modeling_deepseek_v3
+        _dsv3_mod._old_deepseek_v3_moe = _dsv3_mod.DeepseekV3MoE
+        _dsv3_mod.DeepseekV3MoE = SyncDeepseekV3MoEBlock
+        _dsv3_mod._old_deepseek_v3_attention = _dsv3_mod.DeepseekV3Attention
+        _dsv3_mod.DeepseekV3Attention = DeepseekV3PagedAttention
 
         transformers.models.gpt_oss.modeling_gpt_oss._old_gpt_oss_mlp = (
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP
@@ -849,6 +1033,14 @@ class OffloadEngine(object):
 
             _glm_mod._old_glm_moe_dsa_moe = _glm_mod.GlmMoeDsaMoE
             _glm_mod.GlmMoeDsaMoE = SyncGlmMoeDsaMoEBlock
+        except (ImportError, AttributeError):
+            pass
+
+        try:
+            import transformers.models.glm5_next.modeling_glm5_next as _glm5n_mod
+
+            _glm5n_mod._old_glm5_next_moe = _glm5n_mod.Glm5NextTextMoE
+            _glm5n_mod.Glm5NextTextMoE = SyncGlm5NextMoEBlock
         except (ImportError, AttributeError):
             pass
 
@@ -944,8 +1136,8 @@ class OffloadEngine(object):
                         )[0]
                         is_glm_fp8_ckpt = (
                             "GlmMoeDsa" in _arch0_cast
-                            and _has_fp8_blockwise(self.config)
-                        )
+                            or "Glm5Next" in _arch0_cast
+                        ) and _has_fp8_blockwise(self.config)
                         self._cast_state_dict_tensors(
                             state_dict,
                             is_gptq_ckpt=is_gptq_ckpt,
@@ -1005,9 +1197,8 @@ class OffloadEngine(object):
                             getattr(self.config, "architectures", None) or [""]
                         )[0]
                         is_glm_fp8 = (
-                            "GlmMoeDsa" in arch0
-                            and _has_fp8_blockwise(self.config)
-                        )
+                            "GlmMoeDsa" in arch0 or "Glm5Next" in arch0
+                        ) and _has_fp8_blockwise(self.config)
                         if is_glm_fp8:
                             from moe_infinity.utils.fp8 import (
                                 dequant_fp8_blockwise,
@@ -1077,16 +1268,17 @@ class OffloadEngine(object):
                     _arch0_reload = (
                         getattr(self.config, "architectures", None) or [""]
                     )[0]
-                    if "GlmMoeDsa" in _arch0_reload and _has_fp8_blockwise(
-                        self.config
-                    ):
+                    if (
+                        "GlmMoeDsa" in _arch0_reload
+                        or "Glm5Next" in _arch0_reload
+                    ) and _has_fp8_blockwise(self.config):
                         self._rebuild_glm_fp8_scales_from_ckpt()
 
                 is_flash_attn_available = kwargs.get(
                     "is_flash_attn_available", False
                 )
                 _model_type = getattr(self.config, "model_type", "")
-                _force_eager = _model_type == "glm_moe_dsa"
+                _force_eager = _model_type in ("glm_moe_dsa", "glm5_next")
                 model = cls._from_config(
                     self.config,
                     torch_dtype=self.dtype_cls
@@ -1167,14 +1359,21 @@ class OffloadEngine(object):
                 self.expert_prefetcher.expert_nbytes_map = (
                     _make_expert_nbytes_map(model, self.config)
                 )
+                self.expert_prefetcher.configure_overlap_policy(
+                    self.archer_config
+                )
 
                 # for deepseek and glm, we need to set the expert_tensor_map for the model
                 first_k_dense_replace = 0
                 if "deepseek" in model_name or "glm" in model_name.lower():
+                    first_k_dense_replace = moe_text_config(
+                        self.config
+                    ).first_k_dense_replace
                     self.expert_prefetcher.first_k_dense_replace = (
-                        self.config.first_k_dense_replace
+                        first_k_dense_replace
                     )
-                    first_k_dense_replace = self.config.first_k_dense_replace
+
+                self._configure_native_phase_policy()
 
                 self.expert_executor.set_expert_dispatcher(
                     self.expert_dispatcher
@@ -1206,6 +1405,7 @@ class OffloadEngine(object):
                         or isinstance(module, SyncOlmoeMoEBlock)
                         or isinstance(module, SyncJambaMoEBlock)
                         or isinstance(module, SyncGlmMoeDsaMoEBlock)
+                        or isinstance(module, SyncGlm5NextMoEBlock)
                     ):
                         module.archer_engine = self.archer_engine
                         module.archer_config = self.archer_config
@@ -1236,11 +1436,28 @@ class OffloadEngine(object):
                 if getattr(self.config, "model_type", "") in (
                     "glm_moe_dsa",
                     "qwen3_5_moe",
+                    "glm5_next",
                 ):
                     self._load_resident_shared_experts(model)
                     for _name in list(self.name_id_map.keys()):
                         if self._is_shared_expert_param(_name):
                             del self.name_id_map[_name]
+
+                # glm5_next keeps the whole non-expert backbone resident, so
+                # no archer forward hook ever moves those modules; place them
+                # on the GPU once here (offload-managed tensors stay behind as
+                # placeholders and are excluded via name_id_map membership).
+                if (
+                    getattr(self.config, "model_type", "") == "glm5_next"
+                    and torch.cuda.is_available()
+                ):
+                    _resident_device = torch.device("cuda", 0)
+                    for _pname, _param in model.named_parameters(recurse=True):
+                        if _pname not in self.name_id_map:
+                            _param.data = _param.data.to(_resident_device)
+                    for _bname, _buf in model.named_buffers(recurse=True):
+                        if _bname not in self.name_id_map:
+                            _buf.data = _buf.data.to(_resident_device)
 
                 if (
                     getattr(self.config, "model_type", "") == "gpt_oss"
@@ -1250,6 +1467,96 @@ class OffloadEngine(object):
 
                 self.setup_archer_hooks(model)
                 self.deliver_fp8_scales_to_dispatcher()
+                extension_names = {
+                    name
+                    for name in ("_marlin", "_v4_fp4")
+                    if importlib.util.find_spec(f"moe_infinity.{name}")
+                    is not None
+                }
+                manager_match = (
+                    self.expert_dispatcher.get_residency_manager_id()
+                    == self.expert_prefetcher.get_residency_manager_id()
+                )
+                if (
+                    not manager_match
+                    and self.archer_config.adaptive_expert_precision
+                ):
+                    capabilities = resolve_model_precision_capabilities(
+                        self.config, extension_names
+                    )
+                    resolution = AdaptivePrecisionResolution(
+                        False, "residency_manager_mismatch", capabilities
+                    )
+                else:
+                    resolution = _resolve_adaptive_precision(
+                        self.config,
+                        self.archer_config,
+                        self.checkpoint,
+                        extension_names=extension_names,
+                        purpose="serve",
+                        released_entries=RELEASED_ADAPTIVE_ENTRIES,
+                        native_handle=self.archer_engine,
+                    )
+                manager_enabled = bool(
+                    getattr(
+                        self.archer_config,
+                        "phase_specific_expert_policy",
+                        False,
+                    )
+                    or resolution.enabled
+                )
+                phase_enabled = bool(
+                    getattr(
+                        self.archer_config,
+                        "phase_specific_expert_policy",
+                        False,
+                    )
+                )
+                self.expert_dispatcher.configure_residency_manager(
+                    manager_enabled, phase_enabled
+                )
+                self.archer_engine.configure_residency_manager(
+                    manager_enabled, phase_enabled
+                )
+                if resolution.enabled:
+                    self.expert_dispatcher.set_adaptive_hbm_budget_bytes(
+                        self.archer_config.adaptive_hbm_budget_bytes
+                    )
+                    for variant in resolution.manifest.variants:
+                        self.expert_dispatcher.register_expert_variant(
+                            variant.layer_id,
+                            variant.expert_id,
+                            variant.format.value,
+                            int(resolution.manifest.generation[1:]),
+                            variant.execution.value,
+                            list(variant.tensor_ids),
+                            list(variant.tensor_roles),
+                            variant.payload_bytes,
+                            variant.aligned_bytes,
+                            variant.workspace_bytes,
+                        )
+                    catalog = {}
+                    generations = {}
+                    native_generation = int(resolution.manifest.generation[1:])
+                    for variant in resolution.manifest.variants:
+                        key = ExpertKey(variant.layer_id, variant.expert_id)
+                        catalog.setdefault(key, {})[variant.format] = (
+                            variant.aligned_bytes
+                        )
+                        generations[(key, variant.format)] = native_generation
+                    policy = AdaptivePrecisionPolicy(
+                        self.archer_config.adaptive_hbm_budget_bytes,
+                        self.archer_config.adaptive_hotness_decay,
+                        self.archer_config.adaptive_promotion_threshold,
+                        self.archer_config.adaptive_demotion_threshold,
+                        self.archer_config.adaptive_min_residency_epochs,
+                        self.archer_config.adaptive_transition_cooldown_epochs,
+                        catalog,
+                        generations=generations,
+                        epoch_tokens=self.archer_config.adaptive_policy_epoch_tokens,
+                    )
+                    self.expert_executor.set_precision_policy(policy)
+                self.expert_precision_resolution = resolution
                 return model
 
             return archer_from_pretrained
@@ -1295,6 +1602,14 @@ class OffloadEngine(object):
         except (ImportError, AttributeError):
             pass
 
+        try:
+            import transformers.models.glm5_next.modeling_glm5_next as _glm5n_mod
+
+            if hasattr(_glm5n_mod, "_old_glm5_next_moe"):
+                _glm5n_mod.Glm5NextTextMoE = _glm5n_mod._old_glm5_next_moe
+        except (ImportError, AttributeError):
+            pass
+
     def _is_shared_expert_param(self, name: str) -> bool:
         # DeepSeek names shared experts ".shared_experts." (plural); Qwen3.5-MoE
         # uses singular ".shared_expert." plus ".shared_expert_gate.". The
@@ -1312,7 +1627,104 @@ class OffloadEngine(object):
                 return expert_id is None
             if name.endswith("lm_head.weight"):
                 return True
+        # glm5_next (GLM-5.3-Flash): same policy as Qwen3.5-MoE, extended to
+        # the whole checkpoint namespace - only routed experts are offloaded;
+        # KDA linear attention, DSA indexer, mHC hyper-connections, vision
+        # tower (model.visual.*), and lm_head all stay resident.
+        if getattr(self.config, "model_type", "") == "glm5_next":
+            _, expert_id = parse_expert_id(name, self.config)
+            return expert_id is None
         return False
+
+    def _resident_ckpt_key_renamer(self):
+        # Transformers v5 renames some checkpoint keys on load (e.g. glm5_next
+        # maps on-disk "hc_attn_base" to module "attn_hc.base" and
+        # "self_attn.A_log" to "self_attn.forget_gate.A_log" via
+        # conversion_mapping WeightRenaming entries). The resident loader reads
+        # safetensors directly, bypassing from_pretrained, so it must apply the
+        # same renames; families without rename entries get the identity.
+        try:
+            from transformers.conversion_mapping import (
+                get_checkpoint_conversion_mapping,
+            )
+        except ImportError:
+            return lambda key: key
+        try:
+            entries = (
+                get_checkpoint_conversion_mapping(
+                    getattr(self.config, "model_type", "")
+                )
+                or []
+            )
+        except Exception:
+            entries = []
+        # Apply plain WeightRenaming entries only. WeightConverter entries
+        # (e.g. packing per-expert weights into a batched module) must NOT be
+        # applied: the Sync MoE blocks keep the raw per-expert checkpoint
+        # layout, and a converter rename would collapse distinct expert keys.
+        renamings = [
+            entry
+            for entry in entries
+            if type(entry).__name__ == "WeightRenaming"
+        ]
+        if not renamings:
+            return lambda key: key
+
+        def _rename(key: str) -> str:
+            for entry in renamings:
+                renamed, matched = entry.rename_source_key(key)
+                if matched is not None:
+                    key = renamed
+            return key
+
+        return _rename
+
+    def _resident_ckpt_fusions(self):
+        # Concat-style WeightConverter entries (e.g. glm5_next fuses on-disk
+        # q/k/v_conv1d.weight into the module's single conv1d.weight along dim
+        # 0). Only literal multi-source -> single-target Concatenate entries
+        # are honored here; wildcard converters (batched experts) are handled
+        # by the per-expert Sync blocks instead.
+        try:
+            from transformers.conversion_mapping import (
+                get_checkpoint_conversion_mapping,
+            )
+        except ImportError:
+            return []
+        try:
+            entries = (
+                get_checkpoint_conversion_mapping(
+                    getattr(self.config, "model_type", "")
+                )
+                or []
+            )
+        except Exception:
+            entries = []
+        fusions = []
+        for entry in entries:
+            if type(entry).__name__ != "WeightConverter":
+                continue
+            sources = getattr(entry, "source_patterns", None)
+            targets = getattr(entry, "target_patterns", None)
+            ops = getattr(entry, "operations", None)
+            if (
+                isinstance(sources, list)
+                and len(sources) > 1
+                and isinstance(targets, list)
+                and len(targets) == 1
+                and ops
+                and len(ops) == 1
+                and type(ops[0]).__name__ == "Concatenate"
+                and all("*" not in str(s) for s in sources)
+            ):
+                fusions.append(
+                    (
+                        str(targets[0]),
+                        [str(s) for s in sources],
+                        getattr(ops[0], "dim", 0),
+                    )
+                )
+        return fusions
 
     @torch.no_grad()
     def _load_resident_shared_experts(self, model):
@@ -1329,6 +1741,8 @@ class OffloadEngine(object):
         if not wanted:
             return
 
+        rename = self._resident_ckpt_key_renamer()
+        fusions = self._resident_ckpt_fusions()
         remaining = set(wanted)
         from moe_infinity.utils.fp8 import dequant_fp8_blockwise
 
@@ -1349,25 +1763,44 @@ class OffloadEngine(object):
                 break
             if ckpt.endswith(".safetensors"):
                 with safe_open(ckpt, framework="pt", device="cpu") as f:
-                    keys = set(f.keys())
+                    raw_keys = set(f.keys())
+                    keys = {rename(k): k for k in raw_keys}
                     for name in list(remaining):
                         if name not in keys:
                             continue
                         param = wanted[name]
-                        scale_key = name + "_scale_inv"
+                        scale_key = keys.get(name + "_scale_inv")
                         scale = (
                             f.get_tensor(scale_key)
-                            if scale_key in keys
+                            if scale_key is not None
                             else None
                         )
                         param.data = _resolve(
-                            param, name, f.get_tensor(name), scale
+                            param, name, f.get_tensor(keys[name]), scale
                         )
                         param.requires_grad_(False)
                         param._moe_infinity_resident = True
                         remaining.remove(name)
+                    for name in list(remaining):
+                        for target_sfx, source_sfxs, dim in fusions:
+                            if not name.endswith(target_sfx):
+                                continue
+                            prefix = name[: -len(target_sfx)]
+                            src_names = [prefix + s for s in source_sfxs]
+                            if not all(k in raw_keys for k in src_names):
+                                continue
+                            param = wanted[name]
+                            fused = torch.cat(
+                                [f.get_tensor(k) for k in src_names], dim=dim
+                            )
+                            param.data = _resolve(param, name, fused, None)
+                            param.requires_grad_(False)
+                            param._moe_infinity_resident = True
+                            remaining.remove(name)
+                            break
             else:
                 state = torch.load(ckpt, map_location="cpu")
+                state = {rename(k): v for k, v in state.items()}
                 for name in list(remaining):
                     if name not in state:
                         continue
@@ -1753,7 +2186,7 @@ class OffloadEngine(object):
 
         expert_layer_id = 0
         if "deepseek" in self.model_name or "glm" in self.model_name.lower():
-            expert_layer_id = self.config.first_k_dense_replace
+            expert_layer_id = moe_text_config(self.config).first_k_dense_replace
 
         output_device_index = None
         for key, tensors in topo:
@@ -2248,7 +2681,16 @@ class OffloadEngine(object):
             else "DeepseekV2Moe"
         )
         setattr(_dsv2_mod2, _dsv2_attr2, _dsv2_mod2._old_deepseek_v2_moe)
-        transformers.models.deepseek_v3.modeling_deepseek_v3.DeepseekV3MoE = transformers.models.deepseek_v3.modeling_deepseek_v3._old_deepseek_v3_moe
+        if hasattr(_dsv2_mod2, "_old_deepseek_v2_attention"):
+            _dsv2_mod2.DeepseekV2Attention = (
+                _dsv2_mod2._old_deepseek_v2_attention
+            )
+        _dsv3_mod2 = transformers.models.deepseek_v3.modeling_deepseek_v3
+        _dsv3_mod2.DeepseekV3MoE = _dsv3_mod2._old_deepseek_v3_moe
+        if hasattr(_dsv3_mod2, "_old_deepseek_v3_attention"):
+            _dsv3_mod2.DeepseekV3Attention = (
+                _dsv3_mod2._old_deepseek_v3_attention
+            )
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP = (
             transformers.models.gpt_oss.modeling_gpt_oss._old_gpt_oss_mlp
         )

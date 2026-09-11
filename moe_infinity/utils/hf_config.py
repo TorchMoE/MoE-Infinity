@@ -76,8 +76,16 @@ def moe_text_config(config: PretrainedConfig) -> PretrainedConfig:
     # get_text_config() in transformers v5. Flat models return themselves.
     getter = getattr(config, "get_text_config", None)
     if callable(getter):
-        return getter()
-    return getattr(config, "text_config", config)
+        text = getter()
+    else:
+        text = getattr(config, "text_config", config)
+    if isinstance(text, dict):
+        # A generic PretrainedConfig (used when the model class is not
+        # importable, e.g. glm5_next on transformers < 5.16) keeps nested
+        # sub-configs as plain dicts; normalize so MoE-shape parsing works
+        # without the modeling class.
+        text = PretrainedConfig.from_dict(text)
+    return text
 
 
 def parse_moe_param(config: PretrainedConfig) -> Tuple[int, int, int]:
@@ -111,6 +119,12 @@ def parse_moe_param(config: PretrainedConfig) -> Tuple[int, int, int]:
         num_decoder_layers = config.num_hidden_layers
         num_layers = config.num_hidden_layers
         num_experts = config.n_routed_experts
+    elif "glm5next" in arch:
+        text = moe_text_config(config)
+        num_encoder_layers = 0
+        num_decoder_layers = text.num_hidden_layers
+        num_layers = text.num_hidden_layers
+        num_experts = text.n_routed_experts
     elif "deepseek" in arch:
         num_encoder_layers = 0
         num_decoder_layers = config.num_hidden_layers
@@ -202,6 +216,22 @@ def parse_expert_id(
             layer_id = int(layer_id)
             expert_id = int(expert_id)
             # MTP layer guard: GLM has a MTP layer at index num_hidden_layers (78)
+            if layer_id >= num_layers:
+                return None, None
+    elif "glm5next" in arch:
+        decoder_sparse_step = 1
+        layer_type = "decoder"
+
+        # example "model.language_model.layers.10.mlp.experts.3.gate_proj.weight";
+        # anchored on language_model to exclude vision keys (`model.visual.*`).
+        result = re.findall(
+            r"language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.", param_name
+        )
+        if result:
+            layer_id, expert_id = result[0]
+            layer_id = int(layer_id)
+            expert_id = int(expert_id)
+            # MTP layer guard, same convention as the GlmMoeDsa branch above
             if layer_id >= num_layers:
                 return None, None
     elif "deepseek" in arch or "qwen3" in arch:

@@ -4,7 +4,7 @@ import types
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 from unittest.mock import Mock
 
 import pytest
@@ -25,6 +25,8 @@ def _ensure_package(name: str, path: Path) -> None:
 
 
 def _load_module(module_name: str, file_path: Path) -> types.ModuleType:
+    if module_name in sys.modules:
+        return sys.modules[module_name]
     spec = importlib.util.spec_from_file_location(module_name, file_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -69,6 +71,7 @@ _ = _load_module(
     ROOT / "moe_infinity" / "serving" / "engine.py",
 )
 
+from moe_infinity.memory.adaptive_memory import ResizeOutcome, ResizeResult
 from moe_infinity.runtime.attention_backend import (  # type: ignore[reportMissingImports]
     PagedAttentionBackend,
 )
@@ -91,6 +94,7 @@ from moe_infinity.serving.sampler import (  # type: ignore[reportMissingImports]
 )
 from moe_infinity.serving.sequence import (  # type: ignore[reportMissingImports]
     SamplingParams,
+    SequenceStatus,
 )
 
 
@@ -279,13 +283,61 @@ def _make_config() -> dict[str, object]:
 
 def _make_engine(
     tokenizer: Optional[object] = None,
+    *,
+    adaptive: bool = False,
+    interval_steps: int = 64,
+    device_count: int = 1,
 ) -> ContinuousBatchingEngine:
+    config = _make_config()
+    config.update(
+        {
+            "adaptive_memory_enabled": adaptive,
+            "adaptive_memory_interval_steps": interval_steps,
+            "adaptive_memory_device_count_for_test": device_count,
+        }
+    )
     return ContinuousBatchingEngine(
         model=MockModel(),
         engine=MockOffloadEngine(),
-        config=_make_config(),
+        config=config,
         tokenizer=tokenizer,
     )
+
+
+def test_engine_ticks_controller_only_at_safe_interval() -> None:
+    engine = _make_engine(adaptive=True, interval_steps=4)
+    engine.memory_controller = Mock()
+    for _ in range(3):
+        engine.step()
+    engine.memory_controller.propose.assert_not_called()
+    engine.step()
+    engine.memory_controller.propose.assert_called_once()
+
+
+def test_stats_expose_last_committed_split_and_failures() -> None:
+    engine = _make_engine(adaptive=True, device_count=2)
+    memory = engine.get_stats()["memory"]["adaptive"]
+    assert set(memory["devices"]) == {0, 1}
+    assert {
+        "enabled",
+        "fallback_static",
+        "expert_target_bytes",
+        "kv_target_blocks",
+        "resize_attempts",
+        "resize_failures",
+        "last_reason",
+    }.issubset(memory["devices"][0])
+
+
+def test_failure_on_one_device_does_not_latch_other_device() -> None:
+    engine = _make_engine(adaptive=True, device_count=2)
+    assert engine.memory_controller is not None
+    engine.memory_controller.record_resize(
+        ResizeResult(0, ResizeOutcome.REJECTED, 512, 8, "pinned"), step=64
+    )
+    stats = engine.get_stats()["memory"]["adaptive"]["devices"]
+    assert stats[0]["resize_failures"] == 1
+    assert stats[1]["resize_failures"] == 0
 
 
 def test_shutdown_closes_cuda_graph_runner_once() -> None:
@@ -596,6 +648,79 @@ def test_engine_n_finished_when_all_complete() -> None:
     )
     assert engine.has_pending_requests() is True
     assert "req-n" not in engine._completed_request_ids
+
+
+def make_mixed_batch(prefill_tokens, decode_tokens) -> BatchMetadata:
+    tokens = [*prefill_tokens, *decode_tokens]
+    return BatchMetadata(
+        seq_ids=[1, 2],
+        input_token_ids=tokens,
+        seq_lengths=[len(prefill_tokens), len(decode_tokens)],
+        context_lengths=[0, 8],
+        is_prefill=[True, False],
+        block_tables=[[0, 1], [2, 3]],
+        token_offsets=[0, len(prefill_tokens), len(tokens)],
+        sampling_params=[SamplingParams(), SamplingParams()],
+    )
+
+
+def test_enabled_policy_executes_mixed_decode_then_prefill() -> None:
+    engine = _make_engine()
+    calls = []
+
+    def execute(batch):
+        calls.append(list(batch.is_prefill))
+        base = 100 if all(batch.is_prefill) else 200
+        return torch.arange(batch.total_tokens).unsqueeze(1) + base
+
+    engine.model_runner.execute = execute
+    engine.config["phase_specific_expert_policy"] = True
+    batch = make_mixed_batch(prefill_tokens=[11, 12], decode_tokens=[21])
+    output = engine._execute_batch(batch)
+    assert calls == [[False], [True]]
+    assert output.squeeze(1).tolist() == [100, 101, 200]
+
+
+def test_disabled_policy_keeps_nonpaged_mixed_combined() -> None:
+    engine = _make_engine()
+    calls = []
+    engine.config["phase_specific_expert_policy"] = False
+    engine.model_runner._get_paged_attention_classes = lambda: []
+    engine.model_runner.execute = lambda batch: (
+        calls.append(list(batch.is_prefill))
+        or torch.zeros((batch.total_tokens, 1))
+    )
+    batch = make_mixed_batch(prefill_tokens=[11, 12], decode_tokens=[21])
+    _ = engine._execute_batch(batch)
+    assert calls == [[True, False]]
+
+
+def test_disabled_policy_keeps_paged_prefill_then_decode() -> None:
+    engine = _make_engine()
+    calls = []
+    engine.config["phase_specific_expert_policy"] = False
+    engine.paged_attention_registry.bindings = [object()]
+    engine.model_runner.execute = lambda batch: (
+        calls.append(list(batch.is_prefill))
+        or torch.zeros((batch.total_tokens, 1))
+    )
+    batch = make_mixed_batch(prefill_tokens=[11, 12], decode_tokens=[21])
+    _ = engine._execute_batch(batch)
+    assert calls == [[True], [False]]
+
+
+def test_get_stats_reports_disabled_expert_policy_without_prefetcher() -> None:
+    engine = _make_engine()
+    stats = engine.get_stats()
+    assert "expert_policy" in stats
+    policy = stats["expert_policy"]
+    assert policy["enabled"] == 0
+    assert policy["resident_bytes"] == 0
+    assert policy["resident_experts"] == 0
+    assert policy["prefill_hits"] == 0
+    assert policy["decode_hits"] == 0
+    assert policy["transition_hits"] == 0
+    assert policy["starvation_promotions"] == 0
 
 
 def test_set_block_store_rejects_oversized_logical_capacity() -> None:
@@ -1016,3 +1141,117 @@ def test_non_paged_decode_is_always_eager() -> None:
         ]
         == 1
     )
+
+
+class _PendingTransferKVCache:
+    def __init__(
+        self,
+        *,
+        progress_rounds: int,
+        on_settle: Callable[[], None] | None = None,
+    ) -> None:
+        self._remaining_rounds = progress_rounds
+        self._on_settle = on_settle
+        self.wait_calls: list[float] = []
+        self.shutdown_calls = 0
+        self.pending = progress_rounds > 0
+
+    def has_pending_transfers(self) -> bool:
+        return self.pending
+
+    def wait_for_transfer_progress(self, timeout_ms: float) -> bool:
+        self.wait_calls.append(timeout_ms)
+        if self._remaining_rounds <= 0:
+            self.pending = False
+            return False
+        self._remaining_rounds -= 1
+        if self._remaining_rounds == 0:
+            self.pending = False
+            if self._on_settle is not None:
+                self._on_settle()
+        return True
+
+    def shutdown(self, timeout_ms: float = 5000.0) -> None:
+        self.shutdown_calls += 1
+
+
+def test_engine_forwards_kv_swap_max_retries_to_scheduler() -> None:
+    config = _make_config()
+    config["kv_swap_max_retries"] = 5
+    engine = ContinuousBatchingEngine(
+        model=MockModel(),
+        engine=MockOffloadEngine(),
+        config=config,
+    )
+
+    assert engine.scheduler.kv_swap_max_retries == 5
+
+
+def test_run_until_done_waits_for_pending_transfers_without_error() -> None:
+    engine = _make_engine()
+
+    engine.add_request(
+        request_id="req-swap",
+        prompt_token_ids=[10],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
+    )
+    seq_id = engine._request_to_seq_ids["req-swap"][0]
+    engine._sequences[seq_id].set_status(SequenceStatus.SWAPPED)
+
+    def _settle() -> None:
+        engine.abort_request("req-swap")
+
+    fake_cache = _PendingTransferKVCache(progress_rounds=2, on_settle=_settle)
+    engine.kv_cache = fake_cache
+
+    outputs = engine.run_until_done()
+
+    assert isinstance(outputs, dict)
+    assert fake_cache.wait_calls == [100.0, 100.0]
+
+
+def test_run_until_done_raises_when_no_progress_and_no_pending_transfer() -> (
+    None
+):
+    engine = _make_engine()
+    fake_cache = _PendingTransferKVCache(progress_rounds=0)
+    engine.kv_cache = fake_cache
+    engine.add_request(
+        request_id="req-stuck",
+        prompt_token_ids=[10],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=1),
+    )
+    seq_id = engine._request_to_seq_ids["req-stuck"][0]
+    engine._sequences[seq_id].set_status(SequenceStatus.SWAPPED)
+
+    try:
+        engine.run_until_done()
+    except RuntimeError as exc:
+        assert "no progress" in str(exc)
+    else:
+        raise AssertionError("stuck engine must raise a no-progress error")
+
+
+def test_engine_shutdown_is_idempotent() -> None:
+    engine = _make_engine()
+    fake_cache = _PendingTransferKVCache(progress_rounds=0)
+    engine.kv_cache = fake_cache
+
+    engine.shutdown()
+    engine.shutdown()
+
+    assert fake_cache.shutdown_calls == 1
+
+
+def test_engine_shutdown_aborts_pending_requests() -> None:
+    engine = _make_engine()
+    engine.add_request(
+        request_id="req-open",
+        prompt_token_ids=[10],
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=4),
+    )
+    assert engine.has_pending_requests() is True
+
+    engine.shutdown()
+
+    assert engine.has_pending_requests() is False

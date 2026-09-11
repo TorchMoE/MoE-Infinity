@@ -5,8 +5,6 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-_ = sys.modules.pop("moe_infinity", None)
-_ = sys.modules.pop("moe_infinity.utils", None)
 
 
 CUDA_AVAILABLE = torch.cuda.is_available()
