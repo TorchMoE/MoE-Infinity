@@ -15,7 +15,9 @@ torch = pytest.importorskip("torch")
 modeling = pytest.importorskip("transformers.models.jamba.modeling_jamba")
 
 if not hasattr(modeling, "JambaMLP"):
-    pytest.skip("transformers does not expose JambaMLP", allow_module_level=True)
+    pytest.skip(
+        "transformers does not expose JambaMLP", allow_module_level=True
+    )
 
 
 def test_forward_returns_bare_tensor():
