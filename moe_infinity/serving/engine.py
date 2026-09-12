@@ -8,9 +8,21 @@ from typing import Callable, Optional, Protocol, cast
 
 import torch
 
+from moe_infinity.memory.adaptive_memory import (
+    AdaptiveMemoryConfig,
+    AdaptiveMemoryController,
+    MemorySignals,
+    ResizeDirection,
+)
 from moe_infinity.runtime.attention_backend import PagedAttentionBackend
 from moe_infinity.runtime.attention_types import DECODE_GRAPH_REASONS
 
+from ..engine.kv_transfer import (
+    CudaKVTransferBackend,
+    KVTransferBackend,
+    PinnedBufferPool,
+    SyncKVTransferBackend,
+)
 from .batch import (
     BatchBuilder,
     BatchMetadata,
@@ -21,6 +33,7 @@ from .batch import (
 from .cuda_graph import CudaGraphRunner
 from .kv_cache import PagedKVCache
 from .memory_manager import MemoryManager
+from .memory_resize import TransactionalServingMemoryResizer
 from .model_runner import ModelRunner
 from .prefix_cache import CacheNamespace, PrefixCache
 from .sampler import Sampler
@@ -62,6 +75,60 @@ class SpeculativeGenerator(Protocol):
 _eviction_sync: Optional[EvictionSyncAdapter] = None
 
 _VERIFY_ADMISSION_MAX_RETRIES = 1024
+
+_logger = logging.getLogger(__name__)
+
+
+class KVSwapConfig(Protocol):
+    kv_swap_mode: str
+    kv_swap_host_memory_bytes: int
+    kv_swap_max_inflight_bytes: int
+    kv_swap_checksum: bool
+    kv_swap_max_retries: int
+    kv_swap_allow_sync_fallback: bool
+
+
+@dataclass(frozen=True)
+class _EngineKVSwapSettings:
+    kv_swap_mode: str
+    kv_swap_host_memory_bytes: int
+    kv_swap_max_inflight_bytes: int
+    kv_swap_checksum: bool
+    kv_swap_max_retries: int
+    kv_swap_allow_sync_fallback: bool
+
+
+def build_kv_transfer_resources(
+    config: KVSwapConfig,
+    device: torch.device,
+    *,
+    pool_factory: Callable[[int], object] = PinnedBufferPool,
+    backend_factory: Callable[
+        [torch.device], KVTransferBackend
+    ] = CudaKVTransferBackend,
+) -> tuple[KVTransferBackend, Optional[object], Optional[str]]:
+    if config.kv_swap_mode == "sync":
+        return SyncKVTransferBackend(), None, None
+
+    pool: Optional[object] = None
+    try:
+        pool = pool_factory(config.kv_swap_host_memory_bytes)
+        backend = backend_factory(device)
+    except Exception as exc:
+        if pool is not None:
+            close = getattr(pool, "close", None)
+            if callable(close):
+                close()
+        if not config.kv_swap_allow_sync_fallback:
+            raise
+        fallback_reason = (
+            f"async KV transfer unavailable ({type(exc).__name__}: {exc}); "
+            "falling back to sync"
+        )
+        return SyncKVTransferBackend(), None, fallback_reason
+
+    return backend, pool, None
+
 
 CHUNKED_PREFIX_INCOMPATIBLE = (
     "enable_chunked_prefill and enable_prefix_caching cannot both be true "
@@ -161,7 +228,7 @@ class ContinuousBatchingEngine:
             ),
             kv_cache_ratio=self._get_float_config("kv_cache_ratio", 0.25),
         )
-        _ = self.memory_manager.compute_budget(
+        self._memory_budget = self.memory_manager.compute_budget(
             model_memory_bytes=self._resolve_model_memory_bytes(model)
         )
 
@@ -169,13 +236,52 @@ class ContinuousBatchingEngine:
         num_layers = self._get_int_config("num_layers")
         num_kv_heads = self._get_int_config("num_kv_heads")
         head_dim = self._get_int_config("head_dim")
+
+        self._kv_format_decision = self._resolve_kv_cache_format_decision(
+            model=model,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+        effective_format = self._kv_format_decision.effective_format.name.value
         num_blocks = self._resolve_num_blocks(
             block_size=block_size,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
+            format_name=effective_format,
         )
 
+        from moe_infinity.runtime.kv_cache_format import (
+            allocate_layered_paged_kv_store,
+        )
+
+        kv_store_owner_id = f"serving-engine:{id(self)}"
+        kv_store = allocate_layered_paged_kv_store(
+            owner_id=kv_store_owner_id,
+            format_name=effective_format,
+            num_layers=num_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            execution_dtype=self.dtype,
+            device=self.device,
+        )
+        self.kv_store = kv_store
+        self.kv_store_owner_id = kv_store_owner_id
+        swap_settings = self._resolve_kv_swap_settings()
+        backend, pool, fallback_reason = build_kv_transfer_resources(
+            swap_settings,
+            self.device,
+        )
+        self._kv_swap_mode = (
+            "sync"
+            if fallback_reason is not None
+            else swap_settings.kv_swap_mode
+        )
+        self._kv_swap_fallback_reason = fallback_reason
+        if fallback_reason is not None:
+            _logger.warning("%s", fallback_reason)
         self.model_runner = ModelRunner(model, engine, device=self.device)
 
         self.prefix_cache: PrefixCache | None = None
@@ -206,7 +312,14 @@ class ContinuousBatchingEngine:
             head_dim=head_dim,
             dtype=self.dtype,
             device=self.device,
+            transfer_backend=backend,
+            pinned_pool=cast(Optional[PinnedBufferPool], pool),
+            host_pool_bytes=swap_settings.kv_swap_host_memory_bytes,
+            max_inflight_bytes=swap_settings.kv_swap_max_inflight_bytes,
+            checksum=swap_settings.kv_swap_checksum,
             storage=backend_storage,
+            store=kv_store,
+            owner_id=kv_store_owner_id,
         )
 
         provider = self._maybe_bind_prefix_cache(capability)
@@ -240,6 +353,7 @@ class ContinuousBatchingEngine:
             verify_expert_byte_deficit_cap=self._get_optional_int_config(
                 "verify_expert_byte_deficit_cap"
             ),
+            kv_swap_max_retries=swap_settings.kv_swap_max_retries,
         )
         from moe_infinity.models.paged_attention_registry import (
             PagedAttentionLayerRegistry,
@@ -341,6 +455,95 @@ class ContinuousBatchingEngine:
         self._request_failures: dict[str, dict[str, str]] = {}
         self._num_steps = 0
         self._total_generated_tokens = 0
+        self._adaptive_tick_counter = 0
+        self._adaptive_interval_steps = int(
+            self.config.get("adaptive_memory_interval_steps", 64)
+        )
+        test_device_count = self.config.pop(
+            "adaptive_memory_device_count_for_test", None
+        )
+        detected_devices = (
+            torch.cuda.device_count() if torch.cuda.is_available() else 1
+        )
+        self._adaptive_device_count = int(
+            test_device_count or detected_devices or 1
+        )
+        self._adaptive_kv_block_bytes = (
+            2
+            * block_size
+            * num_layers
+            * num_kv_heads
+            * head_dim
+            * torch.tensor([], dtype=self.dtype).element_size()
+        )
+        self._adaptive_targets: dict[int, tuple[int, int, bool]] = {}
+        self._memory_resizers: dict[int, object] = {}
+        self.memory_controller: AdaptiveMemoryController | None = None
+        if bool(self.config.get("adaptive_memory_enabled", False)):
+            self.memory_controller = AdaptiveMemoryController(
+                self._adaptive_config_from_values()
+            )
+        for device_id in range(self._adaptive_device_count):
+            kv_supported = device_id == int(self.device.index or 0)
+            kv_blocks = self.kv_cache.num_blocks if kv_supported else 0
+            expert_bytes = int(self._memory_budget.expert_cache_bytes)
+            self._adaptive_targets[device_id] = (
+                expert_bytes,
+                kv_blocks,
+                kv_supported,
+            )
+            if self.memory_controller is not None:
+                self.memory_controller.observe(
+                    MemorySignals(
+                        device_id=device_id,
+                        step=0,
+                        expert_misses=0,
+                        expert_accesses=0,
+                        expert_fetch_stall_ms=0.0,
+                        kv_used_blocks=0,
+                        kv_total_blocks=kv_blocks,
+                        kv_swap_bytes=0,
+                        kv_swap_stall_ms=0.0,
+                        kv_preemptions=0,
+                        free_gpu_bytes=self._free_gpu_bytes(device_id),
+                        kv_supported=kv_supported,
+                    )
+                )
+        expert_cache = getattr(self.engine, "expert_prefetcher", None)
+        if self.memory_controller is not None and callable(
+            getattr(expert_cache, "resize_cache", None)
+        ):
+            device_id = int(self.device.index or 0)
+            expert_bytes, kv_blocks, _ = self._adaptive_targets[device_id]
+            self._memory_resizers[device_id] = (
+                TransactionalServingMemoryResizer(
+                    device_id=device_id,
+                    scheduler=self.scheduler,
+                    expert_cache=expert_cache,
+                    kv_cache=self.kv_cache,
+                    reserve_probe=self._free_gpu_bytes,
+                    free_reserve_bytes=self._adaptive_config_from_values().free_memory_reserve_bytes,
+                    static_expert_bytes=expert_bytes,
+                    static_kv_blocks=kv_blocks,
+                )
+            )
+        self._is_shutdown = False
+
+    def _resolve_kv_swap_settings(self) -> KVSwapConfig:
+        return _EngineKVSwapSettings(
+            kv_swap_mode=self._get_str_config("kv_swap_mode", "sync"),
+            kv_swap_host_memory_bytes=self._get_int_config(
+                "kv_swap_host_memory_bytes", 512 * 1024 * 1024
+            ),
+            kv_swap_max_inflight_bytes=self._get_int_config(
+                "kv_swap_max_inflight_bytes", 256 * 1024 * 1024
+            ),
+            kv_swap_checksum=self._get_bool_config("kv_swap_checksum", False),
+            kv_swap_max_retries=self._get_int_config("kv_swap_max_retries", 2),
+            kv_swap_allow_sync_fallback=self._get_bool_config(
+                "kv_swap_allow_sync_fallback", True
+            ),
+        )
 
     def add_request(
         self,
@@ -382,6 +585,12 @@ class ContinuousBatchingEngine:
         self.scheduler.add_request(group)
 
     def step(self) -> list[RequestOutput]:
+        self._adaptive_tick_counter += 1
+        if (
+            self.memory_controller is not None
+            and self._adaptive_tick_counter % self._adaptive_interval_steps == 0
+        ):
+            self._tick_adaptive_memory()
         self._prepare_speculative_rounds()
         scheduler_output = self.scheduler.schedule()
         outputs = self._verify_speculative_rounds(
@@ -1218,6 +1427,13 @@ class ContinuousBatchingEngine:
             if outputs or self._num_steps > steps_before:
                 continue
 
+            if self.kv_cache.has_pending_transfers():
+                progressed = self.kv_cache.wait_for_transfer_progress(
+                    timeout_ms=100.0
+                )
+                if progressed:
+                    continue
+
             pending_request_ids = self._pending_request_ids()
             raise RuntimeError(
                 f"engine made no progress with pending requests: {pending_request_ids}"
@@ -1227,6 +1443,25 @@ class ContinuousBatchingEngine:
             request_id: self._format_request_outputs(request_id)
             for request_id in self._request_outputs
         }
+
+    def shutdown(self, timeout_ms: float = 5000.0) -> None:
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
+        graph_runner = getattr(self, "cuda_graph_runner", None)
+        if graph_runner is not None:
+            graph_runner.close()
+
+        for request_id in list(self._request_to_seq_ids.keys()):
+            self.abort_request(request_id)
+
+        if self.kv_cache.has_pending_transfers():
+            _logger.warning(
+                "engine shutdown with pending KV transfers; synchronizing "
+                "before reclaiming DMA-owned resources"
+            )
+
+        self.kv_cache.shutdown(timeout_ms=timeout_ms)
 
     def get_request_n_outputs(self, request_id: str) -> list[list[int]]:
         if request_id not in self._request_outputs:
@@ -1388,17 +1623,69 @@ class ContinuousBatchingEngine:
     def invalidate_cuda_graphs(self, reason: str) -> None:
         self.cuda_graph_runner.invalidate(reason)
 
-    def shutdown(self) -> None:
-        if self._shutdown:
-            return
-        self.cuda_graph_runner.close()
-        self._shutdown = True
-
     def get_stats(self) -> dict[str, object]:
         status_counts = {status.value: 0 for status in SequenceStatus}
         for sequence in self._sequences.values():
             status_counts[sequence.status.value] += 1
 
+        memory = self.memory_manager.report()
+        memory_controller = getattr(self, "memory_controller", None)
+        adaptive_devices = (
+            memory_controller.report() if memory_controller is not None else {}
+        )
+        for device_id, (
+            expert_bytes,
+            kv_blocks,
+            _,
+        ) in getattr(self, "_adaptive_targets", {}).items():
+            device = adaptive_devices.setdefault(device_id, {})
+            device.setdefault("enabled", memory_controller is not None)
+            device.setdefault("fallback_static", False)
+            device.setdefault("fallback_reason", "")
+            device.setdefault("resize_attempts", 0)
+            device.setdefault("resize_failures", 0)
+            device.setdefault("last_reason", "init")
+            device.setdefault("hard_budget_violations", 0)
+            device.setdefault("minimum_capacity_violations", 0)
+            device.setdefault(
+                "min_free_gpu_bytes", self._free_gpu_bytes(device_id)
+            )
+            adaptive_config = self._adaptive_config_from_values()
+            device.setdefault(
+                "configured_reserve_bytes",
+                adaptive_config.free_memory_reserve_bytes,
+            )
+            device.setdefault("resize_count", int(device["resize_attempts"]))
+            device.setdefault(
+                "max_resize_count",
+                getattr(self, "_adaptive_tick_counter", 0)
+                // adaptive_config.cooldown_steps
+                + 1,
+            )
+            if int(device.get("expert_target_bytes", 0)) == 0:
+                device["expert_target_bytes"] = expert_bytes
+            if int(device.get("kv_target_blocks", 0)) == 0:
+                device["kv_target_blocks"] = kv_blocks
+        memory["adaptive"] = {
+            "enabled": memory_controller is not None,
+            "devices": adaptive_devices,
+            "completed": (
+                not self.has_pending_requests()
+                if callable(getattr(self, "has_pending_requests", None))
+                else True
+            ),
+            "failure_limit": (
+                self._adaptive_config_from_values().failure_limit
+                if getattr(self, "config", None) is not None
+                else 0
+            ),
+        }
+        swap_stats_fn = getattr(self.kv_cache, "get_swap_stats", None)
+        kv_swap = dict(swap_stats_fn()) if callable(swap_stats_fn) else {}
+        kv_swap["mode"] = getattr(self, "_kv_swap_mode", "sync")
+        kv_swap["fallback_reason"] = getattr(
+            self, "_kv_swap_fallback_reason", None
+        )
         graph_runner = getattr(self, "cuda_graph_runner", None)
         cuda_graph_stats = graph_runner.stats() if graph_runner else {}
         storage = getattr(self.kv_cache, "storage", None)
@@ -1459,27 +1746,33 @@ class ContinuousBatchingEngine:
             "pending_requests": len(self._pending_request_ids()),
             "completed_requests": len(self._completed_request_ids),
             "cancelled_requests": len(self._cancelled_request_ids),
-            "failed_requests": len(self._request_failures),
+            "failed_requests": len(getattr(self, "_request_failures", {})),
             "num_steps": self._num_steps,
             "total_generated_tokens": self._total_generated_tokens,
             "kv_cache_num_blocks": self.kv_cache.num_blocks,
             "kv_cache_free_blocks": self.kv_cache.block_allocator.num_free_blocks,
             "sequence_status_counts": status_counts,
+            "memory": memory,
             "speculative_execution_context": (
                 self._spec_session_driver.execution_context_mode
-                if self._spec_session_driver is not None
+                if getattr(self, "_spec_session_driver", None) is not None
                 else None
             ),
             "speculative_sessions": [
                 record.diagnostics()
-                for record in self.speculative_sessions.values()
+                for record in getattr(self, "speculative_sessions", {}).values()
             ],
             "paged_mla_admission": (
                 self._spec_session_driver.admission_stats
-                if self._spec_session_driver is not None
+                if getattr(self, "_spec_session_driver", None) is not None
                 else None
             ),
-            "memory": self.memory_manager.report(),
+            "expert_policy": (
+                self._expert_policy_stats()
+                if callable(getattr(self, "_expert_policy_stats", None))
+                else {}
+            ),
+            "kv_swap": kv_swap,
             "num_prefill_chunks": getattr(self, "_num_prefill_chunks", 0),
             "chunked_prefill_requested": getattr(
                 getattr(self, "scheduler", None),
@@ -1496,13 +1789,162 @@ class ContinuousBatchingEngine:
             ),
             "cuda_graph": cuda_graph_stats,
         }
-        stats.update(self._prefix_cache_stats())
+        format_stats = getattr(self, "kv_cache_format_stats", None)
+        if callable(format_stats):
+            stats.update(format_stats())
+        prefix_stats = getattr(self, "_prefix_cache_stats", None)
+        if callable(prefix_stats):
+            stats.update(prefix_stats())
         return stats
 
     def get_request_failure(self, request_id: str) -> dict[str, str]:
         if request_id not in self._request_failures:
             raise KeyError(f"request_id '{request_id}' has no recorded failure")
         return dict(self._request_failures[request_id])
+
+    def _adaptive_config_from_values(self) -> AdaptiveMemoryConfig:
+        defaults = AdaptiveMemoryConfig()
+        return AdaptiveMemoryConfig(
+            enabled=bool(self.config.get("adaptive_memory_enabled", False)),
+            interval_steps=int(
+                self.config.get(
+                    "adaptive_memory_interval_steps", defaults.interval_steps
+                )
+            ),
+            cooldown_steps=int(
+                self.config.get(
+                    "adaptive_memory_cooldown_steps", defaults.cooldown_steps
+                )
+            ),
+            ewma_alpha=float(
+                self.config.get(
+                    "adaptive_memory_ewma_alpha", defaults.ewma_alpha
+                )
+            ),
+            hysteresis_ratio=float(
+                self.config.get(
+                    "adaptive_memory_hysteresis_ratio",
+                    defaults.hysteresis_ratio,
+                )
+            ),
+            max_resize_step_bytes=int(
+                self.config.get(
+                    "adaptive_memory_max_resize_step_bytes",
+                    defaults.max_resize_step_bytes,
+                )
+            ),
+            min_expert_cache_bytes=int(
+                self.config.get(
+                    "adaptive_memory_min_expert_cache_bytes",
+                    defaults.min_expert_cache_bytes,
+                )
+            ),
+            min_kv_cache_blocks=int(
+                self.config.get(
+                    "adaptive_memory_min_kv_cache_blocks",
+                    defaults.min_kv_cache_blocks,
+                )
+            ),
+            free_memory_reserve_bytes=int(
+                self.config.get(
+                    "adaptive_memory_free_reserve_bytes",
+                    defaults.free_memory_reserve_bytes,
+                )
+            ),
+            failure_limit=int(
+                self.config.get(
+                    "adaptive_memory_failure_limit", defaults.failure_limit
+                )
+            ),
+        )
+
+    def _free_gpu_bytes(self, device_id: int) -> int:
+        if torch.cuda.is_available():
+            return int(torch.cuda.mem_get_info(device_id)[0])
+        return int(self.memory_manager.total_gpu_memory_bytes)
+
+    def _tick_adaptive_memory(self) -> None:
+        controller = self.memory_controller
+        if controller is None:
+            return
+        used_blocks = (
+            self.kv_cache.num_blocks
+            - self.kv_cache.block_allocator.num_free_blocks
+        )
+        expert_snapshot = getattr(self.engine, "adaptive_memory_snapshot", None)
+        snapshot = expert_snapshot() if callable(expert_snapshot) else {}
+        for device_id, (
+            expert_bytes,
+            kv_blocks,
+            kv_supported,
+        ) in self._adaptive_targets.items():
+            controller.observe(
+                MemorySignals(
+                    device_id=device_id,
+                    step=self._adaptive_tick_counter,
+                    expert_misses=int(snapshot.get("expert_misses", 0)),
+                    expert_accesses=int(snapshot.get("expert_accesses", 0)),
+                    expert_fetch_stall_ms=float(
+                        snapshot.get("expert_fetch_stall_ms", 0.0)
+                    ),
+                    kv_used_blocks=used_blocks if kv_supported else 0,
+                    kv_total_blocks=kv_blocks,
+                    kv_swap_bytes=0,
+                    kv_swap_stall_ms=0.0,
+                    kv_preemptions=0,
+                    free_gpu_bytes=self._free_gpu_bytes(device_id),
+                    kv_supported=kv_supported,
+                )
+            )
+            target = controller.propose(
+                device_id=device_id,
+                step=self._adaptive_tick_counter,
+                total_bytes=self.memory_manager.total_gpu_memory_bytes,
+                model_bytes=self._memory_budget.model_memory_bytes,
+                activation_reserve_bytes=(
+                    self.memory_manager.total_gpu_memory_bytes
+                    - self._memory_budget.model_memory_bytes
+                    - self._memory_budget.available_bytes
+                ),
+                kv_block_bytes=self._adaptive_kv_block_bytes,
+                current_expert_bytes=expert_bytes,
+                current_kv_blocks=kv_blocks,
+                kv_supported=kv_supported,
+            )
+            if target.direction is ResizeDirection.HOLD:
+                continue
+            resizer = self._memory_resizers.get(device_id)
+            if resizer is None:
+                continue
+            result = resizer.apply(
+                device_id,
+                target,
+                current_expert_bytes=expert_bytes,
+                current_kv_blocks=kv_blocks,
+                kv_block_bytes=self._adaptive_kv_block_bytes,
+            )
+            controller.record_resize(result, step=self._adaptive_tick_counter)
+            if result.committed:
+                self._adaptive_targets[device_id] = (
+                    result.expert_bytes,
+                    result.kv_blocks,
+                    result.kv_supported,
+                )
+
+    def _expert_policy_stats(self) -> dict[str, int]:
+        from moe_infinity.memory.expert_prefetcher import disabled_policy_stats
+
+        engine = getattr(getattr(self, "model_runner", None), "engine", None)
+        prefetcher = getattr(engine, "expert_prefetcher", None)
+        getter = getattr(prefetcher, "get_policy_stats", None)
+        if callable(getter):
+            try:
+                snapshot = getter()
+            except Exception:
+                snapshot = None
+            if isinstance(snapshot, dict):
+                return snapshot
+        return disabled_policy_stats()
 
     def get_config(self) -> dict[str, object]:
         config: dict[str, object] = {}
@@ -1511,6 +1953,7 @@ class ContinuousBatchingEngine:
                 config[key] = value
             else:
                 config[key] = str(value)
+        config.update(self.kv_cache_format_stats())
         return config
 
     def update_config(self, updates: dict[str, object]) -> dict[str, object]:
@@ -1524,7 +1967,61 @@ class ContinuousBatchingEngine:
             self.config[key] = value
             setattr(self.scheduler, key, value)
             applied[key] = value
+        if "adaptive_memory_enabled" in updates:
+            value = updates["adaptive_memory_enabled"]
+            if not isinstance(value, bool):
+                raise ValueError(
+                    "adaptive_memory_enabled must be a boolean value"
+                )
+            current = self.memory_controller is not None
+            if current and not value:
+                self.restore_static_memory_targets(transactional=True)
+            elif value and not current:
+                self.config["adaptive_memory_enabled"] = True
+                self.memory_controller = AdaptiveMemoryController(
+                    self._adaptive_config_from_values()
+                )
+                for device_id, (
+                    _,
+                    kv_blocks,
+                    kv_supported,
+                ) in self._adaptive_targets.items():
+                    self.memory_controller.observe(
+                        MemorySignals(
+                            device_id=device_id,
+                            step=self._adaptive_tick_counter,
+                            expert_misses=0,
+                            expert_accesses=0,
+                            expert_fetch_stall_ms=0.0,
+                            kv_used_blocks=0,
+                            kv_total_blocks=kv_blocks,
+                            kv_swap_bytes=0,
+                            kv_swap_stall_ms=0.0,
+                            kv_preemptions=0,
+                            free_gpu_bytes=self._free_gpu_bytes(device_id),
+                            kv_supported=kv_supported,
+                        )
+                    )
+            self.config["adaptive_memory_enabled"] = value
+            applied["adaptive_memory_enabled"] = value
         return applied
+
+    def restore_static_memory_targets(
+        self, *, transactional: bool = True
+    ) -> None:
+        if not transactional:
+            raise ValueError("static memory restoration must be transactional")
+        for device_id in sorted(self._adaptive_targets):
+            resizer = self._memory_resizers.get(device_id)
+            restore = getattr(resizer, "restore_static_targets", None)
+            if callable(restore):
+                restore()
+            elif self.memory_controller is not None:
+                self.memory_controller.disable_to_static(
+                    device_id, "static_restore_deferred"
+                )
+        self.memory_controller = None
+        self.config["adaptive_memory_enabled"] = False
 
     def _resolve_num_blocks(
         self,
@@ -1533,6 +2030,7 @@ class ContinuousBatchingEngine:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
+        format_name: str = "native",
     ) -> int:
         explicit_num_blocks = self.config.get("num_kv_blocks")
         if explicit_num_blocks is not None:
@@ -1550,6 +2048,7 @@ class ContinuousBatchingEngine:
                 num_heads=num_kv_heads,
                 head_dim=head_dim,
                 dtype=self.dtype,
+                format_name=format_name,
             )
 
         if num_blocks > 0:
@@ -1559,6 +2058,81 @@ class ContinuousBatchingEngine:
     def _fallback_num_blocks(self, block_size: int) -> int:
         max_tokens_per_step = self._get_int_config("max_tokens_per_step", 1)
         return max(1, ceil(max_tokens_per_step / max(1, block_size)))
+
+    def _resolve_kv_cache_format_decision(
+        self, *, model: object, num_kv_heads: int, head_dim: int
+    ):
+        from moe_infinity.kernel.paged_attention_ops import (
+            probe_native_int8_binding,
+        )
+        from moe_infinity.runtime import flashinfer_utils
+        from moe_infinity.runtime.kv_cache_format import (
+            KVCacheBackendCapabilities,
+            KVCacheModelInfo,
+            model_info_from_config,
+            resolve_kv_cache_format,
+        )
+
+        requested = str(self.config.get("kv_cache_format", "native"))
+        allow_fallback = bool(self.config.get("kv_cache_allow_fallback", True))
+        model_config = getattr(model, "config", None)
+        if model_config is not None:
+            model_info = model_info_from_config(model_config)
+            if model_info.num_attention_heads <= 0:
+                model_info = KVCacheModelInfo(
+                    num_attention_heads=num_kv_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    is_mla=model_info.is_mla,
+                )
+        else:
+            model_info = KVCacheModelInfo(
+                num_attention_heads=num_kv_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                is_mla=False,
+            )
+        native_available, native_reason = probe_native_int8_binding()
+        sdpa_available = callable(
+            getattr(
+                __import__("torch.nn.functional", fromlist=["x"]),
+                "scaled_dot_product_attention",
+                None,
+            )
+        )
+        backend_preference = (
+            "flashinfer" if flashinfer_utils.HAS_FLASHINFER else "auto"
+        )
+        capabilities = KVCacheBackendCapabilities(
+            flashinfer_available=bool(flashinfer_utils.HAS_FLASHINFER),
+            native_int8_binding_available=native_available,
+            sdpa_available=sdpa_available,
+            native_int8_unavailable_reason=native_reason,
+        )
+        return resolve_kv_cache_format(
+            requested=requested,
+            model=model_info,
+            device=self.device,
+            backend_preference=backend_preference,
+            capabilities=capabilities,
+            allow_fallback=allow_fallback,
+        )
+
+    def kv_cache_format_stats(self) -> dict[str, object]:
+        decision = getattr(self, "_kv_format_decision", None)
+        if decision is None:
+            return {
+                "requested_kv_cache_format": "native",
+                "effective_kv_cache_format": "native",
+                "kv_cache_execution_backend": "native",
+                "kv_cache_format_decision_reason": None,
+            }
+        return {
+            "requested_kv_cache_format": decision.requested_format.name.value,
+            "effective_kv_cache_format": decision.effective_format.name.value,
+            "kv_cache_execution_backend": decision.execution_backend,
+            "kv_cache_format_decision_reason": decision.reason,
+        }
 
     def _bind_layered_paged_kv_store(self) -> None:
         from moe_infinity.runtime.attention_backend import (
@@ -1611,15 +2185,34 @@ class ContinuousBatchingEngine:
         has_decode = any(not p for p in batch.is_prefill)
         uses_paged = bool(self.paged_attention_registry.bindings)
 
+        phase_policy_enabled = bool(
+            self.config.get("phase_specific_expert_policy", False)
+        )
+
         if not (has_prefill and has_decode):
             if has_decode and not has_prefill:
                 return self._execute_decode_batch(batch)
             return self.model_runner.execute(batch)
 
-        if not uses_paged:
+        if not phase_policy_enabled and not uses_paged:
             return self.model_runner.execute(batch)
 
         split = split_prefill_decode_batch(batch)
+        if phase_policy_enabled:
+            # Phase policy executes the decode half first so decode-phase
+            # expert accesses are recorded before prefill floods the cache.
+            decode_logits = (
+                self._execute_decode_batch(split.decode_batch)
+                if split.decode_batch is not None
+                else None
+            )
+            prefill_logits = (
+                self.model_runner.execute(split.prefill_batch)
+                if split.prefill_batch is not None
+                else None
+            )
+            return split.recombine_outputs(prefill_logits, decode_logits)
+
         prefill_logits = None
         decode_logits = None
         if split.prefill_batch is not None:
@@ -1962,11 +2555,11 @@ class ContinuousBatchingEngine:
             raise ValueError(f"{key} must be an integer value")
         return value
 
-    def _get_bool_config(self, key: str, default: bool = False) -> bool:
+    def _get_str_config(self, key: str, default: str) -> str:
         value = self.config.get(key, default)
-        if not isinstance(value, bool):
-            raise ValueError(f"{key} must be a boolean value")
-        return bool(value)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} must be a string value")
+        return value
 
     def _get_bool_config(self, key: str, default: bool) -> bool:
         value = self.config.get(key, default)
@@ -1995,5 +2588,6 @@ class ContinuousBatchingEngine:
 __all__ = [
     "ContinuousBatchingEngine",
     "RequestOutput",
+    "build_kv_transfer_resources",
     "set_eviction_sync",
 ]

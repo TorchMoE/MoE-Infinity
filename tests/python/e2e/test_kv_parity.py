@@ -264,3 +264,113 @@ def test_kv_parity_tokens_identical_under_pressure(parity_bundle) -> None:
     assert len(pressure_tokens) == 32
     assert baseline_tokens == pressure_tokens
     assert swap_count[0] > 0
+
+
+def test_int8_vs_native_decode_logit_and_token_agreement() -> None:
+    """Model-free logit/token-agreement gate over >= 2048 decode steps.
+
+    Runs an identical synthetic GQA decode loop through the native and INT8
+    attention backends; the INT8 storage path must keep per-step logit cosine
+    >= 0.999, mean absolute logit error <= 0.02, and greedy token agreement
+    >= 99% across the whole run.
+    """
+    import math
+
+    from moe_infinity.runtime.attention_backend import PagedAttentionBackend
+    from moe_infinity.runtime.attention_types import (
+        AttentionMetadata,
+        KVCacheSpec,
+    )
+    from moe_infinity.runtime.kv_cache_format import (
+        allocate_layered_paged_kv_store,
+    )
+
+    torch.manual_seed(2026)
+    device = torch.device("cpu")
+    kv_heads, q_heads, head_dim = 4, 8, 32
+    block_size, vocab = 16, 64
+    total_steps = 2048
+    num_blocks = (total_steps + block_size - 1) // block_size + 2
+    scale = 1.0 / math.sqrt(head_dim)
+
+    native = PagedAttentionBackend(
+        KVCacheSpec(kv_heads, head_dim, torch.float16, block_size),
+        num_blocks,
+        device,
+    )
+    int8 = PagedAttentionBackend(
+        KVCacheSpec(kv_heads, head_dim, torch.float16, block_size, "int8_sym"),
+        num_blocks,
+        device,
+    )
+    int8.bind_store(
+        allocate_layered_paged_kv_store(
+            owner_id="parity-int8",
+            format_name="int8_sym",
+            num_layers=1,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            execution_dtype=torch.float16,
+            device=device,
+        ),
+        owner_id="parity-int8",
+    )
+
+    proj = torch.randn(q_heads * head_dim, vocab, dtype=torch.float32)
+    block_table = torch.arange(num_blocks, dtype=torch.int64).reshape(1, -1)
+
+    cosines: list[float] = []
+    abs_errs: list[float] = []
+    matches = 0
+
+    for step in range(total_steps):
+        key = torch.randn(1, kv_heads, head_dim, dtype=torch.float16)
+        value = torch.randn(1, kv_heads, head_dim, dtype=torch.float16)
+        query = torch.randn(1, q_heads, head_dim, dtype=torch.float16)
+        slot = torch.tensor([step])
+        native.write_kv(key, value, slot)
+        int8.write_chunk(
+            layer_idx=0, key_chunk=key, value_chunk=value, slot_mapping=slot
+        )
+        seq_len = step + 1
+        meta = AttentionMetadata(
+            block_tables=block_table,
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64),
+            max_seq_len=seq_len,
+            num_prefill_tokens=0,
+            num_decode_tokens=1,
+            slot_mapping=slot,
+            is_prefill=False,
+        )
+        native_out = native.forward(
+            query, query, query, attention_metadata=meta, scale=scale
+        )
+        int8_out = int8.forward(
+            query,
+            query,
+            query,
+            layer_idx=0,
+            attention_metadata=meta,
+            scale=scale,
+        )
+        nl = (native_out[0].float().flatten() @ proj).float()
+        il = (int8_out[0].float().flatten() @ proj).float()
+        cosines.append(
+            float(torch.nn.functional.cosine_similarity(nl, il, dim=0))
+        )
+        abs_errs.append(float((nl - il).abs().mean()))
+        if int(nl.argmax()) == int(il.argmax()):
+            matches += 1
+
+    mean_logit_cosine = sum(cosines) / len(cosines)
+    mean_absolute_logit_error = sum(abs_errs) / len(abs_errs)
+    total_tokens = total_steps
+    matching_tokens = matches
+
+    assert total_tokens >= 2048
+    assert mean_logit_cosine >= 0.999
+    assert mean_absolute_logit_error <= 0.02
+    assert matching_tokens / total_tokens >= 0.99
+    assert int8.effective_format == "int8_sym"

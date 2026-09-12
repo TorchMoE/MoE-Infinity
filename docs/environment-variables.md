@@ -80,7 +80,15 @@ production env surface documented above.
 - `MOE_DFLASH_OFFLOAD` — DFlash GPU tests use it to override the offload root without editing the test; defaults to a model-specific cache path.
 - `DSV4_FLASH_CKPT`
 - `MOE_DFLASH_GPU`, `MOE_DFLASH_MEM_RATIO`
+- `MOE_DFLASH_SERVING_GPU` — opt-in gate for the native prefetch/compute-sample smoke tests (`tests/python/dflash/test_prefetch_native_gpu.py`). Unset skips them cleanly.
+- `MOE_PREFETCH_NATIVE_MODEL`, `MOE_PREFETCH_NATIVE_OFFLOAD` — override the model/offload root used by the native prefetch smoke tests.
 - `WORLD_SIZE`, `RANK`, `LOCAL_RANK`
+
+Overlap-aware expert prefetch is configured through `ArcherConfig`
+(`overlap_prefetch_policy` and its knobs, see
+[Configuration](configuration.md)), not environment variables. Only the
+benchmark/smoke opt-ins above gate the overlap workflow; runtime tuning stays in
+config.
 
 Repo evidence:
 - `moe_infinity/kernel/__init__.py`

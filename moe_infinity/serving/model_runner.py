@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 import torch
 
+from moe_infinity.memory.expert_policy import (
+    ExpertPhase,
+    expert_phase_scope,
+)
 from moe_infinity.runtime.attention_types import (
     AttentionMetadata as RuntimeAttentionMetadata,
 )
@@ -73,6 +77,9 @@ class ModelRunner:
         engine: object,
         device: Optional[torch.device] = None,
         *,
+        kv_store: object | None = None,
+        attention_backend: object | None = None,
+        owner_id: str | None = None,
         paged_kv_storage: object = None,
         paged_attention_registry: object = None,
         decode_graph_capability_provider: object = None,
@@ -81,6 +88,37 @@ class ModelRunner:
         self.engine = engine
         self.device = self._resolve_device(device)
         self.seq_id_list = []
+        self.kv_store = kv_store
+        self._bound_attention_backend = attention_backend
+        self._owner_id = owner_id
+        self.paged_kv_storage = paged_kv_storage
+        self.paged_attention_registry = paged_attention_registry
+        self.decode_graph_capability_provider = decode_graph_capability_provider
+        self._warned_no_paged_shim = False
+        if kv_store is not None or attention_backend is not None:
+            self._validate_store_identity(kv_store, attention_backend, owner_id)
+
+    @staticmethod
+    def _validate_store_identity(
+        kv_store: object | None,
+        attention_backend: object | None,
+        owner_id: str | None,
+    ) -> None:
+        if kv_store is None or attention_backend is None:
+            raise RuntimeError(
+                "ModelRunner requires both kv_store and attention_backend "
+                "when either is provided"
+            )
+        backend_store = getattr(attention_backend, "store", None)
+        if backend_store is not kv_store:
+            raise RuntimeError(
+                "KV store identity mismatch between ModelRunner and backend"
+            )
+        store_owner = getattr(kv_store, "owner_id", None)
+        if owner_id is not None and store_owner != owner_id:
+            raise RuntimeError(
+                "KV store identity mismatch: owner_id does not match store"
+            )
         self.paged_kv_storage = paged_kv_storage
         self.paged_attention_registry = paged_attention_registry
         self.decode_graph_capability_provider = decode_graph_capability_provider
@@ -233,6 +271,13 @@ class ModelRunner:
             "attention_mask": attention_mask,
         }
 
+    def _expert_phase(self, batch: BatchMetadata) -> ExpertPhase:
+        if batch.is_prefill and all(batch.is_prefill):
+            return ExpertPhase.PREFILL
+        if batch.is_prefill and not any(batch.is_prefill):
+            return ExpertPhase.DECODE
+        return ExpertPhase.MIXED
+
     def prepare_batch_side_effects(self, batch: BatchMetadata) -> None:
         self._configure_expert_tracing(len(batch.seq_ids))
         self._advance_request_id()
@@ -290,9 +335,10 @@ class ModelRunner:
         if past_key_values is not None:
             forward_kwargs["past_key_values"] = past_key_values
 
-        outputs = self._forward_with_optional_paged_context(
-            forward_kwargs, batch=batch
-        )
+        with expert_phase_scope(self._expert_phase(batch)):
+            outputs = self._forward_with_optional_paged_context(
+                forward_kwargs, batch=batch
+            )
 
         logits = self._extract_logits(outputs)
         if logits.dim() == 3:
@@ -675,6 +721,8 @@ class ModelRunner:
         return 1
 
     def _get_attention_backend(self) -> object | None:
+        if self._bound_attention_backend is not None:
+            return self._bound_attention_backend
         getter = getattr(self.engine, "get_attention_backend", None)
         if callable(getter):
             backend = getter()
@@ -835,7 +883,7 @@ class ModelRunner:
             and len(set(layer_indices)) == len(layer_indices)
             and isinstance(backend, PagedAttentionBackend)
             and isinstance(
-                getattr(backend, "block_store", None), LayeredPagedKVStore
+                getattr(backend, "_block_store", None), LayeredPagedKVStore
             )
             and backend.supports_chunked_prefill()
         )
@@ -855,7 +903,7 @@ class ModelRunner:
             return "incomplete_qwen3_paged_layer_registry"
         backend = self._get_attention_backend()
         if not isinstance(backend, PagedAttentionBackend) or not isinstance(
-            getattr(backend, "block_store", None), LayeredPagedKVStore
+            getattr(backend, "_block_store", None), LayeredPagedKVStore
         ):
             return "layered_paged_kv_store_unavailable"
         if not backend.supports_chunked_prefill():

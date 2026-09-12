@@ -141,3 +141,118 @@ def test_generation_loop_passes_metadata_to_forward() -> None:
     assert observed[0].num_decode_tokens == 0
     assert all(meta.num_decode_tokens == 1 for meta in observed[1:])
     assert all(meta.is_prefill is False for meta in observed[1:])
+
+
+def test_offload_wiring_observes_one_prefill_then_decode_phases() -> None:
+    from moe_infinity.memory.expert_policy import ExpertPhase
+
+    observed: list[AttentionMetadata] = []
+
+    def mock_forward(
+        token_ids: list[int],
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        observed.append(metadata)
+        logits = torch.full((len(token_ids), 64), -1e9, dtype=torch.float32)
+        logits[:, 5] = 0.0
+        return logits
+
+    spec = KVCacheSpec(
+        num_kv_heads=2,
+        head_dim=8,
+        dtype=torch.float32,
+        block_size=4,
+    )
+    mgr = KVCacheManager(num_gpu_blocks=16, num_cpu_blocks=32, block_size=4)
+    engine = GenerationEngine(
+        kv_cache_manager=mgr,
+        kv_spec=spec,
+        num_layers=2,
+        vocab_size=64,
+        model_forward_fn=mock_forward,
+        eos_token_id=2,
+    )
+
+    _ = engine.generate(prompt_token_ids=[1, 3], request_id="rid")
+
+    phases = [
+        ExpertPhase.PREFILL if meta.is_prefill else ExpertPhase.DECODE
+        for meta in observed
+    ]
+    assert phases[0] is ExpertPhase.PREFILL
+    assert phases.count(ExpertPhase.PREFILL) == 1
+    assert all(phase is ExpertPhase.DECODE for phase in phases[1:])
+
+
+def _native_model_config() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        hidden_size=16,
+        vocab_size=32,
+        eos_token_id=2,
+        max_position_embeddings=64,
+        torch_dtype="float32",
+    )
+
+
+def _native_engine_config(*, enable_kv_cache_offload: bool) -> Any:
+    from moe_infinity.utils.config import ArcherConfig
+
+    config = ArcherConfig(
+        use_native_engine=True,
+        enable_kv_cache_offload=enable_kv_cache_offload,
+        device_memory_ratio=0.7,
+        kv_cache_memory_ratio=0.15,
+    )
+    return config
+
+
+def _native_moe() -> Any:
+    from moe_infinity.entrypoints.big_modeling import MoE
+
+    moe = MoE.__new__(MoE)
+    moe.use_native_engine = True
+    moe.max_seq_length = 64
+    moe.model = types.SimpleNamespace(config=_native_model_config())
+    return moe
+
+
+def test_native_kv_offload_stores_paged_backend_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    moe = _native_moe()
+    engine_config = _native_engine_config(enable_kv_cache_offload=True)
+
+    components = moe._build_native_components(moe.model.config, engine_config)
+
+    coordinator = components["kv_offload_coordinator"]
+    attention_backend = components["attention_backend"]
+    assert coordinator is not None
+    assert attention_backend is not None
+    stored = getattr(coordinator, "_kv_tensors")
+    assert isinstance(stored, tuple)
+    assert stored[0] is attention_backend.k_cache
+    assert stored[1] is attention_backend.v_cache
+
+
+def test_native_kv_offload_without_backend_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import moe_infinity.runtime.attention_backend as ab_module
+
+    def _failing_backend(*_args: Any, **_kwargs: Any) -> object:
+        raise RuntimeError("no paged backend")
+
+    monkeypatch.setattr(ab_module, "PagedAttentionBackend", _failing_backend)
+
+    moe = _native_moe()
+    engine_config = _native_engine_config(enable_kv_cache_offload=True)
+
+    with pytest.raises(
+        RuntimeError, match="KV offload requires initialized paged KV tensors"
+    ):
+        moe._build_native_components(moe.model.config, engine_config)
