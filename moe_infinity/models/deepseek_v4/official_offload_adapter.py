@@ -16,6 +16,10 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from moe_infinity.models.deepseek_v4.vision_exp import (
+    should_skip_resident_load,
+)
+
 
 class OfficialExpertHostStore:
     def __init__(
@@ -267,6 +271,7 @@ def load_offloaded_v4_flash(
     shard_file: str,
     max_resident_experts: int = 8,
     use_native: bool = None,
+    text_only: bool = True,
 ):
     import json as _json
 
@@ -317,16 +322,23 @@ def load_offloaded_v4_flash(
     patch_moe_with_offload(model, store, M, use_native=use_native)
     torch.cuda.empty_cache()
 
-    _load_non_expert_weights(model, shard_file, device)
+    _load_non_expert_weights(
+        model, shard_file, device, config=margs, text_only=text_only
+    )
     return model, store
 
 
-def _load_non_expert_weights(model, shard_file, device):
+def _load_non_expert_weights(
+    model, shard_file, device, config=None, text_only=True
+):
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
     with safe_open(shard_file, framework="pt", device="cpu") as f:
         for k in f.keys():
-            if ".ffn.experts." in k:
+            if config is not None:
+                if should_skip_resident_load(k, config, text_only=text_only):
+                    continue
+            elif ".ffn.experts." in k:
                 continue
             if k.endswith(".scale"):
                 wp = params.get(k[:-6] + ".weight")
