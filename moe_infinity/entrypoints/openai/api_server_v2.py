@@ -420,6 +420,49 @@ def _ensure_cp_middleware_initialized() -> Optional[Any]:
         return _cp_middleware
 
 
+def _wire_contextpilot_phase_c(runtime_engine: object) -> None:
+    """Install Phase C hooks (eviction sync + CP-aware KV manager).
+
+    When ContextPilot is inactive or absent, clears the eviction-sync
+    singleton and installs the Null KV manager. Failures are logged and
+    swallowed so wiring can never break server startup.
+    """
+    global _eviction_sync
+    try:
+        from moe_infinity.serving import engine as engine_module
+        from moe_infinity.serving.cp_kv_interface import (
+            ContextPilotKVManager,
+            NullCPAwareKVManager,
+        )
+
+        middleware = (
+            _ensure_cp_middleware_initialized()
+            if _is_contextpilot_active()
+            else None
+        )
+
+        if middleware is not None:
+            from moe_infinity.serving.eviction_sync import EvictionSyncAdapter
+
+            adapter = EvictionSyncAdapter(middleware)
+            engine_module.set_eviction_sync(adapter)
+            _eviction_sync = adapter
+            kv_manager: object = ContextPilotKVManager(middleware)
+            _cp_logger.info("ContextPilot Phase C wiring installed")
+        else:
+            engine_module.set_eviction_sync(None)
+            _eviction_sync = None
+            kv_manager = NullCPAwareKVManager()
+
+        for target_name in ("scheduler", "kv_cache"):
+            target = getattr(runtime_engine, target_name, None)
+            setter = getattr(target, "set_cp_kv_manager", None)
+            if callable(setter):
+                setter(kv_manager)
+    except Exception as exc:
+        _cp_logger.warning("ContextPilot Phase C wiring failed: %s", exc)
+
+
 def _process_chat_messages_with_contextpilot(
     messages: Any,
     *,
@@ -576,6 +619,7 @@ def initialize_with_model(
         stream_manager = StreamManager()
 
     engine = initialized_engine
+    _wire_contextpilot_phase_c(initialized_engine)
     _health_state.set_healthy()
 
 
@@ -1413,6 +1457,7 @@ async def _initialize_model() -> None:
             stream_manager = StreamManager()
 
         _replace_engine(initialized_engine)
+        _wire_contextpilot_phase_c(initialized_engine)
         configured_max_seq_length = engine_config.get("max_seq_length")
         if isinstance(configured_max_seq_length, int):
             runtime_max_seq_length = configured_max_seq_length
