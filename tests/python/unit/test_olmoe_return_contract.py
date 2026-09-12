@@ -21,7 +21,9 @@ torch = pytest.importorskip("torch")
 modeling = pytest.importorskip("transformers.models.olmoe.modeling_olmoe")
 
 if not hasattr(modeling, "OlmoeMLP"):
-    pytest.skip("transformers does not expose OlmoeMLP", allow_module_level=True)
+    pytest.skip(
+        "transformers does not expose OlmoeMLP", allow_module_level=True
+    )
 
 
 def test_forward_returns_bare_tensor():
