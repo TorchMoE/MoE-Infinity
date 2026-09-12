@@ -62,7 +62,6 @@ moe_infinity/
 ├── engine/              Deprecated synchronous generation path (powers MoE.generate)
 │   ├── generation_loop.py     GenerationEngine, spec_strategy seam, standard fallback
 │   ├── scheduler.py           Request scheduler with block-level KV allocation
-│   ├── request_manager.py     Thread-safe request lifecycle
 │   ├── types.py               Request, Sequence, SamplingParams, status enums
 │   ├── transfer_types.py      TransferRequest, TransferPriority, TransferType
 │   ├── unified_transfer_scheduler.py  Coordinates expert + KV transfers
@@ -88,8 +87,6 @@ moe_infinity/
 │   ├── validation.py          Request validation + error shaping
 │   ├── health.py              /health endpoint state
 │   ├── watchdog.py            Startup / decode timeout enforcement
-│   ├── expert_batch.py        BatchedExpertDispatch helper
-│   ├── expert_prefetch_coordinator.py   Cross-request prefetch hints
 │   ├── eviction_sync.py       Request-termination → ContextPilot eviction
 │   └── contextpilot_*.py      Optional prompt-optimization middleware
 │
@@ -114,7 +111,6 @@ moe_infinity/
 │   ├── offloading_policy.py   LRU / ARC cache policies
 │   ├── kv_cache_manager.py    Python-side KV block bookkeeping
 │   ├── block_pool.py          Block allocator abstraction
-│   ├── cpu_block_cache.py     CPU-resident KV block staging area
 │   └── memory_coordinator.py  Shared GPU memory budget between experts + KV
 │
 ├── distributed/         Multi-GPU expert dispatch
