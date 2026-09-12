@@ -35,11 +35,18 @@ With `gpu_only_expert_routing=true`, full sampling emits `gpu_route_submit`,
 `route_failures` count or any unexpected `gpu_route_fallback` event is a
 rollback signal; set `gpu_only_expert_routing=false` and retain the eager path.
 
-## Deterministic mode
+## C++ runtime configuration
+
+These keys are read by the compiled C++/CUDA offload engine (the `_store`
+extension built from `core/`, see `setup.py`). They tune the native
+prefetch/AIO and caching-allocator paths and are parsed with C `getenv`.
 
 | Variable | Default | Where read | Effect | Notes |
 | --- | --- | --- | --- | --- |
-| `MOE_DETERMINISTIC` | unset, treated as off | `moe_infinity/kernel/deterministic_matmul.py` import time | If `"1"`, turn on deterministic algorithms, set `CUBLAS_WORKSPACE_CONFIG=:16:8`, and set `NCCL_ALGO=Tree`. | The module snapshots and restores the previous values on disable. `CUBLAS_WORKSPACE_CONFIG` and `NCCL_ALGO` are standard CUDA/NCCL knobs, not MoE-Infinity env vars. |
+| `MOE_IO_THREADS` | unset, treated as `0` (auto) | `core/prefetch/archer_prefetch_handle.cpp` handle construction | Number of background I/O threads the native prefetch/AIO engine uses to read expert weights. | Parsed with `atoi`; `0` or unset defers to the AIO layer's hardware-derived `ArcherPrioAioContext::GetDefaultNumIoThreads()`. |
+| `MOE_IO_BLOCK_SIZE_KB` | `1024` (1 MiB) | `core/aio/archer_prio_aio_handle.cpp` static init | Read/transfer block size for the priority AIO path (in KB), which also sizes the pinned-memory pool blocks. | Only applied when the value is in `[256, 65536]` KB; any other value falls back to the 1 MiB default. |
+| `MOEINF_GPU_SIZE` | unset, full device memory | `core/memory/caching_allocator.h` allocator init (CUDA path) | Overrides the GPU caching-allocator capacity, in bytes. | Read via `std::stoull`. If unset, the allocator uses the device's total global memory (`cudaGetDeviceProperties`). |
+| `MOEINF_PIN_SIZE` | required (no default) | `core/memory/caching_allocator.h` allocator init (pinned path) | Sets the pinned-host caching-allocator capacity, in bytes. | Read via `std::stoull`. Unset trips a fatal log when the pinned allocator initializes, so set it when the pinned path is used. |
 
 ## Model-specific toggles
 
@@ -95,9 +102,11 @@ Repo evidence:
 - `moe_infinity/serving/cuda_graph.py`
 - `moe_infinity/profiling/io_profiler.py`
 - `moe_infinity/memory/expert_tracer.py`
-- `moe_infinity/kernel/deterministic_matmul.py`
 - `moe_infinity/runtime/model_offload.py`
 - `moe_infinity/models/deepseek_v4/official_offload_adapter.py`
 - `moe_infinity/entrypoints/openai/api_server_v2.py`
+- `core/prefetch/archer_prefetch_handle.cpp`
+- `core/aio/archer_prio_aio_handle.cpp`
+- `core/memory/caching_allocator.h`
 - `setup.py`
 - `CMakeLists.txt`
