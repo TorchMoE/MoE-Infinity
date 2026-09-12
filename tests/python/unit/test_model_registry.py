@@ -24,6 +24,8 @@ def test_all_models_registered():
     }
     if "deepseekv4" in MODEL_MAPPING_NAMES:
         expected_models.add("deepseekv4")
+    if "deepseekv41" in MODEL_MAPPING_NAMES:
+        expected_models.add("deepseekv41")
     if "qwen3_5" in MODEL_MAPPING_NAMES:
         expected_models.add("qwen3_5")
     if "glmmoedsa" in MODEL_MAPPING_NAMES:

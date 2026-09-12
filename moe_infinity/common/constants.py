@@ -18,6 +18,11 @@ except ImportError:
     DeepseekV4ForCausalLM = None
 
 try:
+    from transformers import DeepseekV41ForCausalLM
+except ImportError:
+    DeepseekV41ForCausalLM = None
+
+try:
     from transformers import Qwen3_5MoeForConditionalGeneration
 except ImportError:
     Qwen3_5MoeForConditionalGeneration = None
@@ -65,6 +70,18 @@ MODEL_MAPPING_TYPES = {
 if DeepseekV4ForCausalLM is not None:
     MODEL_MAPPING_NAMES["deepseekv4"] = DeepseekV4ForCausalLM
     MODEL_MAPPING_TYPES["deepseekv4"] = 5
+
+# DeepSeek-V4.1-Flash (arch "DeepseekV41ForCausalLM", model_type
+# "deepseek_v41") nests its MoE fields under text_config and routes 384
+# per-expert FP4 (E2M1 + ue8m0 scale) experts top-6 with the sqrtsoftplus /
+# noaux_tc router family (expert-type 5, like V4). Its key "deepseekv41"
+# contains "deepseekv4" as a substring; parse_expert_type matches the longest
+# registered key first (length-sort), so V4.1 resolves before V4. Mainline
+# transformers has not merged deepseek_v41 as of 2026-09-12, so the class is
+# usually absent; register only when it is importable (mirrors the V4 guard).
+if DeepseekV41ForCausalLM is not None:
+    MODEL_MAPPING_NAMES["deepseekv41"] = DeepseekV41ForCausalLM
+    MODEL_MAPPING_TYPES["deepseekv41"] = 5
 
 # Qwen3.5-MoE (arch "Qwen3_5MoeForConditionalGeneration") uses per-expert
 # gate_proj/up_proj/down_proj weights (expert-type 5, like Qwen3/DeepSeek); the

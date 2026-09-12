@@ -24,6 +24,7 @@ All notable changes to MoE-Infinity will be documented in this file.
 - No-download unified-execution benchmark/validator and compatibility assertions that fail closed on sampling, ordering, cache invariant, or ownership failures.
 - Documented GLM-5.3 (`zai-org/GLM-5.3`) as running through the existing GlmMoeDsa path (same base as GLM-5.2), with a config-resolution regression test (`tests/python/unit/test_glm53_registry.py`).
 - GLM-5.3-Flash (`zai-org/GLM-5.3-Flash`) glm5_next family support: guarded registry entry, nested text_config parsing, `SyncGlm5NextMoEBlock`, and offload runtime wiring (routed FP8 experts offloaded; KDA/DSA/mHC/vision resident, text-only).
+- DeepSeek-V4.1-Flash (`deepseek-ai/DeepSeek-V4.1-Flash`, `DeepseekV41ForCausalLM`) **Phase 1 (in progress / draft)**: guarded registry entry and nested `text_config` config parsing only (384 routed FP4 experts, top-6, `sqrtsoftplus`/`noaux_tc`), with substring-dispatch precedence over the V4 entry and a phased implementation plan (`docs/deepseek-v41-flash-plan.md`). Expert offload and the CED/Engram/CSA2/DSpark/vision architecture are not yet implemented.
 
 ### Changed
 
