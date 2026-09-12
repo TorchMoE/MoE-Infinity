@@ -1111,10 +1111,14 @@ class PagedKVCache:
         if record is None and block_table is None:
             return
 
-        if self._cp_kv_manager is not None and block_table is not None:
+        if self._cp_kv_manager is not None:
             try:
-                block_hashes = block_table.get_block_ids()
-                self._cp_kv_manager.notify_blocks_freed(seq_id, block_hashes)
+                if block_table is not None:
+                    block_hashes = block_table.get_block_ids()
+                    self._cp_kv_manager.notify_blocks_freed(
+                        seq_id, block_hashes
+                    )
+                self._cp_kv_manager.remove_request(seq_id)
             except Exception:
                 pass
 

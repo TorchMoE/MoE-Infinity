@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from enum import Enum
 from typing import Optional, Protocol
+
+DEFAULT_MAX_TRACKED_REQUEST_IDS = 100_000
 
 
 class _CPMiddlewareLike(Protocol):
@@ -17,11 +20,19 @@ class EvictionEvent(Enum):
 
 
 class EvictionSyncAdapter:
-    def __init__(self, cp_middleware: Optional[_CPMiddlewareLike] = None):
+    def __init__(
+        self,
+        cp_middleware: Optional[_CPMiddlewareLike] = None,
+        *,
+        max_tracked_request_ids: int = DEFAULT_MAX_TRACKED_REQUEST_IDS,
+    ):
         """Takes optional CP middleware instance for remove_requests calls."""
+        if max_tracked_request_ids <= 0:
+            raise ValueError("max_tracked_request_ids must be > 0")
         self._cp_middleware: Optional[_CPMiddlewareLike] = cp_middleware
         self._lock: threading.RLock = threading.RLock()
-        self._evicted_request_ids: set[str] = set()
+        self._max_tracked_request_ids: int = int(max_tracked_request_ids)
+        self._evicted_request_ids: OrderedDict[str, None] = OrderedDict()
         self._evict_incoming: int = 0
         self._evict_removed: int = 0
         self._evict_not_found: int = 0
@@ -89,7 +100,11 @@ class EvictionSyncAdapter:
                 self._evict_not_found += 1
                 return
 
-            self._evicted_request_ids.add(request_id)
+            self._evicted_request_ids[request_id] = None
+            while (
+                len(self._evicted_request_ids) > self._max_tracked_request_ids
+            ):
+                self._evicted_request_ids.popitem(last=False)
 
             if callable(middleware_complete):
                 self._evict_removed += 1

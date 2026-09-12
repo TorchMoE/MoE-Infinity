@@ -33,6 +33,10 @@ class CPAwareKVManager(ABC):
     def get_allocation_priority(self, request_ids: list[str]) -> list[str]:
         """Returns request_ids sorted by CP overlap (highest first)"""
 
+    def remove_request(self, request_id: str) -> None:
+        """Drop all per-request tracking state on terminal removal"""
+        _ = request_id
+
 
 class NullCPAwareKVManager(CPAwareKVManager):
     @override
@@ -165,6 +169,10 @@ class ContextPilotKVManager(CPAwareKVManager):
             key=lambda rid: self.predict_prefix_reuse(rid, []),
             reverse=True,
         )
+
+    @override
+    def remove_request(self, request_id: str) -> None:
+        self._request_to_blocks.pop(request_id, None)
 
     def _get_middleware_callable(self, name: str) -> Optional[object]:
         return cast(Optional[object], getattr(self._middleware, name, None))
