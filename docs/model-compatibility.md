@@ -24,6 +24,7 @@ a claim that any particular DeepSeek DFlash pair has been validated.
 | DeepSeek-V2 (`DeepseekV2ForCausalLM`) | validated | implemented/experimental | Eager consistency harness; Stage 4b details below. |
 | DeepSeek-V3 (`DeepseekV3ForCausalLM`) | implemented/experimental | implemented/experimental | Routing and paged-attention parity evidence. |
 | DeepSeek-V4 (`DeepseekV4ForCausalLM`) | validated official mp4 path | not validated | DFlash unsupported; mp1 not covered. |
+| DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`) | in progress / draft | not recorded | Phase 1 only: guarded registry entry + nested `text_config` parsing (384 routed FP4 experts, top-6, `sqrtsoftplus`/`noaux_tc`). Expert offload + CED/Engram/CSA2/DSpark/vision deferred; see [docs/deepseek-v41-flash-plan.md](./deepseek-v41-flash-plan.md). |
 | Mixtral (`MixtralForCausalLM`) | implemented/experimental | implemented/experimental | No real-model serving harness recorded. |
 | Qwen3 / Qwen3.5 MoE | Qwen3 validated; Qwen3.5 tiny-fixture validated | implemented/experimental | Qwen3.5 is text-only and requires newer Transformers. |
 | GLM-5.2 (`GlmMoeDsaForCausalLM`) | validated | tiny serving harness | Built-in MTP, not DFlash. |

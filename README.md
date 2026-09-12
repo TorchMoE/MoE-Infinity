@@ -55,6 +55,7 @@ MoE-Infinity supports HuggingFace MoE checkpoints registered in [`moe_infinity/c
 |---|---|
 | [DeepSeek-V2 / V3](https://huggingface.co/collections/deepseek-ai/deepseek-v2-669a1c8b8f2dbc203fbd7746) | `deepseek-ai/DeepSeek-V2-Lite-Chat`, `deepseek-ai/DeepSeek-V3` |
 | DeepSeek-V4-Flash (FP4 expert offloading) | `deepseek-ai/DeepSeek-V4-Flash` |
+| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) *(in progress / draft)* | `deepseek-ai/DeepSeek-V4.1-Flash` |
 | [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1) | `mistralai/Mixtral-8x7B-Instruct-v0.1`, `Mixtral-8x22B` |
 | [Qwen3-MoE](https://huggingface.co/Qwen/Qwen3-30B-A3B) | `Qwen/Qwen3-30B-A3B` |
 | [Qwen3.5-MoE](https://huggingface.co/Qwen/Qwen3.5-35B-A3B) | `Qwen/Qwen3.5-35B-A3B` |
@@ -68,6 +69,8 @@ MoE-Infinity supports HuggingFace MoE checkpoints registered in [`moe_infinity/c
 | [Meta NLLB-MoE](https://huggingface.co/facebook/nllb-moe-54b) | `facebook/nllb-moe-54b` |
 
 > DeepSeek-V4-Flash is only registered when your installed `transformers` provides `DeepseekV4ForCausalLM`; otherwise it is skipped automatically. Path A uses the HF-native `MoE` wrapper, and Path B uses the official FP4 offload loader. See [docs/model-compatibility.md](docs/model-compatibility.md) and [moe_infinity/models/deepseek_v4/README.md](./moe_infinity/models/deepseek_v4/README.md).
+
+> DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`, `model_type="deepseek_v41"`) is **in progress / draft**. Phase 1 ships only the guarded registry entry and nested-`text_config` config parsing (384 routed FP4 experts, top-6, `sqrtsoftplus`/`noaux_tc`); it is registered only when your `transformers` provides `DeepseekV41ForCausalLM` (mainline has not merged `deepseek_v41` as of 2026-09-12, so this usually requires the `trust_remote_code` path). Expert offload (Phase 2) and the CED/Engram/CSA2/DSpark/vision architecture (Phase 3) are not yet implemented. See [docs/deepseek-v41-flash-plan.md](docs/deepseek-v41-flash-plan.md).
 
 > Qwen3.5-MoE (`Qwen3_5MoeForConditionalGeneration`, requires `transformers` >= 5.12) is a vision-language checkpoint served text-only. Its 256 routed experts are offloaded while the text backbone, token embeddings, hybrid linear and full attention layers, shared expert, and `lm_head` stay resident on GPU. The v5 packed expert tensors expand to per-expert on load. Vision and MTP weights are present but unused for text generation. See [docs/model-compatibility.md](docs/model-compatibility.md).
 
